@@ -172,8 +172,8 @@ void oft_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
                 copy(copy_r, tRgR(_,_,_,k_tile_next), tRsR(_,_,_,smem_pipe_write));
             }
             __syncwarp();
-            cp_async_fence();
         }
+        cp_async_fence();
         cp_async_wait<K_PIPE_MAX-1>();
         asm volatile("bar.sync 14, %0;\n"
                             :
@@ -379,9 +379,9 @@ void oft_arb(TensorGB const &gB, TensorSB &sB, TiledCopyB copy_b,
         ++smem_pipe_read;
         smem_pipe_read = (smem_pipe_read == K_PIPE_MAX) ? 0 : smem_pipe_read;
     }
-    // copy(tCrC, tCgC); // Copy the final result to gC
+    copy(tCrC, tCgC); // Copy the final result to gC
     
-    copy(r2g_atom_C{}, tXrC, tXgC); // Copy the final result to gC
+    // copy(r2g_atom_C{}, tXrC, tXgC); // Copy the final result to gC
 }
 
 template <class GridShape, class CtaTiler,

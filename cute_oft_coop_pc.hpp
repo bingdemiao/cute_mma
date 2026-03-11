@@ -10,8 +10,8 @@
 #endif
 
 struct CurrKernelParams {
-    static const unsigned int group_size = OFT_GROUP_SIZE;
-    static const unsigned int reconn_sz = OFT_RECONN_SIZE;
+    static constexpr unsigned int group_size = OFT_GROUP_SIZE;
+    static constexpr unsigned int reconn_sz = OFT_RECONN_SIZE;
 };
 
 template <class KernelParams>

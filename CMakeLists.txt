@@ -89,6 +89,11 @@ else()
         target_link_libraries(${PLAYGROUND_NAME} PRIVATE CUDA::cublas)
     endforeach()
 endif()
+option(BUILD_TORCH_EXT "Build PyTorch extension" OFF)
+if(BUILD_TORCH_EXT)
+    add_subdirectory(torch_ext)
+endif()
+
 # set(dtypes_o half float)
 # set(dtypes_r half float)
 
