@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ._config import CompParams
+from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 
 # Root of the cute_mma source tree (three levels up: _compiler.py -> cute_oft -> src -> repo root)
 _SOURCE_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -49,6 +49,8 @@ def _source_files(src: Path, backend: str) -> list[Path]:
         return [
             src / "cute_oft_coop_pc.cu",
             src / "cute_oft_coop_pc.hpp",
+            src / "cute_oft_backward.cu",
+            src / "cute_oft_backward.hpp",
             src / "cute_oft_util.hpp",
             src / "z_curve.hpp",
             src / "common.hpp",
@@ -73,9 +75,10 @@ def _compute_source_hash(src: Path, backend: str) -> str:
     return h.hexdigest()[:16]
 
 
-def _build_dir_name(group_size: int, reconn_sz: int, backend: str, comp: CompParams) -> str:
+def _build_dir_name(group_size: int, reconn_sz: int, backend: str, comp: CompParams, gated: bool = False) -> str:
     if backend == "cute":
-        return f"cute_g{group_size}_r{reconn_sz}_{comp.cache_key()}"
+        gated_suffix = "_gated" if gated else ""
+        return f"cute_g{group_size}_r{reconn_sz}_{comp.cache_key()}{gated_suffix}"
     elif backend == "cublas":
         # cuBLAS supports dynamic hyperparameters — single build for all configs
         return "cublas"
@@ -94,6 +97,7 @@ def _generate_cmake_cute(
     src: Path,
     group_size: int,
     reconn_sz: int,
+    gated: bool = False,
 ) -> None:
     target = _target_name(group_size, reconn_sz, "cute")
     torch_ext = src / "torch_ext"
@@ -148,6 +152,7 @@ add_library({target} SHARED
     {torch_ext / "oft_torch_bind.cpp"}
     {torch_ext / "oft_torch.cu"}
     {src / "cute_oft_coop_pc.cu"}
+    {src / "cute_oft_backward.cu"}
 )
 
 set_target_properties({target} PROPERTIES
@@ -166,6 +171,7 @@ target_include_directories({target} PRIVATE
 target_compile_definitions({target} PRIVATE
     OFT_GROUP_SIZE={group_size}
     OFT_RECONN_SIZE={reconn_sz}
+    OFT_GATED={'1' if gated else '0'}
     TORCH_EXTENSION_NAME={target}
 )
 
@@ -294,11 +300,40 @@ def _parse_build_errors(output: str) -> str:
     return "Unknown compilation error (see full log above)"
 
 
+def _compose_config_header(
+    comp_params: CompParams,
+    bwd_db_params: BwdDBCompParams | None = None,
+    bwd_dadr_params: BwdDAdRCompParams | None = None,
+) -> str:
+    """Compose the full oft_config.hpp with forward + backward params."""
+    if bwd_db_params is None:
+        bwd_db_params = BwdDBCompParams()
+    if bwd_dadr_params is None:
+        bwd_dadr_params = BwdDAdRCompParams()
+
+    return f"""\
+#pragma once
+#include <cute/tensor.hpp>
+namespace cute {{
+
+{comp_params.to_header()}
+
+{bwd_db_params.to_header()}
+
+{bwd_dadr_params.to_header()}
+
+}}
+"""
+
+
 def compile_kernel(
     group_size: int,
     reconn_sz: int,
     backend: str = "cute",
     comp_params: CompParams | None = None,
+    gated: bool = False,
+    bwd_db_params: BwdDBCompParams | None = None,
+    bwd_dadr_params: BwdDAdRCompParams | None = None,
 ) -> Path:
     """Compile (or retrieve from cache) a kernel .so for the given parameters.
 
@@ -306,9 +341,13 @@ def compile_kernel(
     """
     if comp_params is None:
         comp_params = CompParams()
+    if bwd_db_params is None:
+        bwd_db_params = BwdDBCompParams()
+    if bwd_dadr_params is None:
+        bwd_dadr_params = BwdDAdRCompParams()
 
     src = _source_root()
-    cache = _cache_root() / "builds" / _build_dir_name(group_size, reconn_sz, backend, comp_params)
+    cache = _cache_root() / "builds" / _build_dir_name(group_size, reconn_sz, backend, comp_params, gated)
     cache.mkdir(parents=True, exist_ok=True)
 
     target = _target_name(group_size, reconn_sz, backend)
@@ -341,8 +380,9 @@ def compile_kernel(
 
         # Generate config header and CMakeLists.txt
         if backend == "cute":
-            (cache / "oft_config.hpp").write_text(comp_params.to_header())
-            _generate_cmake_cute(cache, src, group_size, reconn_sz)
+            header = _compose_config_header(comp_params, bwd_db_params, bwd_dadr_params)
+            (cache / "oft_config.hpp").write_text(header)
+            _generate_cmake_cute(cache, src, group_size, reconn_sz, gated)
         elif backend == "cublas":
             _generate_cmake_cublas(cache, src)
 

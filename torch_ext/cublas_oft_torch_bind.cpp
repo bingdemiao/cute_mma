@@ -6,7 +6,25 @@ torch::Tensor cublas_oft_forward(
     torch::Tensor R,
     int64_t group_size,
     int64_t reconn_sz,
-    bool rw_mode);
+    bool rw_mode,
+    bool gated);
+
+std::vector<torch::Tensor> cublas_backward_dA_dR(
+    torch::Tensor dC,
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor R,
+    int64_t group_size,
+    int64_t reconn_sz,
+    bool gated);
+
+torch::Tensor cublas_backward_dB(
+    torch::Tensor dC,
+    torch::Tensor A,
+    torch::Tensor R,
+    int64_t group_size,
+    int64_t reconn_sz,
+    bool gated);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &cublas_oft_forward,
@@ -16,5 +34,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("R"),
           py::arg("group_size") = 256,
           py::arg("reconn_sz") = 8,
-          py::arg("rw_mode") = false);
+          py::arg("rw_mode") = false,
+          py::arg("gated") = false);
+    m.def("backward_dA_dR", &cublas_backward_dA_dR,
+          "OFT backward (cuBLAS): compute dA, dR",
+          py::arg("dC"),
+          py::arg("A"),
+          py::arg("B"),
+          py::arg("R"),
+          py::arg("group_size") = 256,
+          py::arg("reconn_sz") = 8,
+          py::arg("gated") = false);
+    m.def("backward_dB", &cublas_backward_dB,
+          "OFT backward (cuBLAS): compute dB",
+          py::arg("dC"),
+          py::arg("A"),
+          py::arg("R"),
+          py::arg("group_size") = 256,
+          py::arg("reconn_sz") = 8,
+          py::arg("gated") = false);
 }

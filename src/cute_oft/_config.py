@@ -33,19 +33,8 @@ class CompParams:
     warp_layout2: tuple[int, ...] = (2, 2)
 
     def to_header(self) -> str:
-        """Generate the oft_config.hpp content."""
-
-        def _layout_type(shape: tuple[int, ...]) -> str:
-            if len(shape) == 1:
-                return f"cute::Layout<cute::Shape<cute::Int<{shape[0]}>>>"
-            inner = ", ".join(f"cute::Int<{s}>" for s in shape)
-            return f"cute::Layout<cute::Shape<{inner}>>"
-
+        """Generate the C++ struct definition for CurrCompParams."""
         return f"""\
-#pragma once
-#include <cute/tensor.hpp>
-namespace cute {{
-
     struct CurrCompParams {{
         static const unsigned int bM = {self.bM};
         static const unsigned int bN = {self.bN};
@@ -56,12 +45,97 @@ namespace cute {{
         static const unsigned int bP_b = {self.bP_b};
         using warp_layout1 = {_layout_type(self.warp_layout1)};
         using warp_layout2 = {_layout_type(self.warp_layout2)};
-    }};
-
-}}
-"""
+    }};"""
 
     def cache_key(self) -> str:
         """Short hash identifying this parameter combination."""
+        content = self.to_header()
+        return hashlib.sha256(content.encode()).hexdigest()[:12]
+
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-compatible dictionary."""
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CompParams:
+        """Deserialize from a dictionary."""
+        d = dict(d)
+        # Convert lists back to tuples for warp layouts
+        for key in ("warp_layout1", "warp_layout2"):
+            if key in d and isinstance(d[key], list):
+                d[key] = tuple(d[key])
+        return cls(**d)
+
+
+def _layout_type(shape: tuple[int, ...]) -> str:
+    """Convert a tuple of ints to a CuTe Layout type string."""
+    if len(shape) == 1:
+        return f"cute::Layout<cute::Shape<cute::Int<{shape[0]}>>>"
+    inner = ", ".join(f"cute::Int<{s}>" for s in shape)
+    return f"cute::Layout<cute::Shape<{inner}>>"
+
+
+@dataclasses.dataclass(frozen=True)
+class BwdDBCompParams:
+    """Performance parameters for the backward dB kernel (producer-consumer)."""
+
+    bM: int = 32           # M tile size (reduction dim, iterated)
+    bK: int = 32           # K tile size (output dim)
+    bP_a: int = 2          # Pipeline depth: A async loads (producer)
+    bP_ar: int = 2         # Pipeline depth: AR producer→consumer
+    bP_dc: int = 2         # Pipeline depth: dC async loads (consumer)
+    warp_layout_producer: tuple[int, ...] = (2,)    # 2 warps
+    warp_layout_consumer: tuple[int, ...] = (2, 2)  # 4 warps
+
+    def to_header(self) -> str:
+        """Generate the C++ struct definition."""
+        return f"""\
+    struct BwdDBParams {{
+        static const unsigned int bM = {self.bM};
+        static const unsigned int bK = {self.bK};
+        static const unsigned int bP_a = {self.bP_a};
+        static const unsigned int bP_ar = {self.bP_ar};
+        static const unsigned int bP_dc = {self.bP_dc};
+        using warp_layout_producer = {_layout_type(self.warp_layout_producer)};
+        using warp_layout_consumer = {_layout_type(self.warp_layout_consumer)};
+    }};"""
+
+    def cache_key(self) -> str:
+        content = self.to_header()
+        return hashlib.sha256(content.encode()).hexdigest()[:12]
+
+
+@dataclasses.dataclass(frozen=True)
+class BwdDAdRCompParams:
+    """Performance parameters for the backward fused dA+dR kernel (producer-consumer).
+
+    Producer: loads dC + B, computes dAR = dC @ B^T via MMA (heavy, gs reduction).
+    Consumer: loads A + R, computes AR via MMA, then dA/dR via MMA (light).
+    """
+
+    bM: int = 32           # M tile size
+    n_buf_slots: int = 16  # Number of dR buffer slots (controls atomic contention)
+    bP_dc_b: int = 2       # Pipeline depth: dC+B async loads (producer)
+    bP_dar: int = 2        # Pipeline depth: dAR producer→consumer
+    bP_a_r: int = 2        # Pipeline depth: A+R async loads (consumer)
+    # Producer: heavy GEMM (gs reduction)
+    warp_layout_producer: tuple[int, ...] = (2,)    # 2 warps
+    # Consumer: light MMA ops (rs reduction)
+    warp_layout_consumer: tuple[int, ...] = (2,)    # 2 warps
+
+    def to_header(self) -> str:
+        """Generate the C++ struct definition."""
+        return f"""\
+    struct BwdDAdRParams {{
+        static const unsigned int bM = {self.bM};
+        static const unsigned int n_buf_slots = {self.n_buf_slots};
+        static const unsigned int bP_dc_b = {self.bP_dc_b};
+        static const unsigned int bP_dar = {self.bP_dar};
+        static const unsigned int bP_a_r = {self.bP_a_r};
+        using warp_layout_producer = {_layout_type(self.warp_layout_producer)};
+        using warp_layout_consumer = {_layout_type(self.warp_layout_consumer)};
+    }};"""
+
+    def cache_key(self) -> str:
         content = self.to_header()
         return hashlib.sha256(content.encode()).hexdigest()[:12]

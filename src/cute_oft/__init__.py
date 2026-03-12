@@ -24,6 +24,7 @@ from typing import Literal
 
 import torch
 
+from ._autotune import autotune
 from ._compiler import CompilationError, clear_cache
 from ._config import CompParams
 from ._loader import get_or_compile
@@ -36,6 +37,8 @@ from ._validate import (
 
 __all__ = [
     "forward",
+    "backward",
+    "autotune",
     "clear_cache",
     "CompParams",
     "CompilationError",
@@ -43,6 +46,9 @@ __all__ = [
 
 BACKENDS = ("cute", "cublas", "pytorch")
 MODES = ("ar", "rw")
+
+
+ACTIVATIONS = (None, "silu_gate")
 
 
 def forward(
@@ -53,7 +59,8 @@ def forward(
     reconn_sz: int = 8,
     backend: Literal["cute", "cublas", "pytorch"] = "cute",
     mode: Literal["ar", "rw"] = "ar",
-    comp_params: CompParams | None = None,
+    comp_params: CompParams | Literal["auto"] | None = None,
+    activation: Literal["silu_gate"] | None = None,
 ) -> torch.Tensor:
     """Compute C = A @ diag(R) @ B^T with OFT structure.
 
@@ -73,7 +80,12 @@ def forward(
             Only supported by "cublas" and "pytorch" backends. The "cute" backend
             always uses "ar" mode.
         comp_params: Performance tuning parameters for the 'cute' backend. Ignored
-            by other backends. Uses defaults if None.
+            by other backends. Pass "auto" to run autotuning for the given problem
+            shape. Uses defaults if None.
+        activation: Optional non-linearity inserted between AR and B stages.
+            - None: Standard OFT: C = (A @ R^T) @ B^T
+            - "silu_gate": Gated OFT: C = (A * SiLU(A @ R^T)) @ B^T
+            Only supported in "ar" mode.
 
     Returns:
         Output tensor of shape (M, N), float16, CUDA.
@@ -93,27 +105,120 @@ def forward(
         )
     if backend == "cute" and mode != "ar":
         raise ValueError("The 'cute' backend only supports mode='ar'")
+    if activation not in ACTIVATIONS:
+        raise ValueError(
+            f"Unknown activation {activation!r}, must be one of {ACTIVATIONS}"
+        )
+    if activation is not None and mode != "ar":
+        raise ValueError(
+            f"activation={activation!r} is only supported in mode='ar'"
+        )
+
+    gated = activation == "silu_gate"
 
     validate_kernel_params(group_size, reconn_sz)
     validate_tensor_params(A, B, R, group_size, reconn_sz)
 
     if backend == "pytorch":
         from ._pytorch_backend import pytorch_forward
-        return pytorch_forward(A, B, R, group_size, reconn_sz, rw_mode=(mode == "rw"))
+        return pytorch_forward(
+            A, B, R, group_size, reconn_sz,
+            rw_mode=(mode == "rw"), activation=activation,
+        )
 
     if backend == "cute":
-        if comp_params is None:
+        if comp_params == "auto":
+            M, K = A.shape
+            N = B.shape[0]
+            comp_params = autotune(
+                M, N, K, group_size, reconn_sz,
+                device=A.device.index or 0,
+                gated=gated,
+            )
+        elif comp_params is None:
             comp_params = CompParams()
         smem = compute_smem_bytes(
             comp_params.bM, comp_params.bN, comp_params.bK,
             group_size, reconn_sz,
             comp_params.c_width,
             comp_params.bP_a_r, comp_params.bP_ar, comp_params.bP_b,
+            gated=gated,
         )
         check_smem_limit(smem, A.device.index or 0)
-        module = get_or_compile(group_size, reconn_sz, backend, comp_params)
+        module = get_or_compile(group_size, reconn_sz, backend, comp_params, gated=gated)
         return module.forward(A, B, R, group_size, reconn_sz)
 
     # cublas backend
     module = get_or_compile(group_size, reconn_sz, backend, comp_params)
-    return module.forward(A, B, R, group_size, reconn_sz, mode == "rw")
+    return module.forward(A, B, R, group_size, reconn_sz, mode == "rw", gated)
+
+
+def backward(
+    dC: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    R: torch.Tensor,
+    group_size: int = 256,
+    reconn_sz: int = 8,
+    backend: Literal["cute", "cublas", "pytorch"] = "pytorch",
+    activation: Literal["silu_gate"] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Compute gradients for OFT backward pass.
+
+    Recomputes intermediate activations (AR or A*SiLU(AR)) from inputs
+    rather than storing them, to minimize memory usage.
+
+    When activation is None (non-gated / fine-tuning mode), dB is not
+    computed and returned as None, since B is frozen.
+
+    Args:
+        dC: Gradient of loss w.r.t. output C, shape (M, N), float16, CUDA.
+        A: Input tensor of shape (M, K), float16, CUDA.
+        B: Weight tensor of shape (N, K), float16, CUDA.
+        R: Reconnection matrix of shape (n_groups * reconn_sz, K), float16, CUDA.
+        group_size: Number of output channels per group.
+        reconn_sz: Reconnection block size.
+        backend: Computation backend. "pytorch", "cublas", or "cute".
+        activation: Must match the activation used in the forward pass.
+
+    Returns:
+        (dA, dR, dB) — gradients w.r.t. A, R, B respectively.
+        dB is None when activation is None (non-gated mode).
+    """
+    if activation not in ACTIVATIONS:
+        raise ValueError(
+            f"Unknown activation {activation!r}, must be one of {ACTIVATIONS}"
+        )
+
+    validate_kernel_params(group_size, reconn_sz)
+    validate_tensor_params(A, B, R, group_size, reconn_sz)
+
+    gated = activation == "silu_gate"
+
+    if backend == "pytorch":
+        from ._pytorch_backend import pytorch_backward
+        return pytorch_backward(dC, A, B, R, group_size, reconn_sz, activation=activation)
+
+    if backend == "cublas":
+        module = get_or_compile(group_size, reconn_sz, backend)
+        grads = module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated)
+        dA, dR = grads[0], grads[1]
+        if gated:
+            dB = module.backward_dB(dC, A, R, group_size, reconn_sz, gated)
+        else:
+            dB = None
+        return dA, dR, dB
+
+    if backend == "cute":
+        module = get_or_compile(group_size, reconn_sz, backend, gated=gated)
+        grads = module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated)
+        dA, dR = grads[0], grads[1]
+        if gated:
+            dB = module.backward_dB(dC, A, R, group_size, reconn_sz, gated)
+        else:
+            dB = None
+        return dA, dR, dB
+
+    raise ValueError(
+        f"Backend {backend!r} is not yet supported for backward pass."
+    )

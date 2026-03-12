@@ -18,6 +18,7 @@ def get_or_compile(
     reconn_sz: int,
     backend: str = "cute",
     comp_params: CompParams | None = None,
+    gated: bool = False,
 ) -> ModuleType:
     """Get a compiled kernel module, compiling if necessary.
 
@@ -29,12 +30,17 @@ def get_or_compile(
     if backend == "cublas":
         # cuBLAS supports dynamic hyperparameters — single compiled module
         key = "cublas_oft"
+        module_name = key
     else:
-        key = f"cute_oft_g{group_size}_r{reconn_sz}"
+        # Cache key includes comp_params hash so different configs don't collide.
+        # Module name must match the PyInit_ symbol in the .so (target name only).
+        gated_suffix = "_gated" if gated else ""
+        key = f"cute_oft_g{group_size}_r{reconn_sz}_{comp_params.cache_key()}{gated_suffix}"
+        module_name = f"cute_oft_g{group_size}_r{reconn_sz}"
 
     if key not in _module_cache:
-        so_path = compile_kernel(group_size, reconn_sz, backend, comp_params)
-        module = _load_so(so_path, key)
+        so_path = compile_kernel(group_size, reconn_sz, backend, comp_params, gated=gated)
+        module = _load_so(so_path, module_name)
         _module_cache[key] = module
 
     return _module_cache[key]

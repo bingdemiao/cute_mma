@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import cute_oft
 
 
-def oft_reference(A, B, R, group_size, reconn_sz):
+def oft_reference(A, B, R, group_size, reconn_sz, activation=None):
     """Reference implementation (AR mode)."""
     M, K = A.shape
     N = B.shape[0]
@@ -38,6 +38,8 @@ def oft_reference(A, B, R, group_size, reconn_sz):
                 A[:, b * reconn_sz : (b + 1) * reconn_sz] @ R_block.T
             )
 
+        if activation == "silu_gate":
+            AR = A * torch.nn.functional.silu(AR)
         B_group = B[g * group_size : (g + 1) * group_size, :]
         C[:, g * group_size : (g + 1) * group_size] = AR @ B_group.T
 
@@ -63,12 +65,12 @@ def make_test_tensors(m, n, k, group_size, reconn_sz):
     return A, B, R
 
 
-def test_oft(m, n, k, group_size=256, reconn_sz=8, backend="cute", mode="ar", error_threshold=5e-3):
+def test_oft(m, n, k, group_size=256, reconn_sz=8, backend="cute", mode="ar", error_threshold=5e-3, activation=None):
     """Test a backend against the reference."""
     A, B, R = make_test_tensors(m, n, k, group_size, reconn_sz)
 
-    C_ref = oft_reference(A, B, R, group_size, reconn_sz)
-    C_kernel = cute_oft.forward(A, B, R, group_size, reconn_sz, backend=backend, mode=mode)
+    C_ref = oft_reference(A, B, R, group_size, reconn_sz, activation=activation)
+    C_kernel = cute_oft.forward(A, B, R, group_size, reconn_sz, backend=backend, mode=mode, activation=activation)
 
     # Check for NaN/Inf
     nan_count = C_kernel.isnan().sum().item()
@@ -95,8 +97,9 @@ def test_oft(m, n, k, group_size=256, reconn_sz=8, backend="cute", mode="ar", er
     max_acceptable_mean = 0.01
     passed = mean_error < max_acceptable_mean and nan_count == 0
     status = "PASS" if passed else "FAIL"
+    act_str = f" act={activation}" if activation else ""
     print(
-        f"[{status}] {backend:8s}/{mode:2s} M={m}, N={n}, K={k}, gs={group_size}, rs={reconn_sz}: "
+        f"[{status}] {backend:8s}/{mode:2s} M={m}, N={n}, K={k}, gs={group_size}, rs={reconn_sz}{act_str}: "
         f"mean_rel_err={mean_error:.6f}, max_rel_err={max_error:.6f}, "
         f"error_rate={error_rate*100:.2f}% (at {error_threshold:.0e} threshold)"
     )
@@ -110,6 +113,9 @@ ALL_CONFIGS = {
     "cute":    ["ar"],
 }
 
+# Backends that support gated activation (AR mode only)
+GATED_BACKENDS = ["pytorch", "cublas", "cute"]
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="OFT kernel correctness tests")
@@ -117,6 +123,8 @@ if __name__ == "__main__":
                         help="Test only this backend (default: all)")
     parser.add_argument("--mode", choices=["ar", "rw"],
                         help="Test only this mode (default: all supported modes)")
+    parser.add_argument("--activation", choices=["silu_gate"],
+                        help="Test only this activation (default: test both None and silu_gate)")
     args = parser.parse_args()
 
     # Build list of (backend, mode) pairs to test
@@ -142,6 +150,21 @@ if __name__ == "__main__":
 
             # Test with different hyperparameters
             all_passed &= test_oft(1024, 1024, 256, group_size=128, reconn_sz=16, backend=backend, mode=mode)
+
+    # Test gated activation (silu_gate) — AR mode only
+    gated_backends = [args.backend] if args.backend else GATED_BACKENDS
+    if args.mode != "rw" and args.activation != "silu_gate" or args.activation == "silu_gate":
+        for backend in gated_backends:
+            if args.activation == "silu_gate" or args.activation is None:
+                print(f"\n--- Backend: {backend}, Mode: ar, Activation: silu_gate ---\n")
+
+                all_passed &= test_oft(256, 256, 32, backend=backend, activation="silu_gate")
+                all_passed &= test_oft(1024, 1024, 256, backend=backend, activation="silu_gate")
+                all_passed &= test_oft(4096, 4096, 1024, backend=backend, activation="silu_gate")
+
+                # Test with different hyperparameters
+                all_passed &= test_oft(1024, 1024, 256, group_size=128, reconn_sz=16,
+                                       backend=backend, activation="silu_gate")
 
     print()
     if all_passed:
