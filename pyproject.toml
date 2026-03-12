@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cute-oft"
+version = "0.1.0"
+description = "JIT-compiled OFT (Orthogonal Fine-Tuning) CUDA kernels for PyTorch"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "einops",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

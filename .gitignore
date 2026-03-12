@@ -2,3 +2,6 @@ build*
 media*
 autotune_configs/**/oft_config.hpp
 python
+*.egg-info
+__pycache__
+playgrounds
