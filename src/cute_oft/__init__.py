@@ -79,6 +79,7 @@ def forward(
     activation: Literal["silu_gate"] | None = None,
     autotuning: bool = False,
     autotuning_search_space: Iterable[CompParams | tuple[CompParams, Callable]] | None = None,
+    force_rebenchmark: bool = False,
 ) -> torch.Tensor:
     """Compute C = A @ diag(R) @ B^T with OFT structure.
 
@@ -139,6 +140,7 @@ def forward(
                 device=A.device.index or 0,
                 gated=gated,
                 search_space=autotuning_search_space,
+                force_rebenchmark=force_rebenchmark,
             )
         elif comp_params is None:
             comp_params = CompParams()
@@ -183,6 +185,7 @@ def backward(
     autotuning_search_space_db: Iterable[BwdDBCompParams | tuple[BwdDBCompParams, Callable]] | None = None,
     bwd_dadr_params: BwdDAdRCompParams | None = None,
     bwd_db_params: BwdDBCompParams | None = None,
+    force_rebenchmark: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Compute gradients for OFT backward pass.
 
@@ -248,6 +251,7 @@ def backward(
                     M, N, K, group_size, reconn_sz,
                     device=dev, gated=gated,
                     search_space=autotuning_search_space_dadr,
+                    force_rebenchmark=force_rebenchmark,
                 )
             else:
                 bwd_dadr_params = BwdDAdRCompParams()
@@ -277,6 +281,7 @@ def backward(
                         M, N, K, group_size, reconn_sz,
                         device=dev, gated=gated,
                         search_space=autotuning_search_space_db,
+                        force_rebenchmark=force_rebenchmark,
                     )
                 else:
                     bwd_db_params = BwdDBCompParams()

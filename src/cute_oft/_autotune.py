@@ -202,6 +202,60 @@ def _save_cache(cache: dict) -> None:
     path.write_text(json.dumps(cache, indent=2))
 
 
+def _compile_failed_path() -> Path:
+    import os
+    root = Path(os.environ.get("CUTE_OFT_CACHE_DIR", Path.home() / ".cache" / "cute_oft"))
+    return root / "compile_failed.json"
+
+
+def _load_compile_failed() -> dict[str, dict]:
+    """Load the global compile-failed registry.
+
+    Returns dict mapping compile_context_key -> {"source_hash": str, "keys": [str]}
+    """
+    path = _compile_failed_path()
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_compile_failed(data: dict[str, dict]) -> None:
+    path = _compile_failed_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+
+
+def _compile_context_key(
+    group_size: int, reconn_sz: int,
+    kernel_type: KernelType, gated: bool,
+) -> str:
+    """Key for compile-failed registry (shape-independent)."""
+    suffix = "_gated" if gated else ""
+    return f"{kernel_type}_g{group_size}_r{reconn_sz}{suffix}"
+
+
+def _current_source_hash(kernel_type: KernelType) -> str:
+    """Get the current source hash for a kernel type."""
+    from ._compiler import _compute_source_hash, _source_root
+    src = _source_root()
+    return _compute_source_hash(src, "cute", kernel_type)
+
+
+def _load_known_bad(ctx_key: str, kernel_type: KernelType) -> set[str]:
+    """Load known-bad config keys for a context, checking source hash freshness."""
+    data = _load_compile_failed()
+    entry = data.get(ctx_key)
+    if entry is None:
+        return set()
+    # If source has changed, these failures may no longer apply
+    if entry.get("source_hash") != _current_source_hash(kernel_type):
+        return set()
+    return set(entry.get("keys", []))
+
+
 def _parse_problem_key(key: str) -> dict | None:
     """Parse a _problem_key string back into its components.
 
@@ -312,6 +366,11 @@ def clear_autotune_cache(
         return
 
     # Mode 2: full wipe
+    # Also clear the compile-failed registry
+    cf_path = _compile_failed_path()
+    if cf_path.exists():
+        cf_path.unlink()
+
     cache_path = _cache_path()
 
     if keep_best_kernels:
@@ -478,6 +537,7 @@ def _autotune_generic(
     verbose: bool,
     gated: bool,
     make_tensors: Callable,
+    force_rebenchmark: bool = False,
 ) -> T:
     """Generic autotuning engine shared by all three autotune functions.
 
@@ -504,8 +564,12 @@ def _autotune_generic(
     # Build lookup for cached results
     tested_by_key = {t["cache_key"]: t for t in entry.get("tested", [])}
 
+    # Load global compile-failed registry (auto-invalidated on source changes)
+    ctx_key = _compile_context_key(group_size, reconn_sz, kernel_type, gated)
+    known_bad: set[str] = _load_known_bad(ctx_key, kernel_type)
+
     # If no search space provided and we have a cached best, return it
-    if search_space is None and entry.get("best") is not None:
+    if search_space is None and entry.get("best") is not None and not force_rebenchmark:
         cached_best = entry["best"]
         params = params_cls.from_dict(cached_best["params"])
         if verbose:
@@ -533,13 +597,20 @@ def _autotune_generic(
         if callback is not None:
             callbacks[ck] = callback
 
-        if ck in tested_keys:
+        if ck in tested_keys and not force_rebenchmark:
             # Already tested — report cached result through callback
             skipped_count += 1
             if callback is not None:
                 cached_entry = tested_by_key.get(ck)
                 if cached_entry is not None:
                     callback(config, cached_entry.get("time_ms"))
+            continue
+
+        if ck in known_bad:
+            # Known compile failure — skip without recompiling
+            skipped_count += 1
+            if callback is not None:
+                callback(config, None)
             continue
 
         configs_to_test.append(config)
@@ -695,7 +766,14 @@ def _autotune_generic(
     final_results = [r for r in new_results if r is not None]
 
     # Merge new results into cache entry
-    all_tested = entry.get("tested", []) + final_results
+    if force_rebenchmark:
+        # Replace old entries with new results for the same cache_key
+        old_by_key = {t["cache_key"]: t for t in entry.get("tested", [])}
+        for r in final_results:
+            old_by_key[r["cache_key"]] = r
+        all_tested = list(old_by_key.values())
+    else:
+        all_tested = entry.get("tested", []) + final_results
 
     # Find overall best (excluding None/failed)
     valid = [t for t in all_tested if t.get("time_ms") is not None]
@@ -707,6 +785,25 @@ def _autotune_generic(
             raise RuntimeError(f"All {kernel_type} configurations failed during benchmarking.")
     else:
         best_entry = min(valid, key=lambda t: t["time_ms"])
+
+    # Record newly discovered compile failures in the global registry
+    new_bad = [
+        r["cache_key"] for r in final_results
+        if r.get("time_ms") is None and r["cache_key"] not in known_bad
+    ]
+    if new_bad:
+        compile_failed_data = _load_compile_failed()
+        src_hash = _current_source_hash(kernel_type)
+        entry_cf = compile_failed_data.get(ctx_key, {})
+        # Reset if source changed
+        if entry_cf.get("source_hash") != src_hash:
+            entry_cf = {"source_hash": src_hash, "keys": []}
+        existing = set(entry_cf.get("keys", []))
+        existing.update(new_bad)
+        entry_cf["keys"] = sorted(existing)
+        entry_cf["source_hash"] = src_hash
+        compile_failed_data[ctx_key] = entry_cf
+        _save_compile_failed(compile_failed_data)
 
     # Update cache
     if use_cache:
@@ -798,6 +895,7 @@ def autotune(
     use_cache: bool = True,
     verbose: bool = True,
     gated: bool = False,
+    force_rebenchmark: bool = False,
 ) -> CompParams:
     """Find the best CompParams for the forward kernel.
 
@@ -805,6 +903,8 @@ def autotune(
         device: GPU device index or list of device indices for multi-GPU
             benchmarking.  When multiple devices are given, benchmark work
             is distributed across them for faster autotuning.
+        force_rebenchmark: When True, re-benchmark all configs even if cached
+            results exist.  Useful when previous measurements seem unreliable.
     """
     return _autotune_generic(
         kernel_type="fwd",
@@ -817,6 +917,7 @@ def autotune(
         warmup=warmup, repeat=repeat,
         use_cache=use_cache, verbose=verbose, gated=gated,
         make_tensors=_make_fwd_tensors,
+        force_rebenchmark=force_rebenchmark,
     )
 
 
@@ -833,12 +934,15 @@ def autotune_bwd_dadr(
     use_cache: bool = True,
     verbose: bool = True,
     gated: bool = False,
+    force_rebenchmark: bool = False,
 ) -> BwdDAdRCompParams:
     """Find the best BwdDAdRCompParams for the backward dA+dR kernel.
 
     Args:
         device: GPU device index or list of device indices for multi-GPU
             benchmarking.
+        force_rebenchmark: When True, re-benchmark all configs even if cached
+            results exist.
     """
     return _autotune_generic(
         kernel_type="bwd_dadr",
@@ -851,6 +955,7 @@ def autotune_bwd_dadr(
         warmup=warmup, repeat=repeat,
         use_cache=use_cache, verbose=verbose, gated=gated,
         make_tensors=_make_bwd_dadr_tensors,
+        force_rebenchmark=force_rebenchmark,
     )
 
 
@@ -867,12 +972,15 @@ def autotune_bwd_db(
     use_cache: bool = True,
     verbose: bool = True,
     gated: bool = False,
+    force_rebenchmark: bool = False,
 ) -> BwdDBCompParams:
     """Find the best BwdDBCompParams for the backward dB kernel.
 
     Args:
         device: GPU device index or list of device indices for multi-GPU
             benchmarking.
+        force_rebenchmark: When True, re-benchmark all configs even if cached
+            results exist.
     """
     return _autotune_generic(
         kernel_type="bwd_db",
@@ -885,4 +993,5 @@ def autotune_bwd_db(
         warmup=warmup, repeat=repeat,
         use_cache=use_cache, verbose=verbose, gated=gated,
         make_tensors=_make_bwd_db_tensors,
+        force_rebenchmark=force_rebenchmark,
     )

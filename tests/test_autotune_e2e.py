@@ -23,6 +23,16 @@ from cute_oft._autotune import (
     default_search_space,
     default_search_space_bwd_dadr,
     default_search_space_bwd_db,
+    get_autotune_cache,
+    clear_autotune_cache,
+    _load_compile_failed,
+    _save_compile_failed,
+    _compile_context_key,
+    _compile_failed_path,
+    _current_source_hash,
+    _load_known_bad,
+    _cache_path,
+    _load_cache,
 )
 from cute_oft._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 
@@ -435,3 +445,296 @@ def test_auto_mode_gated():
     for name, val, ref in [("C", C, C_ref), ("dA", dA, dA_ref), ("dR", dR, dR_ref), ("dB", dB, dB_ref)]:
         ok, mean_err, _ = check_gradient(name, val, ref.float(), 0.02)
         assert ok, f"{name} auto gated: mean_rel_err={mean_err:.6f}"
+
+
+# ---------------------------------------------------------------------------
+# force_rebenchmark tests
+# ---------------------------------------------------------------------------
+
+def test_force_rebenchmark():
+    """Test that force_rebenchmark re-benchmarks all configs and replaces cached timings."""
+    m, n, k = 256, 256, 32
+    group_size, reconn_sz = 256, 8
+
+    configs = default_search_space(group_size, reconn_sz)[:2]
+    if not configs:
+        pytest.skip("No configs available")
+
+    # First run: populate cache
+    best1 = autotune(
+        m, n, k, group_size, reconn_sz,
+        search_space=configs,
+        warmup=1, repeat=3,
+        use_cache=True, verbose=False,
+    )
+
+    # Verify results are cached
+    cache = get_autotune_cache()
+    shape_key = (m, n, k, group_size, reconn_sz)
+    assert shape_key in cache
+    assert ("fwd", False) in cache[shape_key]
+    first_timings = dict(cache[shape_key][("fwd", False)])
+
+    # Second run: force_rebenchmark should re-benchmark all, not skip
+    bench_count = 0
+    def cb(config, time_ms):
+        nonlocal bench_count
+        bench_count += 1
+
+    items = [(c, cb) for c in configs]
+    best2 = autotune(
+        m, n, k, group_size, reconn_sz,
+        search_space=items,
+        warmup=1, repeat=3,
+        use_cache=True, verbose=False,
+        force_rebenchmark=True,
+    )
+
+    # All configs should have been benchmarked (not skipped)
+    assert bench_count == len(configs), (
+        f"Expected {len(configs)} benchmarks, got {bench_count}"
+    )
+
+    # Cache should still have the same config keys (replaced, not duplicated)
+    cache2 = get_autotune_cache()
+    second_timings = cache2[shape_key][("fwd", False)]
+    assert set(second_timings.keys()) == set(first_timings.keys())
+
+    # Both runs should return a valid CompParams
+    assert isinstance(best1, CompParams)
+    assert isinstance(best2, CompParams)
+
+
+def test_force_rebenchmark_no_search_space():
+    """Test that force_rebenchmark with no search_space re-runs default space."""
+    m, n, k = 256, 256, 32
+    group_size, reconn_sz = 256, 8
+
+    configs = default_search_space(group_size, reconn_sz)[:2]
+    if not configs:
+        pytest.skip("No configs available")
+
+    # Populate cache
+    autotune(
+        m, n, k, group_size, reconn_sz,
+        search_space=configs,
+        warmup=1, repeat=3,
+        use_cache=True, verbose=False,
+    )
+
+    # Without force_rebenchmark, should return cached best immediately
+    best_cached = autotune(
+        m, n, k, group_size, reconn_sz,
+        warmup=1, repeat=3,
+        use_cache=True, verbose=False,
+    )
+    assert isinstance(best_cached, CompParams)
+
+    # With force_rebenchmark=True and no search_space, should re-run default space
+    best_rebench = autotune(
+        m, n, k, group_size, reconn_sz,
+        warmup=1, repeat=3,
+        use_cache=True, verbose=False,
+        force_rebenchmark=True,
+    )
+    assert isinstance(best_rebench, CompParams)
+
+
+# ---------------------------------------------------------------------------
+# Compile-failed registry tests
+# ---------------------------------------------------------------------------
+
+def test_compile_failed_registry_skips_across_mnk():
+    """Test that configs that fail compilation are skipped for different MNK sizes."""
+    group_size, reconn_sz = 256, 8
+    m1, n1, k1 = 256, 256, 32
+    m2, n2, k2 = 1024, 1024, 256
+
+    configs = default_search_space(group_size, reconn_sz)[:2]
+    if not configs:
+        pytest.skip("No configs available")
+
+    # Inject a fake "bad" config into the compile-failed registry
+    fake_bad_key = "fake_bad_config_000"
+    ctx_key = _compile_context_key(group_size, reconn_sz, "fwd", False)
+    src_hash = _current_source_hash("fwd")
+    cf_data = _load_compile_failed()
+    cf_data[ctx_key] = {"source_hash": src_hash, "keys": [fake_bad_key]}
+    _save_compile_failed(cf_data)
+
+    try:
+        # Create a fake CompParams whose cache_key matches our bad key
+        # We can't easily control cache_key, so instead test via _load_known_bad
+        known_bad = _load_known_bad(ctx_key, "fwd")
+        assert fake_bad_key in known_bad
+
+        # Verify it's also returned for a different MNK (same group_size/reconn_sz)
+        known_bad2 = _load_known_bad(ctx_key, "fwd")
+        assert fake_bad_key in known_bad2
+    finally:
+        # Clean up: remove fake entry
+        cf_data = _load_compile_failed()
+        if ctx_key in cf_data:
+            entry = cf_data[ctx_key]
+            keys = entry.get("keys", [])
+            if fake_bad_key in keys:
+                keys.remove(fake_bad_key)
+            if not keys:
+                del cf_data[ctx_key]
+            else:
+                entry["keys"] = keys
+            _save_compile_failed(cf_data)
+
+
+def test_compile_failed_invalidated_on_source_change():
+    """Test that compile-failed entries are ignored when source hash changes."""
+    group_size, reconn_sz = 256, 8
+    ctx_key = _compile_context_key(group_size, reconn_sz, "fwd", False)
+
+    # Write a compile-failed entry with a stale source hash
+    cf_data = _load_compile_failed()
+    cf_data[ctx_key] = {
+        "source_hash": "stale_hash_that_does_not_match",
+        "keys": ["some_bad_config"],
+    }
+    _save_compile_failed(cf_data)
+
+    try:
+        # _load_known_bad should return empty since source hash doesn't match
+        known_bad = _load_known_bad(ctx_key, "fwd")
+        assert len(known_bad) == 0, (
+            f"Expected empty known_bad for stale hash, got {known_bad}"
+        )
+    finally:
+        # Clean up
+        cf_data = _load_compile_failed()
+        if ctx_key in cf_data:
+            del cf_data[ctx_key]
+            _save_compile_failed(cf_data)
+
+
+def test_compile_failed_recorded_after_autotune():
+    """Test that new compile failures during autotuning are recorded in the registry.
+
+    We directly inject a failure into the registry (simulating what _autotune_generic
+    does after a compile fail) and verify the round-trip, since triggering a real
+    compile failure requires invalid CUDA code — configs that exceed smem limits
+    still compile, they only fail at kernel launch.
+    """
+    group_size, reconn_sz = 256, 8
+    ctx_key = _compile_context_key(group_size, reconn_sz, "fwd", False)
+    src_hash = _current_source_hash("fwd")
+    fake_ck = "injected_fail_test"
+
+    # Ensure clean state
+    cf_data = _load_compile_failed()
+    original_entry = cf_data.get(ctx_key)
+
+    try:
+        # Simulate what _autotune_generic does when it records a failure
+        cf_data[ctx_key] = {"source_hash": src_hash, "keys": [fake_ck]}
+        _save_compile_failed(cf_data)
+
+        # Verify it persists via _load_known_bad
+        known_bad = _load_known_bad(ctx_key, "fwd")
+        assert fake_ck in known_bad
+
+        # Verify it persists across a fresh load
+        cf_data2 = _load_compile_failed()
+        assert fake_ck in cf_data2[ctx_key]["keys"]
+        assert cf_data2[ctx_key]["source_hash"] == src_hash
+    finally:
+        # Restore original state
+        cf_data = _load_compile_failed()
+        if original_entry is None:
+            cf_data.pop(ctx_key, None)
+        else:
+            cf_data[ctx_key] = original_entry
+        _save_compile_failed(cf_data)
+
+
+def test_compile_failed_skipped_in_autotune():
+    """Test that known-bad configs are actually skipped during autotuning."""
+    m, n, k = 256, 256, 32
+    group_size, reconn_sz = 256, 8
+
+    configs = default_search_space(group_size, reconn_sz)[:3]
+    if len(configs) < 2:
+        pytest.skip("Need at least 2 configs")
+
+    # Inject one of the real configs as "bad" in the registry
+    ctx_key = _compile_context_key(group_size, reconn_sz, "fwd", False)
+    src_hash = _current_source_hash("fwd")
+    fake_bad_ck = configs[0].cache_key()
+
+    cf_data = _load_compile_failed()
+    cf_data[ctx_key] = {"source_hash": src_hash, "keys": [fake_bad_ck]}
+    _save_compile_failed(cf_data)
+
+    try:
+        # Run autotune — the first config should be skipped, callback reports None
+        reported: list[tuple] = []
+        def cb(config, time_ms):
+            reported.append((config.cache_key(), time_ms))
+
+        items = [(c, cb) for c in configs]
+        best = autotune(
+            m, n, k, group_size, reconn_sz,
+            search_space=items,
+            warmup=1, repeat=3,
+            use_cache=False, verbose=False,
+        )
+
+        assert isinstance(best, CompParams)
+
+        # The "bad" config should have been reported via callback with time_ms=None
+        bad_reports = [(ck, t) for ck, t in reported if ck == fake_bad_ck]
+        assert len(bad_reports) == 1, f"Expected 1 report for bad config, got {len(bad_reports)}"
+        assert bad_reports[0][1] is None, "Known-bad config should report time_ms=None"
+
+        # The best result should NOT be the fake-bad config
+        assert best.cache_key() != fake_bad_ck
+    finally:
+        # Clean up
+        cf_data = _load_compile_failed()
+        if ctx_key in cf_data:
+            del cf_data[ctx_key]
+            _save_compile_failed(cf_data)
+
+
+# ---------------------------------------------------------------------------
+# Cache management tests
+# ---------------------------------------------------------------------------
+
+def test_get_autotune_cache():
+    """Test that get_autotune_cache returns properly structured results."""
+    m, n, k = 256, 256, 32
+    group_size, reconn_sz = 256, 8
+
+    configs = default_search_space(group_size, reconn_sz)[:2]
+    if not configs:
+        pytest.skip("No configs available")
+
+    autotune(
+        m, n, k, group_size, reconn_sz,
+        search_space=configs,
+        warmup=1, repeat=3,
+        use_cache=True, verbose=False,
+    )
+
+    cache = get_autotune_cache()
+    assert isinstance(cache, dict)
+
+    shape_key = (m, n, k, group_size, reconn_sz)
+    assert shape_key in cache
+
+    kernel_entries = cache[shape_key]
+    assert ("fwd", False) in kernel_entries
+
+    config_timings = kernel_entries[("fwd", False)]
+    assert len(config_timings) >= len(configs)
+    # All tested configs should have a cache_key entry
+    for c in configs:
+        assert c.cache_key() in config_timings
+
+

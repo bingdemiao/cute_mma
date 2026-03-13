@@ -9,7 +9,7 @@ High-performance Python library for OFT (Orthogonal Fine-Tuning) — a parameter
 - **Modes**: `ar` (activation reconnection: `(A @ R^T) @ B^T`), `rw` (reweighting: `A @ (B @ R)^T`, cublas/pytorch only)
 - **Activations**: `None` (standard linear OFT), `"silu_gate"` (gated: `A * SiLU(A @ R^T)` replaces `A @ R^T`, AR mode only)
 - **CompParams / BwdDAdRCompParams / BwdDBCompParams**: Frozen dataclasses controlling tile sizes, pipeline depths, and warp layouts for each kernel type (forward, backward dA+dR, backward dB)
-- **Autotuning**: Per-kernel autotuning via pipelined compilation + benchmarking (producer-consumer overlap), caches all tested results to disk. Supports generators, callbacks, and multi-GPU benchmarking. All compiled kernels are kept on disk across autotune runs (keyed by `group_size/reconn_sz/comp_params`, not MNK).
+- **Autotuning**: Per-kernel autotuning via pipelined compilation + benchmarking (producer-consumer overlap), caches all tested results to disk. Supports generators, callbacks, multi-GPU benchmarking, and `force_rebenchmark`. All compiled kernels are kept on disk across autotune runs (keyed by `group_size/reconn_sz/comp_params`, not MNK). Configs that fail compilation are recorded in a global registry (`compile_failed.json`) and skipped across all MNK sizes.
 - **Safe fallback**: When default `CompParams` fail to compile, `forward()`/`backward()` automatically retry with `safe_defaults()`
 - **Separate compilation**: Forward, backward dAdR, and backward dB kernels compile independently for faster incremental builds
 
@@ -42,7 +42,7 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
 
 ## Public API
 
-- `cute_oft.forward(A, B, R, group_size, reconn_sz, backend, mode, comp_params, activation, autotuning, autotuning_search_space)` — main entry point
+- `cute_oft.forward(A, B, R, group_size, reconn_sz, backend, mode, comp_params, activation, autotuning, autotuning_search_space, force_rebenchmark)` — main entry point
   - `activation=None`: standard OFT `C = (A @ R^T) @ B^T`
   - `activation="silu_gate"`: gated OFT `C = (A * SiLU(A @ R^T)) @ B^T` (AR mode only)
   - `autotuning=True`: check cache first, autotune if miss, use best config
@@ -54,11 +54,12 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
   - `bwd_dadr_params` / `bwd_db_params`: explicit per-kernel params override
   - `autotuning_search_space_dadr` / `autotuning_search_space_db`: custom search spaces
   - Supported backends: `pytorch`, `cublas`, `cute`
-- `cute_oft.autotune(M, N, K, group_size, reconn_sz, device=0, ...)` — find optimal forward CompParams
+- `cute_oft.autotune(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal forward CompParams
   - `device=0` (single GPU) or `device=[0,1,2,3]` (multi-GPU benchmarking)
   - Compilation and benchmarking are pipelined: benchmarking starts as soon as the first config compiles
-- `cute_oft.autotune_bwd_dadr(M, N, K, group_size, reconn_sz, device=0, ...)` — find optimal BwdDAdRCompParams
-- `cute_oft.autotune_bwd_db(M, N, K, group_size, reconn_sz, device=0, ...)` — find optimal BwdDBCompParams
+  - `force_rebenchmark=True`: re-benchmark all configs even if cached results exist (replaces old timings)
+- `cute_oft.autotune_bwd_dadr(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal BwdDAdRCompParams
+- `cute_oft.autotune_bwd_db(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal BwdDBCompParams
 - `cute_oft.clear_autotune_cache(M, N, K, group_size, reconn_sz, device, kernel_type, gated, keep_best_kernels)` — selectively clear autotune results
   - All params provided: remove that specific entry from autotune_results.json (keeps compiled kernels)
   - No params: full wipe. `keep_best_kernels=True` (default) keeps best .so files; `False` deletes everything
