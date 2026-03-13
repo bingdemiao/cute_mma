@@ -194,7 +194,38 @@ void oft_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
             asm volatile("bar.sync %0, %1;\n"
                                 :
                                 : "r"(ar_pipe_write + K_PIPE2_MAX), "n"(n_threads_total)); // wait for the previous data to be consumed
+
             copy(r2s_atom_AR{}, tXrAR, tXsAR(_,_,_,_,ar_pipe_write));
+
+#if OFT_GATED
+            // Apply SiLU gating in smem: sAR(m,c) = sA(m,a_col) * SiLU(sAR(m,c))
+            // Must be done in smem because MMA A and C fragments have different
+            // register-to-position mappings — cannot cross-index between them.
+            asm volatile("bar.sync 14, %0;\n" : : "n"(n_threads1)); // ensure r2s complete
+            {
+                constexpr int n_grp = decltype(n_groups)::value;
+                constexpr int n_cb = decltype(c_blocks)::value;
+                constexpr int rs = decltype(reconn_sz)::value;
+                constexpr int blk_m = decltype(size<0>(sAR))::value;
+                constexpr int total = blk_m * rs * n_cb * n_grp;
+                // sAR column c maps to (r, b, g) via producer_layout_n strides:
+                //   g = c % n_grp, b = (c / n_grp) % n_cb, r = c / (n_cb * n_grp)
+                // Corresponding sA column: j * c_width + b * rs + r
+                for (int idx = thread_idx; idx < total; idx += n_threads1) {
+                    int m = idx / (rs * n_cb * n_grp);
+                    int c = idx % (rs * n_cb * n_grp);
+                    int g = c % n_grp;
+                    int b = (c / n_grp) % n_cb;
+                    int r = c / (n_cb * n_grp);
+                    int a_col = j * rs * n_cb + r * n_cb + b;
+                    float ar = float(sAR(m, c, ar_pipe_write));
+                    float a = float(sA(m, a_col, smem_pipe_read));
+                    float silu_ar = ar / (1.0f + __expf(-ar));
+                    sAR(m, c, ar_pipe_write) = half_t(a * silu_ar);
+                }
+            }
+            asm volatile("bar.sync 14, %0;\n" : : "n"(n_threads1)); // ensure gating complete
+#endif
             asm volatile("bar.arrive %0, %1;\n"
                                 :
                                 : "r"(ar_pipe_write), "n"(n_threads_total)); // signal that the data is ready
@@ -507,29 +538,6 @@ void oft_device(GridShape grid_shape, CtaTiler cta_tiler,
     }
 }
 
-template <typename copy_as_t, typename ele_t,
-  typename _BM, typename _BK, typename _N_Threads>
-constexpr auto cp_layout(_BM bm, _BK bk, _N_Threads _total_threads) {
-    using namespace cute;
-    auto vec_width = Int<sizeof(copy_as_t)>{} / Int<sizeof(ele_t)>();
-    auto total_elements = bm * bk;
-    auto needed_threads = total_elements / vec_width;
-    CUTE_STATIC_ASSERT_V(total_elements % vec_width == _0{}, "total number of elements shall be divisible by the vector length");
-    auto total_threads = min(_total_threads, needed_threads);
-    auto elements_per_thread = total_elements / total_threads;
-    CUTE_STATIC_ASSERT_V(total_elements % total_threads == _0{}, "total number of elements shall be divisible by the number of threads using");
-    CUTE_STATIC_ASSERT_V(elements_per_thread % vec_width == _0{}, "number of elements handled by each thread should be divisible by the vector width");
-    auto cp_width = vec_width;
-    auto threads_along_k = max(bk / cp_width, _1{});
-    auto threads_k_size = bk / threads_along_k;
-    auto threads_m_size = max(cp_width / bk, _1{});
-    auto threads_along_m = total_threads / threads_along_k;
-    return make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<copy_as_t>, ele_t>{},
-                        make_layout(make_shape(threads_along_m, threads_along_k), LayoutRight{}),
-                        //  Layout<Shape<Int<threads_along_m>, Int<threads_along_k>>>{},
-                        make_layout(make_shape(threads_m_size, threads_k_size)));
-}
-
 // // Setup params for a TN GEMM, K-Major inputs
 template <class KernelParams>
 void oft_tn(int m, int n, int k,
@@ -561,8 +569,8 @@ void oft_tn(int m, int n, int k,
     auto bP_ar = Int<CompParams::bP_ar>{};  // Pipeline for AR
     auto bP_b = Int<CompParams::bP_b>{};  // Pipeline for B
     int n_groups = N / group_size;
-    auto warp_layout1 = typename CompParams::warp_layout1{};
-    auto warp_layout2 = typename CompParams::warp_layout2{};
+    auto warp_layout1 = typename CompParams::warp_layout_ar{};
+    auto warp_layout2 = typename CompParams::warp_layout_arb{};
 
     // Define the gmem layouts
     auto A_layout = make_layout(

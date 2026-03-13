@@ -1,8 +1,8 @@
 """JIT compilation of OFT CUDA kernels.
 
-Compiles per-variant .so files keyed by (backend, group_size, reconn_sz, comp_params),
-caching them on disk under ~/.cache/cute_oft/. Handles file locking to
-prevent concurrent-build races.
+Compiles per-variant .so files keyed by (backend, kernel_type, group_size, reconn_sz, comp_params),
+caching them on disk under ~/.cache/cute_oft/. Each kernel type (fwd, bwd_dadr, bwd_db)
+is compiled independently for faster incremental builds.
 """
 
 from __future__ import annotations
@@ -10,11 +10,15 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Literal
 
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
+
+KernelType = Literal["fwd", "bwd_dadr", "bwd_db"]
 
 # Root of the cute_mma source tree (three levels up: _compiler.py -> cute_oft -> src -> repo root)
 _SOURCE_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -43,53 +47,124 @@ def _source_root() -> Path:
     return root
 
 
-def _source_files(src: Path, backend: str) -> list[Path]:
-    """List all source files that affect the compiled kernel."""
-    if backend == "cute":
-        return [
+def _source_files_for_kernel(src: Path, kernel_type: KernelType) -> list[Path]:
+    """List source files for a specific kernel type."""
+    common = [
+        src / "cute_oft_coop_pc.hpp",
+        src / "cute_oft_util.hpp",
+        src / "z_curve.hpp",
+        src / "common.hpp",
+    ]
+    if kernel_type == "fwd":
+        return common + [
             src / "cute_oft_coop_pc.cu",
-            src / "cute_oft_coop_pc.hpp",
-            src / "cute_oft_backward.cu",
-            src / "cute_oft_backward.hpp",
-            src / "cute_oft_util.hpp",
-            src / "z_curve.hpp",
-            src / "common.hpp",
-            src / "torch_ext" / "oft_torch.cu",
-            src / "torch_ext" / "oft_torch_bind.cpp",
+            src / "torch_ext" / "oft_fwd_torch.cu",
+            src / "torch_ext" / "oft_fwd_bind.cpp",
         ]
-    elif backend == "cublas":
-        return [
-            src / "common.hpp",
-            src / "torch_ext" / "cublas_oft_torch.cu",
-            src / "torch_ext" / "cublas_oft_torch_bind.cpp",
+    elif kernel_type == "bwd_dadr":
+        return common + [
+            src / "cute_oft_backward_dadr.cu",
+            src / "cute_oft_backward_dadr.hpp",
+            src / "torch_ext" / "oft_bwd_dadr_torch.cu",
+            src / "torch_ext" / "oft_bwd_dadr_bind.cpp",
+        ]
+    elif kernel_type == "bwd_db":
+        return common + [
+            src / "cute_oft_backward_db.cu",
+            src / "cute_oft_backward_db.hpp",
+            src / "torch_ext" / "oft_bwd_db_torch.cu",
+            src / "torch_ext" / "oft_bwd_db_bind.cpp",
         ]
     else:
-        raise ValueError(f"Unknown backend: {backend}")
+        raise ValueError(f"Unknown kernel_type: {kernel_type}")
 
 
-def _compute_source_hash(src: Path, backend: str) -> str:
+def _source_files_cublas(src: Path) -> list[Path]:
+    """List source files for the cuBLAS backend."""
+    return [
+        src / "common.hpp",
+        src / "torch_ext" / "cublas_oft_torch.cu",
+        src / "torch_ext" / "cublas_oft_torch_bind.cpp",
+    ]
+
+
+def _compute_source_hash(src: Path, backend: str, kernel_type: KernelType = "fwd") -> str:
     h = hashlib.sha256()
-    for f in sorted(_source_files(src, backend)):
+    if backend == "cublas":
+        files = _source_files_cublas(src)
+    else:
+        files = _source_files_for_kernel(src, kernel_type)
+    for f in sorted(files):
         if f.exists():
             h.update(f.read_bytes())
     return h.hexdigest()[:16]
 
 
-def _build_dir_name(group_size: int, reconn_sz: int, backend: str, comp: CompParams, gated: bool = False) -> str:
-    if backend == "cute":
-        gated_suffix = "_gated" if gated else ""
-        return f"cute_g{group_size}_r{reconn_sz}_{comp.cache_key()}{gated_suffix}"
-    elif backend == "cublas":
-        # cuBLAS supports dynamic hyperparameters — single build for all configs
-        return "cublas"
+def _params_cache_key(
+    kernel_type: KernelType,
+    comp_params: CompParams | None = None,
+    bwd_dadr_params: BwdDAdRCompParams | None = None,
+    bwd_db_params: BwdDBCompParams | None = None,
+) -> str:
+    """Get the cache key for the relevant params based on kernel type."""
+    if kernel_type == "fwd":
+        return (comp_params or CompParams()).cache_key()
+    elif kernel_type == "bwd_dadr":
+        return (bwd_dadr_params or BwdDAdRCompParams()).cache_key()
+    elif kernel_type == "bwd_db":
+        return (bwd_db_params or BwdDBCompParams()).cache_key()
     else:
-        raise ValueError(f"Unknown backend: {backend}")
+        raise ValueError(f"Unknown kernel_type: {kernel_type}")
 
 
-def _target_name(group_size: int, reconn_sz: int, backend: str) -> str:
+def _build_dir_name(
+    group_size: int,
+    reconn_sz: int,
+    backend: str,
+    kernel_type: KernelType,
+    cache_key: str,
+    gated: bool = False,
+) -> str:
+    if backend == "cublas":
+        return "cublas"
+    gated_suffix = "_gated" if gated else ""
+    return f"cute_{kernel_type}_g{group_size}_r{reconn_sz}_{cache_key}{gated_suffix}"
+
+
+def _target_name(
+    group_size: int,
+    reconn_sz: int,
+    backend: str,
+    kernel_type: KernelType = "fwd",
+    gated: bool = False,
+) -> str:
     if backend == "cublas":
         return "cublas_oft"
-    return f"{backend}_oft_g{group_size}_r{reconn_sz}"
+    gated_suffix = "_gated" if gated else ""
+    return f"cute_{kernel_type}_g{group_size}_r{reconn_sz}{gated_suffix}"
+
+
+def _compose_config_header(
+    kernel_type: KernelType,
+    comp_params: CompParams | None = None,
+    bwd_dadr_params: BwdDAdRCompParams | None = None,
+    bwd_db_params: BwdDBCompParams | None = None,
+) -> str:
+    """Compose oft_config.hpp containing CurrKernelParams plus relevant params struct."""
+    parts = ["#pragma once", "#include <cute/tensor.hpp>", "namespace cute {", ""]
+
+    if kernel_type == "fwd":
+        params = comp_params or CompParams()
+        parts.append(params.to_header())
+    elif kernel_type == "bwd_dadr":
+        params = bwd_dadr_params or BwdDAdRCompParams()
+        parts.append(params.to_header())
+    elif kernel_type == "bwd_db":
+        params = bwd_db_params or BwdDBCompParams()
+        parts.append(params.to_header())
+
+    parts.extend(["", "}"])
+    return "\n".join(parts) + "\n"
 
 
 def _generate_cmake_cute(
@@ -97,11 +172,34 @@ def _generate_cmake_cute(
     src: Path,
     group_size: int,
     reconn_sz: int,
+    kernel_type: KernelType,
     gated: bool = False,
 ) -> None:
-    target = _target_name(group_size, reconn_sz, "cute")
+    target = _target_name(group_size, reconn_sz, "cute", kernel_type, gated)
     torch_ext = src / "torch_ext"
-    cmake_module_path = src / "cmake"
+
+    # Select source files per kernel type
+    if kernel_type == "fwd":
+        sources = f"""\
+add_library({target} SHARED
+    {torch_ext / "oft_fwd_bind.cpp"}
+    {torch_ext / "oft_fwd_torch.cu"}
+    {src / "cute_oft_coop_pc.cu"}
+)"""
+    elif kernel_type == "bwd_dadr":
+        sources = f"""\
+add_library({target} SHARED
+    {torch_ext / "oft_bwd_dadr_bind.cpp"}
+    {torch_ext / "oft_bwd_dadr_torch.cu"}
+    {src / "cute_oft_backward_dadr.cu"}
+)"""
+    elif kernel_type == "bwd_db":
+        sources = f"""\
+add_library({target} SHARED
+    {torch_ext / "oft_bwd_db_bind.cpp"}
+    {torch_ext / "oft_bwd_db_torch.cu"}
+    {src / "cute_oft_backward_db.cu"}
+)"""
 
     content = f"""\
 cmake_minimum_required(VERSION 3.18)
@@ -120,7 +218,7 @@ set(CMAKE_CUDA_ARCHITECTURES ${{CUDA_ARCH_LIST}})
 set(CMAKE_CUDA_FLAGS "${{CMAKE_CUDA_FLAGS}} --expt-relaxed-constexpr --ptxas-options=-v")
 set(CMAKE_CUDA_FLAGS "${{CMAKE_CUDA_FLAGS}} -lineinfo --use_fast_math -O3")
 
-list(APPEND CMAKE_MODULE_PATH "{cmake_module_path}")
+list(APPEND CMAKE_MODULE_PATH "{src / 'cmake'}")
 find_package(Cutlass REQUIRED)
 
 # Find Python and PyTorch
@@ -148,12 +246,7 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
-add_library({target} SHARED
-    {torch_ext / "oft_torch_bind.cpp"}
-    {torch_ext / "oft_torch.cu"}
-    {src / "cute_oft_coop_pc.cu"}
-    {src / "cute_oft_backward.cu"}
-)
+{sources}
 
 set_target_properties({target} PROPERTIES
     PREFIX ""
@@ -300,57 +393,38 @@ def _parse_build_errors(output: str) -> str:
     return "Unknown compilation error (see full log above)"
 
 
-def _compose_config_header(
-    comp_params: CompParams,
-    bwd_db_params: BwdDBCompParams | None = None,
-    bwd_dadr_params: BwdDAdRCompParams | None = None,
-) -> str:
-    """Compose the full oft_config.hpp with forward + backward params."""
-    if bwd_db_params is None:
-        bwd_db_params = BwdDBCompParams()
-    if bwd_dadr_params is None:
-        bwd_dadr_params = BwdDAdRCompParams()
-
-    return f"""\
-#pragma once
-#include <cute/tensor.hpp>
-namespace cute {{
-
-{comp_params.to_header()}
-
-{bwd_db_params.to_header()}
-
-{bwd_dadr_params.to_header()}
-
-}}
-"""
-
-
 def compile_kernel(
     group_size: int,
     reconn_sz: int,
     backend: str = "cute",
     comp_params: CompParams | None = None,
     gated: bool = False,
+    kernel_type: KernelType = "fwd",
     bwd_db_params: BwdDBCompParams | None = None,
     bwd_dadr_params: BwdDAdRCompParams | None = None,
+    parallel_build: bool = False,
 ) -> Path:
     """Compile (or retrieve from cache) a kernel .so for the given parameters.
 
+    Args:
+        parallel_build: If True, use ``-j1`` so each worker spawns exactly one
+            nvcc process. Use this when multiple compilations run concurrently
+            (e.g. during autotuning) to avoid OOM from many nvcc processes.
+
     Returns the path to the compiled .so file.
     """
-    if comp_params is None:
-        comp_params = CompParams()
-    if bwd_db_params is None:
-        bwd_db_params = BwdDBCompParams()
-    if bwd_dadr_params is None:
-        bwd_dadr_params = BwdDAdRCompParams()
+    if backend == "cublas":
+        # cuBLAS has a single module for all operations
+        kernel_type = "fwd"  # doesn't matter, single build
+
+    cache_key = _params_cache_key(kernel_type, comp_params, bwd_dadr_params, bwd_db_params)
 
     src = _source_root()
-    cache = _cache_root() / "builds" / _build_dir_name(group_size, reconn_sz, backend, comp_params, gated)
+    build_dir_name = _build_dir_name(group_size, reconn_sz, backend, kernel_type, cache_key, gated)
+    cache = _cache_root() / "builds" / build_dir_name
     cache.mkdir(parents=True, exist_ok=True)
 
-    target = _target_name(group_size, reconn_sz, backend)
+    target = _target_name(group_size, reconn_sz, backend, kernel_type, gated)
     build_dir = cache / "build"
 
     lock_path = cache / ".lock"
@@ -359,17 +433,15 @@ def compile_kernel(
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
         # Check if a valid cached build exists
-        source_hash = _compute_source_hash(src, backend)
+        source_hash = _compute_source_hash(src, backend, kernel_type)
         hash_file = cache / ".source_hash"
         config_hash_file = cache / ".config_hash"
-
-        config_key = comp_params.cache_key() if backend == "cute" else "default"
 
         needs_rebuild = True
         if hash_file.exists() and config_hash_file.exists():
             cached_src_hash = hash_file.read_text().strip()
             cached_cfg_hash = config_hash_file.read_text().strip()
-            if cached_src_hash == source_hash and cached_cfg_hash == config_key:
+            if cached_src_hash == source_hash and cached_cfg_hash == cache_key:
                 so_files = list(build_dir.glob(f"{target}.*"))
                 if so_files:
                     needs_rebuild = False
@@ -380,17 +452,21 @@ def compile_kernel(
 
         # Generate config header and CMakeLists.txt
         if backend == "cute":
-            header = _compose_config_header(comp_params, bwd_db_params, bwd_dadr_params)
+            header = _compose_config_header(kernel_type, comp_params, bwd_dadr_params, bwd_db_params)
             (cache / "oft_config.hpp").write_text(header)
-            _generate_cmake_cute(cache, src, group_size, reconn_sz, gated)
+            _generate_cmake_cute(cache, src, group_size, reconn_sz, kernel_type, gated)
         elif backend == "cublas":
             _generate_cmake_cublas(cache, src)
 
         # Configure
-        nproc = os.cpu_count() or 4
+        # When running inside autotuning (parallel_build=True), use -j1 so each
+        # worker spawns exactly one nvcc process — total concurrent nvcc processes
+        # equals CUTE_OFT_COMPILE_WORKERS.  For standalone compilation, use all
+        # available cores for maximum single-build speed.
+        nproc = 1 if parallel_build else (os.cpu_count() or 4)
         python_exe = sys.executable
 
-        print(f"[cute_oft] Compiling {backend} kernel for group_size={group_size}, reconn_sz={reconn_sz}...")
+        print(f"[cute_oft] Compiling {backend}/{kernel_type} kernel for group_size={group_size}, reconn_sz={reconn_sz}...")
 
         configure_cmd = [
             "cmake",
@@ -408,7 +484,7 @@ def compile_kernel(
             output = result.stdout + "\n" + result.stderr
             summary = _parse_build_errors(output)
             raise CompilationError(
-                f"CMake configuration failed for {backend} backend, "
+                f"CMake configuration failed for {backend}/{kernel_type} backend, "
                 f"group_size={group_size}, reconn_sz={reconn_sz}:\n{summary}",
                 output,
             )
@@ -429,14 +505,14 @@ def compile_kernel(
             output = result.stdout + "\n" + result.stderr
             summary = _parse_build_errors(output)
             raise CompilationError(
-                f"Kernel compilation failed for {backend} backend, "
+                f"Kernel compilation failed for {backend}/{kernel_type} backend, "
                 f"group_size={group_size}, reconn_sz={reconn_sz}:\n{summary}",
                 output,
             )
 
         # Record hashes
         hash_file.write_text(source_hash)
-        config_hash_file.write_text(config_key)
+        config_hash_file.write_text(cache_key)
 
         so_files = list(build_dir.glob(f"{target}.*"))
         if not so_files:
@@ -453,10 +529,33 @@ def compile_kernel(
         lock_fd.close()
 
 
+def cleanup_non_best_builds(
+    group_size: int,
+    reconn_sz: int,
+    kernel_type: KernelType,
+    best_cache_key: str,
+    gated: bool = False,
+) -> None:
+    """Delete build directories for non-best configs to save disk space."""
+    builds_root = _cache_root() / "builds"
+    if not builds_root.exists():
+        return
+
+    gated_suffix = "_gated" if gated else ""
+    prefix = f"cute_{kernel_type}_g{group_size}_r{reconn_sz}_"
+    best_name = f"{prefix}{best_cache_key}{gated_suffix}"
+
+    for d in builds_root.iterdir():
+        if not d.is_dir() or not d.name.startswith(prefix) or d.name == best_name:
+            continue
+        # Only clean dirs matching the same gated mode
+        is_gated_dir = d.name.endswith("_gated")
+        if is_gated_dir == gated:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def clear_cache() -> None:
     """Remove all cached kernel builds."""
-    import shutil
-
     cache = _cache_root()
     if cache.exists():
         shutil.rmtree(cache)

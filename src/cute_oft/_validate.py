@@ -102,6 +102,42 @@ def compute_smem_bytes(
     return (size_A + size_R + size_B + size_AR) * 2  # sizeof(half) = 2
 
 
+def compute_smem_bytes_bwd_dadr(
+    bM: int,
+    group_size: int,
+    reconn_sz: int,
+    bP_dc_b: int,
+    bP_dar: int,
+    bP_a_r: int,
+) -> int:
+    """Compute shared memory usage for backward dA+dR kernel.
+
+    Mirrors the smem calculation in oft_backward_dA_dR_launch().
+    """
+    gs, rs = group_size, reconn_sz
+    smem = (bM * gs * bP_dc_b + rs * gs * bP_dc_b + bM * rs * bP_dar
+            + bM * rs + rs * rs * bP_a_r + rs * rs * bP_a_r + bM * rs) * 2 + 256
+    return smem
+
+
+def compute_smem_bytes_bwd_db(
+    bM: int,
+    bK: int,
+    group_size: int,
+    reconn_sz: int,
+    bP_a: int,
+    bP_ar: int,
+    bP_dc: int,
+) -> int:
+    """Compute shared memory usage for backward dB kernel.
+
+    Mirrors the smem calculation in oft_backward_dB_launch().
+    """
+    gs, rs = group_size, reconn_sz
+    smem = (bM * bK * bP_a + rs * bK + bM * rs + bK * bM * bP_ar + gs * bM * bP_dc) * 2 + 256
+    return smem
+
+
 def check_smem_limit(smem_bytes: int, device: int = 0) -> None:
     """Check that shared memory requirement doesn't exceed device limit."""
     props = torch.cuda.get_device_properties(device)

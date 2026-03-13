@@ -9,9 +9,14 @@
 #define OFT_RECONN_SIZE 8
 #endif
 
+#ifndef OFT_GATED
+#define OFT_GATED 0
+#endif
+
 struct CurrKernelParams {
     static constexpr unsigned int group_size = OFT_GROUP_SIZE;
     static constexpr unsigned int reconn_sz = OFT_RECONN_SIZE;
+    static constexpr bool gated = OFT_GATED;
 };
 
 template <class KernelParams>

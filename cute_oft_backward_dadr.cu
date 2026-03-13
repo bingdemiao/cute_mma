@@ -84,11 +84,14 @@ void dAdR_producer(
     auto tXsDAR = r2s_thr.partition_D(sdAR_warp); // (CPY, CPY_M, CPY_N, bP_dar)
 
     // -- s2r atoms: LDSM for smem→reg (producer smem uses K_atom-based swizzle) --
-    constexpr int a_u32 = (WARP_M * gs) / 64;
+    // Per-thread u32 count is based on MMA operand size per step (K_atom),
+    // not the full reduction dimension (gs).
+    constexpr int K_atom_p = (gs < 16) ? 8 : 16;
+    constexpr int a_u32 = (WARP_M * K_atom_p) / 64;
     using s2r_atom_dC = std::conditional_t<(a_u32 >= 4),
         Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
         Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
-    constexpr int b_u32 = (rs * gs) / 64;
+    constexpr int b_u32 = (rs * K_atom_p) / 64;
     using s2r_atom_Bt = std::conditional_t<(b_u32 >= 4),
         Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
         Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
@@ -259,11 +262,11 @@ void dAdR_consumer(
 
     // -- LDSM atoms for s2r (swizzled smem) --
     constexpr int a_u32_s3 = (WARP_M * rs) / 64;
-    using s2r_atom_dAR = std::conditional_t<(a_u32_s3 >= 4),
+    using s2r_atom_dAR = std::conditional_t<(a_u32_s3 % 4 == 0),
         Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
         Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
     constexpr int b_u32_s3 = (rs * rs) / 64;
-    using s2r_atom_Rt = std::conditional_t<(b_u32_s3 >= 4),
+    using s2r_atom_Rt = std::conditional_t<(b_u32_s3 % 4 == 0),
         Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
         Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
 
@@ -340,10 +343,10 @@ void dAdR_consumer(
             auto thr_mma_ar = mma_ar.get_slice(lane_idx);
 
             // LDSM s2r for AR recompute (same register counts as dA MMA)
-            using s2r_atom_A_ar = std::conditional_t<(a_u32_s3 >= 4),
+            using s2r_atom_A_ar = std::conditional_t<(a_u32_s3 % 4 == 0),
                 Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
                 Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
-            using s2r_atom_R_ar = std::conditional_t<(b_u32_s3 >= 4),
+            using s2r_atom_R_ar = std::conditional_t<(b_u32_s3 % 4 == 0),
                 Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
                 Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
 

@@ -14,23 +14,35 @@ Usage::
     # Use pure PyTorch backend (no compilation required)
     C = cute_oft.forward(A, B, R, group_size=256, reconn_sz=8, backend="pytorch")
 
+    # Autotuning
+    C = cute_oft.forward(A, B, R, 256, 8, backend="cute", autotuning=True)
+    dA, dR, dB = cute_oft.backward(dC, A, B, R, 256, 8, backend="cute", autotuning=True)
+
     # Clear all cached compilations
     cute_oft.clear_cache()
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Callable, Iterable, Literal
 
 import torch
 
-from ._autotune import autotune
+from ._autotune import (
+    autotune,
+    autotune_bwd_dadr,
+    autotune_bwd_db,
+    clear_autotune_cache,
+    get_autotune_cache,
+)
 from ._compiler import CompilationError, clear_cache
-from ._config import CompParams
+from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 from ._loader import get_or_compile
 from ._validate import (
     check_smem_limit,
     compute_smem_bytes,
+    compute_smem_bytes_bwd_dadr,
+    compute_smem_bytes_bwd_db,
     validate_kernel_params,
     validate_tensor_params,
 )
@@ -39,15 +51,19 @@ __all__ = [
     "forward",
     "backward",
     "autotune",
+    "autotune_bwd_dadr",
+    "autotune_bwd_db",
+    "clear_autotune_cache",
+    "get_autotune_cache",
     "clear_cache",
     "CompParams",
+    "BwdDAdRCompParams",
+    "BwdDBCompParams",
     "CompilationError",
 ]
 
 BACKENDS = ("cute", "cublas", "pytorch")
 MODES = ("ar", "rw")
-
-
 ACTIVATIONS = (None, "silu_gate")
 
 
@@ -61,6 +77,8 @@ def forward(
     mode: Literal["ar", "rw"] = "ar",
     comp_params: CompParams | Literal["auto"] | None = None,
     activation: Literal["silu_gate"] | None = None,
+    autotuning: bool = False,
+    autotuning_search_space: Iterable[CompParams | tuple[CompParams, Callable]] | None = None,
 ) -> torch.Tensor:
     """Compute C = A @ diag(R) @ B^T with OFT structure.
 
@@ -70,30 +88,16 @@ def forward(
         R: Reconnection matrix of shape (n_groups * reconn_sz, K), float16, CUDA.
         group_size: Number of output channels per group. Must be a multiple of 8.
         reconn_sz: Reconnection block size. Must be a multiple of 8.
-        backend: Computation backend. One of:
-            - "cute": JIT-compiled CuTe cooperative kernel (default, fastest).
-            - "cublas": cuBLAS-based implementation.
-            - "pytorch": Pure PyTorch (no compilation, useful for debugging).
-        mode: Computation mode. One of:
-            - "ar": Compute (A @ R^T) first, then multiply by B^T.
-            - "rw": Transform weights (R @ B) first, then multiply by A.
-            Only supported by "cublas" and "pytorch" backends. The "cute" backend
-            always uses "ar" mode.
-        comp_params: Performance tuning parameters for the 'cute' backend. Ignored
-            by other backends. Pass "auto" to run autotuning for the given problem
-            shape. Uses defaults if None.
-        activation: Optional non-linearity inserted between AR and B stages.
-            - None: Standard OFT: C = (A @ R^T) @ B^T
-            - "silu_gate": Gated OFT: C = (A * SiLU(A @ R^T)) @ B^T
-            Only supported in "ar" mode.
+        backend: Computation backend ("cute", "cublas", "pytorch").
+        mode: Computation mode ("ar" or "rw"). Only cublas/pytorch support "rw".
+        comp_params: Explicit CompParams for the 'cute' backend. Pass "auto" for
+            autotuning. Uses defaults if None.
+        activation: Optional non-linearity ("silu_gate" or None).
+        autotuning: When True, check cache first, autotune if miss, use best config.
+        autotuning_search_space: Custom search space for autotuning (uses default if None).
 
     Returns:
         Output tensor of shape (M, N), float16, CUDA.
-
-    Raises:
-        ValueError: If parameters, tensor shapes, or backend name are invalid.
-        CompilationError: If kernel compilation fails (cute/cublas backends).
-        RuntimeError: If shared memory requirement exceeds device limit (cute backend).
     """
     if backend not in BACKENDS:
         raise ValueError(
@@ -127,13 +131,14 @@ def forward(
         )
 
     if backend == "cute":
-        if comp_params == "auto":
+        if comp_params == "auto" or (autotuning and comp_params is None):
             M, K = A.shape
             N = B.shape[0]
             comp_params = autotune(
                 M, N, K, group_size, reconn_sz,
                 device=A.device.index or 0,
                 gated=gated,
+                search_space=autotuning_search_space,
             )
         elif comp_params is None:
             comp_params = CompParams()
@@ -145,7 +150,17 @@ def forward(
             gated=gated,
         )
         check_smem_limit(smem, A.device.index or 0)
-        module = get_or_compile(group_size, reconn_sz, backend, comp_params, gated=gated)
+        try:
+            module = get_or_compile(
+                group_size, reconn_sz, backend, comp_params,
+                gated=gated, kernel_type="fwd",
+            )
+        except CompilationError:
+            comp_params = CompParams.safe_defaults()
+            module = get_or_compile(
+                group_size, reconn_sz, backend, comp_params,
+                gated=gated, kernel_type="fwd",
+            )
         return module.forward(A, B, R, group_size, reconn_sz)
 
     # cublas backend
@@ -162,6 +177,12 @@ def backward(
     reconn_sz: int = 8,
     backend: Literal["cute", "cublas", "pytorch"] = "pytorch",
     activation: Literal["silu_gate"] | None = None,
+    comp_params: CompParams | Literal["auto"] | None = None,
+    autotuning: bool = False,
+    autotuning_search_space_dadr: Iterable[BwdDAdRCompParams | tuple[BwdDAdRCompParams, Callable]] | None = None,
+    autotuning_search_space_db: Iterable[BwdDBCompParams | tuple[BwdDBCompParams, Callable]] | None = None,
+    bwd_dadr_params: BwdDAdRCompParams | None = None,
+    bwd_db_params: BwdDBCompParams | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Compute gradients for OFT backward pass.
 
@@ -180,6 +201,12 @@ def backward(
         reconn_sz: Reconnection block size.
         backend: Computation backend. "pytorch", "cublas", or "cute".
         activation: Must match the activation used in the forward pass.
+        comp_params: Forward CompParams for the 'cute' backend (legacy, for compilation).
+        autotuning: When True, autotune each backward kernel independently.
+        autotuning_search_space_dadr: Custom search space for dAdR kernel autotuning.
+        autotuning_search_space_db: Custom search space for dB kernel autotuning.
+        bwd_dadr_params: Explicit BwdDAdRCompParams override.
+        bwd_db_params: Explicit BwdDBCompParams override.
 
     Returns:
         (dA, dR, dB) — gradients w.r.t. A, R, B respectively.
@@ -204,20 +231,74 @@ def backward(
         grads = module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated)
         dA, dR = grads[0], grads[1]
         if gated:
-            dB = module.backward_dB(dC, A, R, group_size, reconn_sz, gated)
+            dB_out = module.backward_dB(dC, A, R, group_size, reconn_sz, gated)
         else:
-            dB = None
-        return dA, dR, dB
+            dB_out = None
+        return dA, dR, dB_out
 
     if backend == "cute":
-        module = get_or_compile(group_size, reconn_sz, backend, gated=gated)
-        grads = module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated)
+        M, K = A.shape
+        N = B.shape[0]
+        dev = A.device.index or 0
+
+        # Resolve dAdR params
+        if bwd_dadr_params is None:
+            if comp_params == "auto" or autotuning:
+                bwd_dadr_params = autotune_bwd_dadr(
+                    M, N, K, group_size, reconn_sz,
+                    device=dev, gated=gated,
+                    search_space=autotuning_search_space_dadr,
+                )
+            else:
+                bwd_dadr_params = BwdDAdRCompParams()
+
+        # Load dAdR module
+        try:
+            dadr_module = get_or_compile(
+                group_size, reconn_sz, backend,
+                gated=gated, kernel_type="bwd_dadr",
+                bwd_dadr_params=bwd_dadr_params,
+            )
+        except CompilationError:
+            bwd_dadr_params = BwdDAdRCompParams.safe_defaults()
+            dadr_module = get_or_compile(
+                group_size, reconn_sz, backend,
+                gated=gated, kernel_type="bwd_dadr",
+                bwd_dadr_params=bwd_dadr_params,
+            )
+        grads = dadr_module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated)
         dA, dR = grads[0], grads[1]
+
         if gated:
-            dB = module.backward_dB(dC, A, R, group_size, reconn_sz, gated)
+            # Resolve dB params
+            if bwd_db_params is None:
+                if comp_params == "auto" or autotuning:
+                    bwd_db_params = autotune_bwd_db(
+                        M, N, K, group_size, reconn_sz,
+                        device=dev, gated=gated,
+                        search_space=autotuning_search_space_db,
+                    )
+                else:
+                    bwd_db_params = BwdDBCompParams()
+
+            try:
+                db_module = get_or_compile(
+                    group_size, reconn_sz, backend,
+                    gated=gated, kernel_type="bwd_db",
+                    bwd_db_params=bwd_db_params,
+                )
+            except CompilationError:
+                bwd_db_params = BwdDBCompParams.safe_defaults()
+                db_module = get_or_compile(
+                    group_size, reconn_sz, backend,
+                    gated=gated, kernel_type="bwd_db",
+                    bwd_db_params=bwd_db_params,
+                )
+            dB_out = db_module.backward_dB(dC, A, R, group_size, reconn_sz, gated)
         else:
-            dB = None
-        return dA, dR, dB
+            dB_out = None
+
+        return dA, dR, dB_out
 
     raise ValueError(
         f"Backend {backend!r} is not yet supported for backward pass."
