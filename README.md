@@ -65,6 +65,67 @@ dC = torch.randn_like(C)
 dA, dR, dB = cute_oft.backward(dC, A, B, R, group_size, reconn_sz, backend="cute")
 ```
 
+## `OFTLinear` module
+
+`OFTLinear` is a drop-in replacement for `torch.nn.Linear` that uses OFT structure under the hood. It manages the weight (B), reconnection matrix (R), and optional bias, and integrates with PyTorch's autograd.
+
+### Fine-tuning a pretrained model
+
+Replace existing linear layers with OFT layers, loading the pretrained weights. R is initialized as identity so the layer starts with the same behavior as the original, then only R is trained:
+
+```python
+import cute_oft
+
+# Convert an existing nn.Linear layer
+pretrained_linear = model.some_layer  # nn.Linear(256, 1024)
+model.some_layer = cute_oft.OFTLinear.from_linear(
+    pretrained_linear,
+    group_size=256, reconn_sz=8,
+    autotuning=True,
+)
+
+# Only R requires gradients — B (weight) is frozen
+for name, p in model.some_layer.named_parameters():
+    print(name, p.requires_grad)
+    # weight False
+    # reconn True
+    # bias   True
+```
+
+### Width expansion with gated OFT
+
+Use `activation="silu_gate"` to enable gated OFT, which acts as a width expansion. Both R and B become trainable:
+
+```python
+layer = cute_oft.OFTLinear(
+    in_features=256, out_features=1024,
+    group_size=256, reconn_sz=8,
+    activation="silu_gate",
+    autotuning=True,
+)
+
+# All parameters are trainable
+for name, p in layer.named_parameters():
+    print(name, p.requires_grad)
+    # weight True
+    # reconn True
+    # bias   True
+
+x = torch.randn(batch_size, 256, dtype=torch.float16, device="cuda")
+output = layer(x)  # (batch_size, 1024)
+output.sum().backward()  # gradients flow to weight, reconn, and bias
+```
+
+### Arbitrary batch dimensions
+
+`OFTLinear` handles any number of leading batch dimensions, just like `nn.Linear`:
+
+```python
+layer = cute_oft.OFTLinear(256, 1024, group_size=256, reconn_sz=8).cuda().half()
+x = torch.randn(2, 4, 8, 256, dtype=torch.float16, device="cuda")
+output = layer(x)  # (2, 4, 8, 1024)
+```
+
 ## Backends
 
 | Backend | Forward | Backward | Modes | Notes |
@@ -189,6 +250,23 @@ cute_oft.clear_autotune_cache(keep_best_kernels=False)
 # Clear only compiled kernel builds (not autotune results)
 cute_oft.clear_cache()
 ```
+
+## `OFTLinear` reference
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `in_features` | (required) | Input dimension (K) |
+| `out_features` | (required) | Output dimension (N) |
+| `group_size` | `256` | Output channels per reconnection group |
+| `reconn_sz` | `8` | Block size of orthogonal reconnection matrix |
+| `bias` | `True` | Learnable output bias |
+| `activation` | `None` | `None` (standard OFT) or `"silu_gate"` (gated/width expansion) |
+| `backend` | `"cute"` | `"cute"`, `"cublas"`, or `"pytorch"` |
+| `autotuning` | `False` | Enable automatic kernel autotuning |
+
+Methods:
+- `OFTLinear.from_linear(linear, ...)` — create from an existing `nn.Linear`, copying weights and bias
+- `load_pretrained_weight(weight, bias=None)` — load pretrained weight/bias tensors
 
 ## Configuration classes
 

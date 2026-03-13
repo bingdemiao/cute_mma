@@ -69,6 +69,9 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
 - `cute_oft.BwdDAdRCompParams` — backward dA+dR kernel configuration
 - `cute_oft.BwdDBCompParams` — backward dB kernel configuration
 - All three `CompParams` classes have a `safe_defaults()` classmethod returning conservative configs that compile for all valid shapes
+- `cute_oft.OFTLinear` — `nn.Module` drop-in replacement for `nn.Linear` with OFT structure
+  - `OFTLinear.from_linear(linear, ...)` creates from an existing `nn.Linear`
+  - Standard mode: weight frozen, reconn trainable. Gated mode (`activation="silu_gate"`): both trainable.
 
 ### Search space protocol
 - Items: `CompParam` or `(CompParam, callback)` tuples

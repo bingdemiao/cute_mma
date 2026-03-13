@@ -37,6 +37,7 @@ from ._autotune import (
 )
 from ._compiler import CompilationError, clear_cache
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
+from ._module import OFTLinear
 from ._loader import get_or_compile
 from ._validate import (
     check_smem_limit,
@@ -60,6 +61,7 @@ __all__ = [
     "BwdDAdRCompParams",
     "BwdDBCompParams",
     "CompilationError",
+    "OFTLinear",
 ]
 
 BACKENDS = ("cute", "cublas", "pytorch")
