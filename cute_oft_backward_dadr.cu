@@ -263,8 +263,23 @@ fused_dA_dR_kernel_v2(
                 __syncthreads();
 
                 if constexpr (GATED) {
-                    // Gated: H = A * SiLU(AR), dS = dH * A * silu_prime(AR)
-                    // AR recompute + SiLU → overwrite sDH_temp with dS
+                    // Step A: dA += dH * SiLU(AR) — read dH from sDH_temp BEFORE overwriting
+                    // Each warp processes its own WARP_M_reconn rows
+                    for (int i = 0; i < size(rDA_blk[b]); ++i) {
+                        auto coord2 = tCdA_id(i);
+                        int mi = get<0>(coord2) + warp_idx * WARP_M_reconn;
+                        int ri = get<1>(coord2);
+                        if (mi < m_valid) {
+                            float ar = 0.0f;
+                            for (int j = 0; j < rs; ++j)
+                                ar += float(sA(mi, k_off + j)) * float(sR(ri, k_off + j, r_pipe_r));
+                            float sigma = 1.0f / (1.0f + __expf(-ar));
+                            float dH_val = float(sDH_temp(mi, ri));  // original dH
+                            rDA_blk[b](i) += dH_val * ar * sigma;   // dH * SiLU(AR)
+                        }
+                    }
+
+                    // Step B: compute dS → overwrite sDH_temp
                     for (int idx = threadIdx.x; idx < m_valid * rs; idx += n_threads) {
                         int mi = idx / rs, ri = idx % rs;
                         float ar = 0.0f;
@@ -273,43 +288,20 @@ fused_dA_dR_kernel_v2(
                         float dH_val = float(sDH_temp(mi, ri));
                         float a_val = float(sA(mi, k_off + ri));
                         float sigma = 1.0f / (1.0f + __expf(-ar));
-                        float silu_ar = ar * sigma;
                         float silu_prime = sigma * (1.0f + ar * (1.0f - sigma));
-                        // dA += dH * SiLU(AR) via rDA_blk
-                        // (done below after sync)
                         sDH_temp(mi, ri) = half_t(dH_val * a_val * silu_prime);  // dS
                     }
                     __syncthreads();
 
-                    // dA += dH * SiLU(AR) — need original dH, but we overwrote it with dS
-                    // Use rDH_g register fragment instead (still holds F32 dH)
-                    for (int i = 0; i < size(rDA_blk[b]); ++i) {
-                        auto coord = tCdA_id(i);
-                        int mi = get<0>(coord) + warp_idx * WARP_M_reconn;
-                        int ri = get<1>(coord);
-                        if (mi < m_valid) {
-                            float ar = 0.0f;
-                            for (int j = 0; j < rs; ++j)
-                                ar += float(sA(mi, k_off + j)) * float(sR(ri, k_off + j, r_pipe_r));
-                            float sigma = 1.0f / (1.0f + __expf(-ar));
-                            // Find matching rDH_g element
-                            // rDH_g uses main GEMM partition, tCdA_id uses reconn partition
-                            // Can't directly cross-index — read from sDH_temp before it was overwritten
-                            // Actually we already overwrote sDH_temp with dS...
-                            // Need to save dH values before overwriting.
-                            // Alternative: compute dH * SiLU(AR) BEFORE overwriting sDH_temp with dS
-                        }
-                    }
-                    // TODO: fix gated path — need dH values for elementwise contribution
-                    // For now, handle dA += dS @ R via MMA
+                    // Step C: dA += dS @ R via MMA
                     copy(cons_s2r_A{}, tXsDH, tXrDH_reconn);
                     auto rR_frag = cons_thr.make_fragment_B(cons_thr.partition_B(
                         make_tensor(static_cast<half_t*>(nullptr),
                                     make_layout(make_shape(Int<rs>{}, Int<rs>{}), LayoutRight{}))));
                     auto tBid = cons_thr.partition_B(make_identity_tensor(make_shape(Int<rs>{}, Int<rs>{})));
                     for (int i = 0; i < size(rR_frag); ++i) {
-                        auto coord = tBid(i);
-                        rR_frag(i) = sR(get<1>(coord), k_off + get<0>(coord), r_pipe_r);
+                        auto coord2 = tBid(i);
+                        rR_frag(i) = sR(get<1>(coord2), k_off + get<0>(coord2), r_pipe_r);
                     }
                     gemm(cons_mma, rDH_reconn, rR_frag, rDA_blk[b]);
                 } else {
