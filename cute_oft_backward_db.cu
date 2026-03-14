@@ -129,6 +129,7 @@ void dB_producer(
                 asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
             }
 
+            // Transpose AR to sARt: (BLK_K, BLK_M) with BLK_M contiguous
             for (int idx = lane_idx; idx < WARP_M * rs; idx += 32) {
                 int mi = idx / rs, ri = idx % rs;
                 sARt(kb * rs + ri, warp_idx * WARP_M + mi, ar_pipe_write) =
@@ -194,13 +195,15 @@ void dB_consumer(
         std::conditional_t<(a_u16 >= 4),
             Copy_Atom<SM75_U16x4_LDSM_T, half_t>,
             Copy_Atom<SM75_U16x2_LDSM_T, half_t>>>;
-    using s2r_atom_b = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
 
     auto s2r_a = make_tiled_copy_A(s2r_dCt{}, mma);
     auto s2r_a_thr = s2r_a.get_slice(lane_idx + warp_idx * 32);
     auto tXsdCt = s2r_a_thr.partition_S(sdCt);
     auto rDCt = thr_mma.make_fragment_A(thr_mma.partition_A(sdCt(_,_,_0{})));
     auto tXrdCt = s2r_a_thr.retile_D(rDCt);
+
+    // B-operand (sARt): LDSM_N, BLK_M contiguous (K for TN MMA)
+    using s2r_atom_b = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
 
     auto s2r_b = make_tiled_copy_B(s2r_atom_b{}, mma);
     auto s2r_b_thr = s2r_b.get_slice(lane_idx + warp_idx * 32);
@@ -250,7 +253,7 @@ void dB_consumer(
             : : "r"(ar_pipe_read + BAR_READY_BASE), "n"(n_total_threads));
 
         copy(s2r_dCt{}, tXsdCt(_, _, _, dc_pipe_read), tXrdCt);
-        copy(s2r_atom_b{}, tXsARt(_, _, _, ar_pipe_read), tXrARt);
+        copy(s2r_atom_b{}, tXsARt(_, _, _, ar_pipe_read), tXrARt);  // LDSM_T transposes M→K
         gemm(mma, rDCt, rARt, rDB);
 
         asm volatile("bar.arrive %0, %1;\n"
@@ -303,7 +306,9 @@ dB_pc_kernel(
     auto sA_layout = tile_to_shape(smem_k, make_shape(Int<BLK_M>{}, Int<BLK_K>{}, Int<bP_a>{}));
     auto sR_layout = tile_to_shape(smem_k, make_shape(Int<rs>{}, Int<BLK_K>{}));
     auto sAR_temp_layout = make_layout(make_shape(Int<BLK_M>{}, Int<rs>{}), LayoutRight{});
-    auto sARt_layout = tile_to_shape(smem_m, make_shape(Int<BLK_K>{}, Int<BLK_M>{}, Int<bP_ar>{}));
+    // sARt: (BLK_K, BLK_M, bP_ar) — BLK_M contiguous for LDSM_N B-operand
+    auto sARt_layout = tile_to_shape(smem_m,
+        make_shape(Int<BLK_K>{}, Int<BLK_M>{}, Int<bP_ar>{}));
     // sdCt: (gs, BLK_M, bP_dc) with gs contiguous — for LDSM_T + cp.async
     // Swizzle<3,3,3> with column-major atom (64, 8) stride (1, 64) following CUTLASS pattern
     auto sdCt_atom = composition(
