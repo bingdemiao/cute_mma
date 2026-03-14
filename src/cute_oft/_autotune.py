@@ -93,34 +93,40 @@ def default_search_space_bwd_dadr(
 ) -> list[BwdDAdRCompParams]:
     """Generate candidate BwdDAdRCompParams configurations."""
     # Warp presets: (warp_layout_arb, warp_layout_ar)
-    # dAdR: arb = heavy producer (dC@B^T), ar = light consumer (A@R^T)
+    # arb = heavy producer (dH GEMM), ar = light consumer (reconn ops)
     warp_presets: list[tuple[tuple[int, ...], tuple[int, ...]]] = [
-        ((4,), (2,)),    # 4 heavy warps, 2 light (recommended)
-        ((2,), (2,)),    # balanced
-        ((4,), (4,)),    # max parallelism
+        ((2, 2), (2,)),  # 4 producer + 2 consumer (recommended)
+        ((2,), (2,)),    # 2 producer + 2 consumer (balanced)
+        ((2, 2), (4,)),  # 4 producer + 4 consumer
     ]
 
     candidates: list[BwdDAdRCompParams] = []
-    for bM in (32, 64):
-        for n_buf_slots in (8, 16):
-            for bP_dc_b in (2, 3):
-                for bP_dar in (2, 3):
-                    for bP_a_r in (2,):
-                        for wl_arb, wl_ar in warp_presets:
-                            params = BwdDAdRCompParams(
-                                bM=bM, n_buf_slots=n_buf_slots,
-                                bP_dc_b=bP_dc_b, bP_dar=bP_dar, bP_a_r=bP_a_r,
-                                warp_layout_arb=wl_arb, warp_layout_ar=wl_ar,
-                            )
-                            try:
-                                smem = compute_smem_bytes_bwd_dadr(
-                                    bM, group_size, reconn_sz,
-                                    bP_dc_b, bP_dar, bP_a_r,
-                                )
-                                check_smem_limit(smem, device)
-                            except (RuntimeError, ValueError):
-                                continue
-                            candidates.append(params)
+    for bM in (64, 128):
+        for bK in (64, 128):
+            for bK_inner in (16, 32):
+                for n_buf_slots in (8,):
+                    for bP_dc_b in (2, 3):
+                        for bP_dh in (2,):
+                            for bP_r in (2,):
+                                for wl_arb, wl_ar in warp_presets:
+                                    params = BwdDAdRCompParams(
+                                        bM=bM, bK=bK, bK_inner=bK_inner,
+                                        n_buf_slots=n_buf_slots,
+                                        bP_dc_b=bP_dc_b, bP_dh=bP_dh,
+                                        bP_r=bP_r,
+                                        warp_layout_arb=wl_arb,
+                                        warp_layout_ar=wl_ar,
+                                    )
+                                    try:
+                                        smem = compute_smem_bytes_bwd_dadr(
+                                            bM, bK, bK_inner,
+                                            group_size, reconn_sz,
+                                            bP_dc_b, bP_dh, bP_r,
+                                        )
+                                        check_smem_limit(smem, device)
+                                    except (RuntimeError, ValueError):
+                                        continue
+                                    candidates.append(params)
     return candidates
 
 
@@ -254,6 +260,34 @@ def _load_known_bad(ctx_key: str, kernel_type: KernelType) -> set[str]:
     if entry.get("source_hash") != _current_source_hash(kernel_type):
         return set()
     return set(entry.get("keys", []))
+
+
+# Lock for thread-safe incremental writes to compile_failed.json
+_compile_failed_lock = threading.Lock()
+
+
+def _record_compile_failure(
+    ctx_key: str, kernel_type: KernelType, cache_key: str,
+) -> None:
+    """Immediately record a single compile failure to the persistent registry.
+
+    This is called from the producer thread so that failures are persisted
+    even if the autotuning process is interrupted before completion.
+    """
+    with _compile_failed_lock:
+        data = _load_compile_failed()
+        src_hash = _current_source_hash(kernel_type)
+        entry = data.get(ctx_key, {})
+        # Reset if source changed
+        if entry.get("source_hash") != src_hash:
+            entry = {"source_hash": src_hash, "keys": []}
+        existing = set(entry.get("keys", []))
+        if cache_key not in existing:
+            existing.add(cache_key)
+            entry["keys"] = sorted(existing)
+            entry["source_hash"] = src_hash
+            data[ctx_key] = entry
+            _save_compile_failed(data)
 
 
 def _parse_problem_key(key: str) -> dict | None:
@@ -674,6 +708,10 @@ def _autotune_generic(
                     compile_done += 1
                     if not success:
                         compile_fail += 1
+                        # Record failure immediately so it persists even
+                        # if autotuning is interrupted later.
+                        ck = configs_to_test[idx].cache_key()
+                        _record_compile_failure(ctx_key, kernel_type, ck)
                     else:
                         total_compiled_ok += 1
                     if verbose and compile_done % max(1, total_compilable // 5) == 0:
@@ -786,24 +824,9 @@ def _autotune_generic(
     else:
         best_entry = min(valid, key=lambda t: t["time_ms"])
 
-    # Record newly discovered compile failures in the global registry
-    new_bad = [
-        r["cache_key"] for r in final_results
-        if r.get("time_ms") is None and r["cache_key"] not in known_bad
-    ]
-    if new_bad:
-        compile_failed_data = _load_compile_failed()
-        src_hash = _current_source_hash(kernel_type)
-        entry_cf = compile_failed_data.get(ctx_key, {})
-        # Reset if source changed
-        if entry_cf.get("source_hash") != src_hash:
-            entry_cf = {"source_hash": src_hash, "keys": []}
-        existing = set(entry_cf.get("keys", []))
-        existing.update(new_bad)
-        entry_cf["keys"] = sorted(existing)
-        entry_cf["source_hash"] = src_hash
-        compile_failed_data[ctx_key] = entry_cf
-        _save_compile_failed(compile_failed_data)
+    # NOTE: Compile failures are now recorded incrementally in the producer
+    # thread via _record_compile_failure(), so they persist even if
+    # autotuning is interrupted before reaching this point.
 
     # Update cache
     if use_cache:
@@ -835,8 +858,8 @@ def _config_summary(config) -> str:
         )
     elif isinstance(config, BwdDAdRCompParams):
         return (
-            f"bM={config.bM} slots={config.n_buf_slots} "
-            f"P={config.bP_dc_b}/{config.bP_dar}/{config.bP_a_r}"
+            f"bM={config.bM} bK={config.bK} bKi={config.bK_inner} "
+            f"P={config.bP_dc_b}/{config.bP_dh}/{config.bP_r}"
         )
     elif isinstance(config, BwdDBCompParams):
         return (

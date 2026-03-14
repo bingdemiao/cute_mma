@@ -6,38 +6,42 @@
 
 using namespace cute;
 
-// Helper to avoid ambiguous ternary with half_t
+// =============================================================================
+// Restructured Kernel: Fused dA + dR — Producer-Consumer
+//
+// Grid: (K/BLK_K) × (M/BLK_M) with z-curve ordering.
+// Producer: dH(BLK_M, BLK_K) = dC_g(BLK_M, gs) @ B_g(gs, BLK_K), F32 output via sdH
+// Consumer: dA accumulation + dR partial sums from sdH (F32) + sA + sR
+// =============================================================================
+
 __device__ __forceinline__
 half_t load_or_zero(const half_t* ptr, int idx, bool valid) {
     return valid ? ptr[idx] : half_t(0);
 }
 
 // =============================================================================
-// Kernel 1: Fused dA + dR — Producer-Consumer
+// Producer: dH GEMM with F32 accumulation, writing F32 sdH
 // =============================================================================
-
-// Producer: compute dAR(BLK_M, rs) = dC_g(BLK_M, gs) @ B_g(gs, rs) via MMA
-template <int BLK_M, int GROUP_SIZE, int RECONN_SZ, bool GATED,
-          class SmemDC, class SmemBt, class SmemDAR,
+template <int BLK_M, int BLK_K, int BLK_K_INNER, int GROUP_SIZE, int RECONN_SZ, bool GATED,
+          class SmemDC, class SmemB,
           class WarpLayoutProducer, class WarpLayoutConsumer>
 __device__ static inline
-void dAdR_producer(
+void dAdR_producer_v2(
     const half_t* __restrict__ dC_ptr, int ldDC,
     const half_t* __restrict__ B_ptr,  int ldB,
-    SmemDC& sdC, SmemBt& sBt, SmemDAR& sdAR,
-    int M, int N, int K, int b, int m_start,
+    SmemDC& sdC, SmemB& sB,
+    float* __restrict__ sdH,  // F32 shared memory, row-major (BLK_M, BLK_K)
+    int M, int N, int K, int m_start, int k_start,
     int n_groups,
     int thread_idx,
     WarpLayoutProducer, WarpLayoutConsumer)
 {
     constexpr int gs = GROUP_SIZE;
-    constexpr int rs = RECONN_SZ;
     constexpr int bP_dc_b = cute::BwdDAdRParams::bP_dc_b;
-    constexpr int bP_dar = cute::BwdDAdRParams::bP_dar;
+    constexpr int bP_dh = cute::BwdDAdRParams::bP_dh;
 
-    // Offset barrier IDs by 1 to avoid conflict with __syncthreads() barrier 0
     constexpr int BAR_READY_BASE = 1;
-    constexpr int BAR_CONSUMED_BASE = BAR_READY_BASE + bP_dar;
+    constexpr int BAR_CONSUMED_BASE = BAR_READY_BASE + bP_dh;
 
     constexpr uint32_t n_producer_threads = size(WarpLayoutProducer{}) * 32;
     constexpr uint32_t n_consumer_threads = size(WarpLayoutConsumer{}) * 32;
@@ -45,163 +49,178 @@ void dAdR_producer(
 
     int lane_idx = thread_idx % 32;
     int warp_idx = thread_idx / 32;
-    constexpr int n_producer_warps = size(WarpLayoutProducer{});
-    constexpr int WARP_M = BLK_M / n_producer_warps;
+    constexpr int n_inner_tiles = gs / BLK_K_INNER;
 
-    // -- MMA: dAR(WARP_M, rs) = dC(WARP_M, gs) @ B^T(rs, gs) [TN, K=gs] --
-    using mma_atom_t = std::conditional_t<(gs < 16),
-        MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
-        MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
+    // -- MMA: F32 accumulator TN GEMM --
+    using mma_atom_t = std::conditional_t<(BLK_K_INNER < 16),
+        MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>,
+        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>>;
 
-    auto mma = make_tiled_mma(
-        mma_atom_t{},
-        Layout<Shape<_1, _1>>{},
-        Tile<Int<WARP_M>, Int<rs>>{}
-    );
-    auto thr_mma = mma.get_slice(lane_idx);
+    auto mma = make_tiled_mma(mma_atom_t{}, WarpLayoutProducer{},
+                               Tile<Int<BLK_M>, Int<BLK_K>>{});
+    auto thr_mma = mma.get_slice(lane_idx + warp_idx * 32);
 
-    // -- Swizzle-preserving sub-views via logical_divide --
-    // Flat WARP_M tiler for contiguous warp regions
+    // F32 sdH tensor for r2s copy (non-swizzled, row-major)
+    auto sdH_tensor = make_tensor(make_smem_ptr(sdH),
+        make_layout(make_shape(Int<BLK_M>{}, Int<BLK_K>{}), LayoutRight{}));
 
-    // sdC: (BLK_M, gs, bP_dc_b) -> warp sub-view (WARP_M, gs, bP_dc_b)
-    Tensor sdC_warp = logical_divide(sdC,
-        make_tile(make_layout(Int<WARP_M>{}), _)
-    )(make_coord(_, warp_idx), _, _); // (WARP_M, gs, bP_dc_b)
+    auto rDH = thr_mma.make_fragment_C(thr_mma.partition_C(sdH_tensor));
 
-    // sBt: (rs, gs, bP_dc_b) — no M-tiling needed
-    // sdAR: (BLK_M, rs, bP_dar) -> warp sub-view (WARP_M, rs, bP_dar)
-    Tensor sdAR_warp = logical_divide(sdAR,
-        make_tile(make_layout(Int<WARP_M>{}), _)
-    )(make_coord(_, warp_idx), _, _); // (WARP_M, rs, bP_dar)
+    // r2s copy for F32 dH writeback using MMA C-fragment layout
+    using r2s_dH_atom = Copy_Atom<UniversalCopy<uint32_t>, float>;
+    auto r2s_dh = make_tiled_copy_C(r2s_dH_atom{}, mma);
+    auto r2s_dh_thr = r2s_dh.get_slice(lane_idx + warp_idx * 32);
+    auto tXrDH = r2s_dh_thr.retile_S(rDH);
+    auto tXsdH = r2s_dh_thr.partition_D(sdH_tensor);
 
-    auto tCsDAR = thr_mma.partition_C(sdAR_warp);
-    auto rDAR = thr_mma.make_fragment_C(tCsDAR(_,_,_,_0{}));
+    // -- LDSM s2r atoms --
+    // dC (A-operand): LDSM_N (K_INNER contiguous in smem)
+    constexpr int K_atom = (BLK_K_INNER < 16) ? 8 : 16;
+    constexpr int n_pw = size(WarpLayoutProducer{});
+    constexpr int a_u32 = (BLK_M / n_pw * K_atom) / 64;
+    using s2r_dC = std::conditional_t<(a_u32 >= 4),
+        Copy_Atom<SM75_U32x4_LDSM_N, half_t>, Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
 
-    using r2s_atom = Copy_Atom<UniversalCopy<uint32_t>, half_t>;
-    auto r2s = make_tiled_copy_C(r2s_atom{}, mma);
-    auto r2s_thr = r2s.get_slice(lane_idx);
-    auto tXrDAR = r2s_thr.retile_S(rDAR);
-    auto tXsDAR = r2s_thr.partition_D(sdAR_warp); // (CPY, CPY_M, CPY_N, bP_dar)
+    // B (B-operand): LDSM_T (N-contiguous smem, transpose during s2r)
+    // LDSM_T transposes N-major smem → K-major registers for TN MMA
+    constexpr int b_u16 = (BLK_K * K_atom) / 32;
+    using s2r_B = std::conditional_t<(b_u16 >= 8),
+        Copy_Atom<SM75_U16x8_LDSM_T, half_t>,
+        std::conditional_t<(b_u16 >= 4),
+            Copy_Atom<SM75_U16x4_LDSM_T, half_t>,
+            Copy_Atom<SM75_U16x2_LDSM_T, half_t>>>;
 
-    // -- s2r atoms: LDSM for smem→reg (producer smem uses K_atom-based swizzle) --
-    // Per-thread u32 count is based on MMA operand size per step (K_atom),
-    // not the full reduction dimension (gs).
-    constexpr int K_atom_p = (gs < 16) ? 8 : 16;
-    constexpr int a_u32 = (WARP_M * K_atom_p) / 64;
-    using s2r_atom_dC = std::conditional_t<(a_u32 >= 4),
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
-        Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
-    constexpr int b_u32 = (rs * K_atom_p) / 64;
-    using s2r_atom_Bt = std::conditional_t<(b_u32 >= 4),
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
-        Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
+    auto s2r_a = make_tiled_copy_A(s2r_dC{}, mma);
+    auto s2r_a_thr = s2r_a.get_slice(lane_idx + warp_idx * 32);
+    auto tXsdC = s2r_a_thr.partition_S(sdC);
+    auto rdC = thr_mma.make_fragment_A(thr_mma.partition_A(sdC(_,_,_0{})));
+    auto tXrdC = s2r_a_thr.retile_D(rdC);
 
-    // Partition s2r once before loop
-    auto s2r_a = make_tiled_copy_A(s2r_atom_dC{}, mma);
-    auto s2r_a_thr = s2r_a.get_slice(lane_idx);
-    auto tXsdC = s2r_a_thr.partition_S(sdC_warp); // (CPY, CPY_M, CPY_K, bP_dc_b)
-    auto rDC = thr_mma.make_fragment_A(thr_mma.partition_A(sdC_warp(_,_,_0{})));
-    auto tXrDC = s2r_a_thr.retile_D(rDC);
+    // sB has shape (BLK_K, BLK_K_INNER, pipe) — directly in MMA B-operand shape
+    // (N=BLK_K first, BLK_K contiguous due to Swizzle<3,3,3> atom)
+    auto s2r_b = make_tiled_copy_B(s2r_B{}, mma);
+    auto s2r_b_thr = s2r_b.get_slice(lane_idx + warp_idx * 32);
+    auto tXsB = s2r_b_thr.partition_S(sB);
+    auto rB = thr_mma.make_fragment_B(thr_mma.partition_B(sB(_,_,_0{})));
+    auto tXrB = s2r_b_thr.retile_D(rB);
 
-    auto s2r_b = make_tiled_copy_B(s2r_atom_Bt{}, mma);
-    auto s2r_b_thr = s2r_b.get_slice(lane_idx);
-    auto tXsBt = s2r_b_thr.partition_S(sBt); // (CPY, CPY_N, CPY_K, bP_dc_b)
-    auto rBt = thr_mma.make_fragment_B(thr_mma.partition_B(sBt(_,_,_0{})));
-    auto tXrBt = s2r_b_thr.retile_D(rBt);
+    // -- cp.async for dC and B (vectorized 128-bit) --
+    auto copy_dC = cp_layout<uint128_t, half_t>(Int<BLK_M>{}, Int<BLK_K_INNER>{},
+                                                  Int<n_producer_threads>{});
+    auto thr_copy_dC = copy_dC.get_slice(thread_idx);
+    auto tCsdC_cp = thr_copy_dC.partition_D(sdC);
 
-    // -- Pipeline state --
-    int dc_b_pipe_write = bP_dc_b - 1;
-    int dc_b_pipe_read = 0;
-    int dar_pipe_write = 0;
+    // B cp.async: (BLK_K, BLK_K_INNER) with BLK_K contiguous (dim 0)
+    // Vectorize 8 halfs along dim 0 (BLK_K). Thread layout covers (BLK_K/8, BLK_K_INNER).
+    constexpr int b_threads_dim0 = BLK_K / 8;  // 8 threads along BLK_K (each loads 8 halfs)
+    constexpr int b_threads_dim1 = n_producer_threads / b_threads_dim0;
+    constexpr int b_values_dim1 = BLK_K_INNER / b_threads_dim1;
+    auto copy_B = make_tiled_copy(
+        Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
+        make_layout(make_shape(Int<b_threads_dim0>{}, Int<b_threads_dim1>{}), LayoutRight{}),
+        make_layout(make_shape(_8{}, Int<b_values_dim1>{})));
+    auto thr_copy_B = copy_B.get_slice(thread_idx);
+    auto tCsB_cp = thr_copy_B.partition_D(sB);
 
-    // -- Prefill dC+B pipeline --
-    for (int p = 0; p < bP_dc_b - 1 && p < n_groups; ++p) {
-        for (int i = thread_idx; i < BLK_M * gs; i += n_producer_threads) {
-            int r = i / gs, c = i % gs;
-            int m_idx = m_start + r;
-            sdC(r, c, p) = load_or_zero(dC_ptr, m_idx * ldDC + p * gs + c, m_idx < M);
-        }
-        for (int i = thread_idx; i < gs * rs; i += n_producer_threads) {
-            int src_row = i / rs;
-            int src_col = i % rs;
-            sBt(src_col, src_row, p) = *(B_ptr + (p * gs + src_row) * ldB + b * rs + src_col);
-        }
-        cp_async_fence();
-    }
+    int dh_pipe_write = 0;
 
-    // -- Main group loop --
     for (int g = 0; g < n_groups; ++g) {
-        int g_next = g + bP_dc_b - 1;
-        if (g_next < n_groups) {
-            for (int i = thread_idx; i < BLK_M * gs; i += n_producer_threads) {
-                int r = i / gs, c = i % gs;
-                int m_idx = m_start + r;
-                sdC(r, c, dc_b_pipe_write) = load_or_zero(dC_ptr, m_idx * ldDC + g_next * gs + c, m_idx < M);
-            }
-            for (int i = thread_idx; i < gs * rs; i += n_producer_threads) {
-                int src_row = i / rs;
-                int src_col = i % rs;
-                sBt(src_col, src_row, dc_b_pipe_write) = *(B_ptr + (g_next * gs + src_row) * ldB + b * rs + src_col);
-            }
-        }
-        cp_async_fence();
-        cp_async_wait<bP_dc_b - 1>();
-        asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
-
-        // LDSM s2r loads indexed by pipe
-        copy(s2r_atom_dC{}, tXsdC(_,_,_,dc_b_pipe_read), tXrDC);
-        copy(s2r_atom_Bt{}, tXsBt(_,_,_,dc_b_pipe_read), tXrBt);
-
-        // MMA: dAR = dC @ B^T
-        clear(rDAR);
-        gemm(mma, rDC, rBt, rDAR);
-
-        // Wait for consumer to release dAR buffer
+        // Wait for consumer to finish with sdH BEFORE loading dC+B (aliased memory!)
         asm volatile("bar.sync %0, %1;\n"
-            : : "r"(dar_pipe_write + BAR_CONSUMED_BASE), "n"(n_total_threads));
+            : : "r"(dh_pipe_write + BAR_CONSUMED_BASE), "n"(n_total_threads));
 
-        // Write dAR to pipeline buffer (warp portion)
-        copy(r2s_atom{}, tXrDAR, tXsDAR(_,_,_,dar_pipe_write));
+        clear(rDH);
+        int pipe_w = bP_dc_b - 1, pipe_r = 0;
+
+        // Helpers: load dC and B tiles via cp.async (vectorized 128-bit)
+        auto load_dC_async = [&](int g, int ki_offset, int pipe) {
+            auto gdC = make_tensor(
+                make_gmem_ptr(dC_ptr + m_start * ldDC + g * gs + ki_offset),
+                make_layout(make_shape(Int<BLK_M>{}, Int<BLK_K_INNER>{}),
+                            make_stride(ldDC, Int<1>{})));
+            copy(copy_dC, thr_copy_dC.partition_S(gdC), tCsdC_cp(_,_,_,pipe));
+        };
+
+        // B async load helper
+        auto load_B_async = [&](int g, int ki_offset, int pipe) {
+            // B(N, K) row-major. We load (BLK_K cols, BLK_K_INNER rows) with BLK_K contiguous.
+            // gmem tensor: (BLK_K, BLK_K_INNER) with stride (1, ldB) matching smem shape
+            auto gB = make_tensor(
+                make_gmem_ptr(B_ptr + (g * gs + ki_offset) * ldB + k_start),
+                make_layout(make_shape(Int<BLK_K>{}, Int<BLK_K_INNER>{}),
+                            make_stride(Int<1>{}, ldB)));
+            copy(copy_B, thr_copy_B.partition_S(gB), tCsB_cp(_,_,_,pipe));
+        };
+
+        // Prefill
+        for (int p = 0; p < bP_dc_b - 1 && p < n_inner_tiles; ++p) {
+            int off = p * BLK_K_INNER;
+            load_dC_async(g, off, p);
+            load_B_async(g, off, p);
+            cp_async_fence();
+        }
+
+        // Inner K loop
+        for (int ki = 0; ki < n_inner_tiles; ++ki) {
+            int ki_next = ki + bP_dc_b - 1;
+            if (ki_next < n_inner_tiles) {
+                int off = ki_next * BLK_K_INNER;
+                load_dC_async(g, off, pipe_w);
+                load_B_async(g, off, pipe_w);
+            }
+            cp_async_fence();
+            cp_async_wait<bP_dc_b - 1>();
+            asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
+
+            copy(s2r_dC{}, tXsdC(_,_,_,pipe_r), tXrdC);
+            copy(s2r_B{}, tXsB(_,_,_,pipe_r), tXrB);
+            gemm(mma, rdC, rB, rDH);
+
+            pipe_w = pipe_r;
+            if (++pipe_r == bP_dc_b) pipe_r = 0;
+        }
+
+        // Ensure ALL outstanding async copies are complete before writing sdH
+        // (the last iteration's wait<bP_dc_b-1> may leave 1 fence outstanding)
+        cp_async_wait<0>();
         asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
 
-        // Signal consumer: dAR ready
+        // Write F32 rDH → F32 sdH via r2s tiled copy (uses MMA C-fragment layout)
+        // Consumer already signaled CONSUMED at the start of this group's loop iteration
+        copy(r2s_dH_atom{}, tXrDH, tXsdH);
+        asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
+
         asm volatile("bar.arrive %0, %1;\n"
-            : : "r"(dar_pipe_write + BAR_READY_BASE), "n"(n_total_threads));
-
-        ++dar_pipe_write;
-        if (dar_pipe_write == bP_dar) dar_pipe_write = 0;
-
-        dc_b_pipe_write = dc_b_pipe_read;
-        ++dc_b_pipe_read;
-        if (dc_b_pipe_read == bP_dc_b) dc_b_pipe_read = 0;
+            : : "r"(dh_pipe_write + BAR_READY_BASE), "n"(n_total_threads));
+        if (++dh_pipe_write == bP_dh) dh_pipe_write = 0;
     }
 }
 
-
-// Consumer: loads A+R, uses dAR from producer for dA/dR computation (MMA-accelerated)
-template <int BLK_M, int GROUP_SIZE, int RECONN_SZ, bool GATED,
-          class SmemA, class SmemR, class SmemRt, class SmemARtemp, class SmemDAR,
+// =============================================================================
+// Consumer: dA accumulation + dR from F32 sdH
+// =============================================================================
+template <int BLK_M, int BLK_K, int GROUP_SIZE, int RECONN_SZ, bool GATED,
+          class SmemA, class SmemR, class SmemARtemp,
           class WarpLayoutProducer, class WarpLayoutConsumer>
 __device__ static inline
-void dAdR_consumer(
+void dAdR_consumer_v2(
     const half_t* __restrict__ A_ptr, int ldA,
     const half_t* __restrict__ R_ptr, int ldR,
     half_t* __restrict__ dA_ptr, int ldDA,
     float* __restrict__ dR_partial,
-    SmemA& sA, SmemR& sR_buf, SmemRt& sRt_buf, SmemARtemp& sAR_temp, SmemDAR& sdAR,
-    int M, int K, int b, int m_start,
+    SmemA& sA, SmemR& sR, const float* __restrict__ sdH, SmemARtemp& sAR_temp,
+    int M, int K, int m_start, int k_start,
     int n_groups, int n_buf_slots, int buf_slot,
     int thread_idx,
     WarpLayoutProducer, WarpLayoutConsumer)
 {
-    constexpr int gs = GROUP_SIZE;
     constexpr int rs = RECONN_SZ;
-    constexpr int bP_dar = cute::BwdDAdRParams::bP_dar;
-    constexpr int bP_a_r = cute::BwdDAdRParams::bP_a_r;
+    constexpr int bP_dh = cute::BwdDAdRParams::bP_dh;
+    constexpr int bP_r = cute::BwdDAdRParams::bP_r;
+    constexpr int n_reconn_blocks = BLK_K / rs;
 
-    // Offset barrier IDs by 1 to avoid conflict with __syncthreads() barrier 0
     constexpr int BAR_READY_BASE = 1;
-    constexpr int BAR_CONSUMED_BASE = BAR_READY_BASE + bP_dar;
+    constexpr int BAR_CONSUMED_BASE = BAR_READY_BASE + bP_dh;
 
     constexpr uint32_t n_producer_threads = size(WarpLayoutProducer{}) * 32;
     constexpr uint32_t n_consumer_threads = size(WarpLayoutConsumer{}) * 32;
@@ -211,257 +230,241 @@ void dAdR_consumer(
     constexpr int WARP_M = BLK_M / n_consumer_warps;
     int lane_idx = thread_idx % 32;
     int warp_idx = thread_idx / 32;
-
     int m_valid = min(m_start + BLK_M, M) - m_start;
 
-    // -- Signal producer that all dAR pipe slots are initially available --
-    for (int bid = BAR_CONSUMED_BASE; bid < BAR_CONSUMED_BASE + bP_dar; ++bid) {
-        asm volatile("bar.arrive %0, %1;\n"
-            : : "r"(bid), "n"(n_total_threads));
-    }
-
-    // -- Swizzle-preserving sub-views via logical_divide --
-    // Flat WARP_M tiler for contiguous warp regions
-
-    // sdAR: (BLK_M, rs, bP_dar) -> warp sub-view (WARP_M, rs, bP_dar)
-    Tensor sdAR_warp = logical_divide(sdAR,
-        make_tile(make_layout(Int<WARP_M>{}), _)
-    )(make_coord(_, warp_idx), _, _); // (WARP_M, rs, bP_dar)
-
-    // sA: (BLK_M, rs) -> warp sub-view (WARP_M, rs)
-    Tensor sA_warp = logical_divide(sA,
-        make_tile(make_layout(Int<WARP_M>{}), _)
-    )(make_coord(_, warp_idx), _); // (WARP_M, rs)
-
-    // sRt_buf: (rs, rs, bP_a_r) — no M-tiling needed
-    // sR_buf: (rs, rs, bP_a_r) — no M-tiling needed (gated only)
-
-    // sAR_temp: (BLK_M, rs) -> warp sub-view (WARP_M, rs) (gated only)
-    Tensor sAR_temp_warp = logical_divide(sAR_temp,
-        make_tile(make_layout(Int<WARP_M>{}), _)
-    )(make_coord(_, warp_idx), _); // (WARP_M, rs)
-
-    // -- dA MMA setup: F32 accumulator persists across group iterations --
-    using mma_atom_da = std::conditional_t<(rs < 16),
+    // -- Consumer MMA setup for reconn dA: (WARP_M, rs) += (WARP_M, rs) @ (rs, rs)^T --
+    using cons_mma_atom = std::conditional_t<(rs < 16),
         MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>,
         MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>>;
-    auto mma_da = make_tiled_mma(
-        mma_atom_da{},
-        Layout<Shape<_1, _1>>{},
-        Tile<Int<WARP_M>, Int<rs>>{}
-    );
-    auto thr_mma_da = mma_da.get_slice(lane_idx);
+    auto cons_mma = make_tiled_mma(cons_mma_atom{},
+        Layout<Shape<_1, _1>>{},  // single warp
+        Tile<Int<WARP_M>, Int<rs>>{});
+    auto cons_thr = cons_mma.get_slice(lane_idx);
 
-    // F32 accumulator fragment for dA
+    // Per-reconn-block F32 C-accumulators (persist across all groups)
     auto dA_shape = make_shape(Int<WARP_M>{}, Int<rs>{});
-    auto sdA_layout = make_layout(dA_shape, LayoutRight{});
-    auto tMcDA_dummy = thr_mma_da.partition_C(make_tensor(
-        static_cast<half_t*>(nullptr), sdA_layout));
-    auto rDA = thr_mma_da.make_fragment_C(tMcDA_dummy);
-    clear(rDA);
+    auto dA_layout = make_layout(dA_shape, LayoutRight{});
+    auto tCdA_dummy = cons_thr.partition_C(make_tensor(static_cast<half_t*>(nullptr), dA_layout));
+    // Array of n_reconn_blocks MMA C-accumulators (non-gated path)
+    using frag_c_type = decltype(cons_thr.make_fragment_C(tCdA_dummy));
+    frag_c_type rDA_blk[n_reconn_blocks];
+    #pragma unroll
+    for (int b = 0; b < n_reconn_blocks; ++b) clear(rDA_blk[b]);
 
-    // -- LDSM atoms for s2r (swizzled smem) --
-    constexpr int a_u32_s3 = (WARP_M * rs) / 64;
-    using s2r_atom_dAR = std::conditional_t<(a_u32_s3 % 4 == 0),
+    // (flat rDA array removed — both gated and non-gated use per-block MMA accumulators)
+
+    // Identity tensor for consumer MMA C → (mi, ki) writeback
+    auto tCdA_id = cons_thr.partition_C(make_identity_tensor(dA_shape));
+
+    // sAR_temp warp sub-view for consumer MMA A-operand (dH slice)
+    // sAR_temp: (BLK_M, rs) row-major. Each warp processes WARP_M rows.
+    Tensor sAR_warp = make_tensor(
+        &sAR_temp(warp_idx * WARP_M, 0),
+        make_layout(make_shape(Int<WARP_M>{}, Int<rs>{}), LayoutRight{}));
+
+    // LDSM s2r for consumer A-operand (dH from sAR_temp)
+    constexpr int cons_a_u32 = (WARP_M * rs) / 64;
+    using cons_s2r_A = std::conditional_t<(cons_a_u32 >= 4),
         Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
         Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
-    constexpr int b_u32_s3 = (rs * rs) / 64;
-    using s2r_atom_Rt = std::conditional_t<(b_u32_s3 % 4 == 0),
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
-        Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
+    auto cons_s2r_a = make_tiled_copy_A(cons_s2r_A{}, cons_mma);
+    auto cons_s2r_a_thr = cons_s2r_a.get_slice(lane_idx);
+    auto tXsAR = cons_s2r_a_thr.partition_S(sAR_warp);
+    auto rDH_frag = cons_thr.make_fragment_A(cons_thr.partition_A(sAR_warp));
+    auto tXrDH_frag = cons_s2r_a_thr.retile_D(rDH_frag);
 
-    // Partition s2r once before loop for dA MMA (dAR @ Rt)
-    auto s2r_dar = make_tiled_copy_A(s2r_atom_dAR{}, mma_da);
-    auto s2r_dar_thr = s2r_dar.get_slice(lane_idx);
-    auto tXsdAR = s2r_dar_thr.partition_S(sdAR_warp); // (CPY, CPY_M, CPY_K, bP_dar)
-    auto rdAR_frag = thr_mma_da.make_fragment_A(thr_mma_da.partition_A(sdAR_warp(_,_,_0{})));
-    auto tXrdAR = s2r_dar_thr.retile_D(rdAR_frag);
+    // Signal producer: all dH slots available
+    for (int bid = BAR_CONSUMED_BASE; bid < BAR_CONSUMED_BASE + bP_dh; ++bid)
+        asm volatile("bar.arrive %0, %1;\n" : : "r"(bid), "n"(n_total_threads));
 
-    auto s2r_rt = make_tiled_copy_B(s2r_atom_Rt{}, mma_da);
-    auto s2r_rt_thr = s2r_rt.get_slice(lane_idx);
-    auto tXsRt = s2r_rt_thr.partition_S(sRt_buf); // (CPY, CPY_N, CPY_K, bP_a_r)
-    auto rRt_frag = thr_mma_da.make_fragment_B(thr_mma_da.partition_B(sRt_buf(_,_,_0{})));
-    auto tXrRt = s2r_rt_thr.retile_D(rRt_frag);
-
-    // -- Load A_b(BLK_M, rs) to smem --
-    for (int i = thread_idx; i < BLK_M * rs; i += n_consumer_threads) {
-        int r = i / rs, c = i % rs;
-        int m_idx = m_start + r;
-        sA(r, c) = load_or_zero(A_ptr, m_idx * ldA + b * rs + c, m_idx < M);
+    // Load A once
+    for (int i = thread_idx; i < BLK_M * BLK_K; i += n_consumer_threads) {
+        int r = i / BLK_K, c = i % BLK_K;
+        sA(r, c) = (m_start + r < M && k_start + c < K) ? *(A_ptr + (m_start + r) * ldA + k_start + c) : half_t(0);
     }
 
-    // -- Prefill R pipeline: load R^T (always) and R (gated only) --
-    for (int p = 0; p < bP_a_r - 1 && p < n_groups; ++p) {
-        for (int i = thread_idx; i < rs * rs; i += n_consumer_threads) {
-            int r = i / rs, c = i % rs;
-            half_t val = *(R_ptr + (p * rs + r) * ldR + b * rs + c);
-            sRt_buf(c, r, p) = val;
-            if constexpr (GATED) {
-                sR_buf(r, c, p) = val;
-            }
+    // Prefill R pipeline
+    for (int p = 0; p < bP_r - 1 && p < n_groups; ++p) {
+        for (int i = thread_idx; i < rs * BLK_K; i += n_consumer_threads) {
+            int r = i / BLK_K, c = i % BLK_K;
+            sR(r, c, p) = (k_start + c < K) ? *(R_ptr + (p * rs + r) * ldR + k_start + c) : half_t(0);
         }
         cp_async_fence();
     }
 
-    int r_pipe_write = bP_a_r - 1;
-    int r_pipe_read = 0;
-    int dar_pipe_read = 0;
+    int r_pipe_w = bP_r - 1, r_pipe_r = 0, dh_pipe_r = 0;
 
-    // -- Main group loop --
     for (int g = 0; g < n_groups; ++g) {
-        // Load next R^T (and R for gated)
-        int g_next = g + bP_a_r - 1;
+        // Load next R
+        int g_next = g + bP_r - 1;
         if (g_next < n_groups) {
-            for (int i = thread_idx; i < rs * rs; i += n_consumer_threads) {
-                int r = i / rs, c = i % rs;
-                half_t val = *(R_ptr + (g_next * rs + r) * ldR + b * rs + c);
-                sRt_buf(c, r, r_pipe_write) = val;
-                if constexpr (GATED) {
-                    sR_buf(r, c, r_pipe_write) = val;
-                }
+            for (int i = thread_idx; i < rs * BLK_K; i += n_consumer_threads) {
+                int r = i / BLK_K, c = i % BLK_K;
+                sR(r, c, r_pipe_w) = (k_start + c < K) ? *(R_ptr + (g_next * rs + r) * ldR + k_start + c) : half_t(0);
             }
         }
         cp_async_fence();
-        cp_async_wait<bP_a_r - 1>();
+        cp_async_wait<bP_r - 1>();
         asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
 
-        // Wait for producer's dAR
+        // Wait for producer's dH (F32)
         asm volatile("bar.sync %0, %1;\n"
-            : : "r"(dar_pipe_read + BAR_READY_BASE), "n"(n_total_threads));
+            : : "r"(dh_pipe_r + BAR_READY_BASE), "n"(n_total_threads));
 
-        // -- dA computation via MMA --
         if constexpr (GATED) {
-            // Phase A: AR recompute via MMA — rAR = A_warp @ R_warp^T (natural TN fit)
-            using mma_atom_ar = std::conditional_t<(rs < 16),
-                MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
-                MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
-            auto mma_ar = make_tiled_mma(
-                mma_atom_ar{},
-                Layout<Shape<_1, _1>>{},
-                Tile<Int<WARP_M>, Int<rs>>{}
-            );
-            auto thr_mma_ar = mma_ar.get_slice(lane_idx);
+            // Gated path: per-reconn-block AR recompute, SiLU, dA accumulation via MMA
+            // Then write all dS to sAR_temp ONCE for dR computation
+            auto rR_frag = cons_thr.make_fragment_B(cons_thr.partition_B(
+                make_tensor(static_cast<half_t*>(nullptr),
+                            make_layout(make_shape(Int<rs>{}, Int<rs>{}), LayoutRight{}))));
+            auto tBid = cons_thr.partition_B(make_identity_tensor(
+                make_shape(Int<rs>{}, Int<rs>{})));
 
-            // LDSM s2r for AR recompute (same register counts as dA MMA)
-            using s2r_atom_A_ar = std::conditional_t<(a_u32_s3 % 4 == 0),
-                Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
-                Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
-            using s2r_atom_R_ar = std::conditional_t<(b_u32_s3 % 4 == 0),
-                Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
-                Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
+            for (int b = 0; b < n_reconn_blocks; ++b) {
+                int k_off = b * rs;
 
-            auto s2r_a_ar = make_tiled_copy_A(s2r_atom_A_ar{}, mma_ar);
-            auto s2r_a_ar_thr = s2r_a_ar.get_slice(lane_idx);
-            auto rA_ar = thr_mma_ar.make_fragment_A(thr_mma_ar.partition_A(sA_warp));
-            copy(s2r_atom_A_ar{}, s2r_a_ar_thr.partition_S(sA_warp), s2r_a_ar_thr.retile_D(rA_ar));
-
-            auto s2r_b_ar = make_tiled_copy_B(s2r_atom_R_ar{}, mma_ar);
-            auto s2r_b_ar_thr = s2r_b_ar.get_slice(lane_idx);
-            auto tXsR_ar = s2r_b_ar_thr.partition_S(sR_buf); // (CPY, CPY_N, CPY_K, bP_a_r)
-            auto rR_ar = thr_mma_ar.make_fragment_B(thr_mma_ar.partition_B(sR_buf(_,_,_0{})));
-            copy(s2r_atom_R_ar{}, tXsR_ar(_,_,_,r_pipe_read), s2r_b_ar_thr.retile_D(rR_ar));
-
-            // AR MMA output -> sAR_temp
-            auto tCsAR = thr_mma_ar.partition_C(sAR_temp_warp);
-            auto rAR = thr_mma_ar.make_fragment_C(tCsAR);
-            clear(rAR);
-            gemm(mma_ar, rA_ar, rR_ar, rAR);
-
-            // r2s: write rAR -> sAR_temp
-            using r2s_atom_AR = Copy_Atom<UniversalCopy<uint32_t>, half_t>;
-            auto r2s_ar = make_tiled_copy_C(r2s_atom_AR{}, mma_ar);
-            auto r2s_ar_thr = r2s_ar.get_slice(lane_idx);
-            copy(r2s_atom_AR{}, r2s_ar_thr.retile_S(rAR), r2s_ar_thr.partition_D(sAR_temp_warp));
-            asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
-
-            // Phase B: Element-wise SiLU + dS (scalar — swizzle handled by CuTe layout)
-            for (int idx = thread_idx; idx < m_valid * rs; idx += n_consumer_threads) {
-                int mi = idx / rs, ri = idx % rs;
-                float ar = float(sAR_temp(mi, ri));
-                float dH = float(sdAR(mi, ri, dar_pipe_read));
-                float a_val = float(sA(mi, ri));
-                float sigma = 1.0f / (1.0f + __expf(-ar));
-                float silu_ar = ar * sigma;
-                float silu_prime = sigma * (1.0f + ar * (1.0f - sigma));
-                float dS = dH * a_val * silu_prime;
-                sdAR(mi, ri, dar_pipe_read) = half_t(dS);
-                sAR_temp(mi, ri) = half_t(dH * silu_ar);
-            }
-            asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
-
-            // Phase C: Load SiLU contribution (dH*SiLU(AR)) into rDA
-            {
-                auto tMcDA_id = thr_mma_da.partition_C(make_identity_tensor(dA_shape));
-                for (int i = 0; i < size(rDA); ++i) {
-                    auto coord = tMcDA_id(i);
-                    int mi = get<0>(coord) + warp_idx * WARP_M;
-                    if (mi < m_valid)
-                        rDA(i) += float(sAR_temp(mi, get<1>(coord)));
+                // AR recompute via MMA: rAR = A @ R^T
+                // First write A slice to sAR_temp, sync, then LDSM
+                for (int idx = thread_idx; idx < BLK_M * rs; idx += n_consumer_threads) {
+                    int mi = idx / rs, ri = idx % rs;
+                    sAR_temp(mi, ri) = (mi < m_valid) ? sA(mi, k_off + ri) : half_t(0);
                 }
-            }
+                asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
 
-            // Phase D: dA += dS @ R via MMA (sdAR now contains dS)
-            {
-                copy(s2r_atom_dAR{}, tXsdAR(_,_,_,dar_pipe_read), tXrdAR);
-                copy(s2r_atom_Rt{}, tXsRt(_,_,_,r_pipe_read), tXrRt);
-                gemm(mma_da, rdAR_frag, rRt_frag, rDA);
+                copy(cons_s2r_A{}, tXsAR, tXrDH_frag);  // load A slice
+                for (int i = 0; i < size(rR_frag); ++i) {
+                    auto coord = tBid(i);
+                    rR_frag(i) = sR(get<0>(coord), k_off + get<1>(coord), r_pipe_r);  // R natural for A@R^T
+                }
+                frag_c_type rAR;
+                clear(rAR);
+                gemm(cons_mma, rDH_frag, rR_frag, rAR);
+
+                // Elementwise: dA += dH * SiLU(AR), compute dS, write dS to sAR_temp
+                for (int i = 0; i < size(rAR); ++i) {
+                    auto coord = tCdA_id(i);
+                    int mi = get<0>(coord) + warp_idx * WARP_M;
+                    int ri = get<1>(coord);
+                    if (mi < m_valid) {
+                        float ar_f = rAR(i);
+                        float sigma = 1.0f / (1.0f + __expf(-ar_f));
+                        float dH_val = sdH[mi * BLK_K + k_off + ri];
+                        float a_val = float(sA(mi, k_off + ri));
+
+                        rDA_blk[b](i) += dH_val * ar_f * sigma;  // dH * SiLU(AR)
+                        float silu_prime = sigma * (1.0f + ar_f * (1.0f - sigma));
+                        sAR_temp(mi, ri) = half_t(dH_val * a_val * silu_prime);  // dS
+                    }
+                }
+                asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
+
+                // dA += dS @ R via MMA
+                copy(cons_s2r_A{}, tXsAR, tXrDH_frag);
+                for (int i = 0; i < size(rR_frag); ++i) {
+                    auto coord = tBid(i);
+                    rR_frag(i) = sR(get<1>(coord), k_off + get<0>(coord), r_pipe_r);  // R for dA@R
+                }
+                gemm(cons_mma, rDH_frag, rR_frag, rDA_blk[b]);
+
+                // dR partial sums (scalar)
+                for (int idx = thread_idx; idx < rs * rs; idx += n_consumer_threads) {
+                    int i = idx / rs, j = idx % rs;
+                    float val = 0.0f;
+                    for (int mi = 0; mi < m_valid; ++mi)
+                        val += float(sAR_temp(mi, i)) * float(sA(mi, k_off + j));
+                    if (val != 0.0f) {
+                        int dR_rows = n_groups * rs;
+                        atomicAdd(&dR_partial[buf_slot * dR_rows * K + (g * rs + i) * K + k_start + k_off + j], val);
+                    }
+                }
             }
         } else {
-            // Non-gated: dA += dAR @ R via MMA
-            copy(s2r_atom_dAR{}, tXsdAR(_,_,_,dar_pipe_read), tXrdAR);
-            copy(s2r_atom_Rt{}, tXsRt(_,_,_,r_pipe_read), tXrRt);
-            gemm(mma_da, rdAR_frag, rRt_frag, rDA);
-        }
+            // Non-gated: dA via MMA per reconn block
+            for (int b = 0; b < n_reconn_blocks; ++b) {
+                int k_off = b * rs;
 
-        asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
+                // Step 1: Copy F32 sdH slice → F16 sAR_temp (all consumer threads cooperate)
+                for (int idx = thread_idx; idx < BLK_M * rs; idx += n_consumer_threads) {
+                    int mi = idx / rs, ri = idx % rs;
+                    sAR_temp(mi, ri) = (mi < m_valid) ? half_t(sdH[mi * BLK_K + k_off + ri]) : half_t(0);
+                }
+                asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
 
-        // dR partial: dR_g_b(i,j) = sum_m dAR(m,i) * A(m,j)  (scalar, kept as-is)
-        {
-            for (int idx = thread_idx; idx < rs * rs; idx += n_consumer_threads) {
-                int i = idx / rs, j = idx % rs;
-                float val = 0.0f;
-                for (int mi = 0; mi < m_valid; ++mi)
-                    val += float(sdAR(mi, i, dar_pipe_read)) * float(sA(mi, j));
-                if (val != 0.0f) {
-                    int dr_row = g * rs + i;
-                    int dr_col = b * rs + j;
-                    int dR_rows = n_groups * rs;
-                    atomicAdd(&dR_partial[buf_slot * dR_rows * K + dr_row * K + dr_col], val);
+                // Step 2: MMA dA_b += dH_b(WARP_M, rs) @ R_b(rs, rs)
+                // Load A-operand from sAR_temp (warp's portion) via LDSM
+                copy(cons_s2r_A{}, tXsAR, tXrDH_frag);
+
+                // Load B-operand (R sub-block) via scalar into MMA B-fragment
+                // TN B-operand: (N=rs, K=rs) with K contiguous
+                auto rR_frag = cons_thr.make_fragment_B(cons_thr.partition_B(
+                    make_tensor(static_cast<half_t*>(nullptr),
+                                make_layout(make_shape(Int<rs>{}, Int<rs>{}), LayoutRight{}))));
+                // Load using partition_B identity to find register positions
+                {
+                    auto tBid = cons_thr.partition_B(make_identity_tensor(
+                        make_shape(Int<rs>{}, Int<rs>{})));
+                    for (int i = 0; i < size(rR_frag); ++i) {
+                        auto coord = tBid(i);
+                        int col = get<0>(coord);  // N dimension
+                        int ri = get<1>(coord);   // K dimension
+                        rR_frag(i) = sR(ri, k_off + col, r_pipe_r);
+                    }
+                }
+
+                // MMA accumulate
+                gemm(cons_mma, rDH_frag, rR_frag, rDA_blk[b]);
+            }
+
+            // dR partial sums (scalar — reduction over M, not a matmul shape)
+            for (int b = 0; b < n_reconn_blocks; ++b) {
+                int k_off = b * rs;
+                for (int idx = thread_idx; idx < rs * rs; idx += n_consumer_threads) {
+                    int i = idx / rs, j = idx % rs;
+                    float val = 0.0f;
+                    for (int mi = 0; mi < m_valid; ++mi)
+                        val += sdH[mi * BLK_K + k_off + i] * float(sA(mi, k_off + j));
+                    if (val != 0.0f) {
+                        int dR_rows = n_groups * rs;
+                        atomicAdd(&dR_partial[buf_slot * dR_rows * K + (g * rs + i) * K + k_start + k_off + j], val);
+                    }
                 }
             }
         }
 
-        // Signal producer: dAR consumed
         asm volatile("bar.arrive %0, %1;\n"
-            : : "r"(dar_pipe_read + BAR_CONSUMED_BASE), "n"(n_total_threads));
-
-        ++dar_pipe_read;
-        if (dar_pipe_read == bP_dar) dar_pipe_read = 0;
-
-        r_pipe_write = r_pipe_read;
-        ++r_pipe_read;
-        if (r_pipe_read == bP_a_r) r_pipe_read = 0;
+            : : "r"(dh_pipe_r + BAR_CONSUMED_BASE), "n"(n_total_threads));
+        if (++dh_pipe_r == bP_dh) dh_pipe_r = 0;
+        r_pipe_w = r_pipe_r;
+        if (++r_pipe_r == bP_r) r_pipe_r = 0;
     }
 
-    // Write dA to global memory via MMA coordinate mapping
+    // Write dA to global memory
+    // Both gated and non-gated use per-reconn-block MMA accumulators
     {
-        auto tMcDA = thr_mma_da.partition_C(make_identity_tensor(dA_shape));
-        for (int i = 0; i < size(rDA); ++i) {
-            auto coord = tMcDA(i);
+    // Non-gated: write from per-reconn-block MMA fragments
+    for (int b = 0; b < n_reconn_blocks; ++b) {
+        int k_off = b * rs;
+        for (int i = 0; i < size(rDA_blk[b]); ++i) {
+            auto coord = tCdA_id(i);
             int mi = get<0>(coord) + warp_idx * WARP_M;
+            int ki = get<1>(coord) + k_off;
             int m_idx = m_start + mi;
-            if (m_idx < M)
-                *(dA_ptr + m_idx * ldDA + b * rs + get<1>(coord)) = half_t(rDA(i));
+            int k_idx = k_start + ki;
+            if (m_idx < M && k_idx < K)
+                *(dA_ptr + m_idx * ldDA + k_idx) = half_t(rDA_blk[b](i));
         }
     }
+    } // end non-gated writeback
 }
 
-
-template <int BLK_M, int GROUP_SIZE, int RECONN_SZ, bool GATED>
+// =============================================================================
+// Kernel entry point
+// =============================================================================
+template <int BLK_M, int BLK_K, int BLK_K_INNER, int GROUP_SIZE, int RECONN_SZ, bool GATED>
 __global__ void __launch_bounds__(
     (size(typename cute::BwdDAdRParams::warp_layout_arb{}) +
      size(typename cute::BwdDAdRParams::warp_layout_ar{})) * 32)
-fused_dA_dR_kernel(
+fused_dA_dR_kernel_v2(
     const half_t* __restrict__ dC_ptr,  int ldDC,
     const half_t* __restrict__ A_ptr,   int ldA,
     const half_t* __restrict__ B_ptr,   int ldB,
@@ -469,97 +472,89 @@ fused_dA_dR_kernel(
     half_t* __restrict__ dA_ptr,        int ldDA,
     float* __restrict__ dR_partial,
     int M, int N, int K,
-    int n_groups, int n_blocks,
-    int n_buf_slots)
+    int n_groups, int n_buf_slots)
 {
     constexpr int gs = GROUP_SIZE;
     constexpr int rs = RECONN_SZ;
     constexpr int bP_dc_b = cute::BwdDAdRParams::bP_dc_b;
-    constexpr int bP_dar = cute::BwdDAdRParams::bP_dar;
-    constexpr int bP_a_r = cute::BwdDAdRParams::bP_a_r;
+    constexpr int bP_dh = cute::BwdDAdRParams::bP_dh;
+    constexpr int bP_r = cute::BwdDAdRParams::bP_r;
 
     using wlp_t = typename cute::BwdDAdRParams::warp_layout_arb;
     using wlc_t = typename cute::BwdDAdRParams::warp_layout_ar;
-    wlp_t warp_layout_producer;
-    wlc_t warp_layout_consumer;
 
-    constexpr int n_producer_threads = size(wlp_t{}) * 32;
     constexpr int n_consumer_threads = size(wlc_t{}) * 32;
 
-    // Grid with z-curve ordering
-    auto grid_shape = make_shape(n_blocks, (M + BLK_M - 1) / BLK_M);
+    // Z-curve grid mapping
+    int n_k_tiles = (K + BLK_K - 1) / BLK_K;
+    int n_m_tiles = (M + BLK_M - 1) / BLK_M;
+    auto grid_shape = make_shape(n_k_tiles, n_m_tiles);
     auto grid_coord = z_curve(grid_shape, blockIdx.x);
-    int b = get<0>(grid_coord);
-    int m_tile = get<1>(grid_coord);
+    int k_start = get<0>(grid_coord) * BLK_K;
+    int m_start = get<1>(grid_coord) * BLK_M;
+    int buf_slot = get<1>(grid_coord) % n_buf_slots;
 
-    int buf_slot = m_tile % n_buf_slots;
-    int m_start = m_tile * BLK_M;
+    // Shared memory layouts
+    auto smem_ki = get_smem_atom(Int<BLK_K_INNER>{});
+    auto smem_bk = get_smem_atom(Int<BLK_K>{});
 
-    // -- Shared memory layouts (SWIZZLED for LDSM_N s2r) --
-    constexpr int K_atom = (gs < 16) ? 8 : 16;
-    auto smem_producer = get_smem_atom(Int<K_atom>{});
-    auto smem_rs = get_smem_atom(Int<rs>{});
+    auto sdC_layout = tile_to_shape(smem_ki, make_shape(Int<BLK_M>{}, Int<BLK_K_INNER>{}, Int<bP_dc_b>{}));
 
-    // Producer: sdC(BLK_M, gs, bP_dc_b)
-    auto sdC_layout = tile_to_shape(smem_producer,
-        make_shape(Int<BLK_M>{}, Int<gs>{}, Int<bP_dc_b>{}));
-    // Producer: sBt(rs, gs, bP_dc_b)
-    auto sBt_layout = tile_to_shape(smem_producer,
-        make_shape(Int<rs>{}, Int<gs>{}, Int<bP_dc_b>{}));
-    // Pipeline: sdAR(BLK_M, rs, bP_dar)
-    auto sdAR_layout = tile_to_shape(smem_rs,
-        make_shape(Int<BLK_M>{}, Int<rs>{}, Int<bP_dar>{}));
-    // Consumer: sA(BLK_M, rs)
-    auto sA_layout = tile_to_shape(smem_rs,
-        make_shape(Int<BLK_M>{}, Int<rs>{}));
-    // Consumer: sR(rs, rs, bP_a_r) — used only for gated AR recompute
-    auto sR_layout = tile_to_shape(smem_rs,
-        make_shape(Int<rs>{}, Int<rs>{}, Int<bP_a_r>{}));
-    // Consumer: sRt(rs, rs, bP_a_r) — R transposed, for dA MMA
-    auto sRt_layout = tile_to_shape(smem_rs,
-        make_shape(Int<rs>{}, Int<rs>{}, Int<bP_a_r>{}));
-    // Consumer: sAR_temp(BLK_M, rs) — temp for gated AR recompute MMA output + SiLU
-    auto sAR_temp_layout = tile_to_shape(smem_rs,
-        make_shape(Int<BLK_M>{}, Int<rs>{}));
+    // sB: (BLK_K, BLK_K_INNER, pipe) — MMA B-operand shape (N=BLK_K, K=BLK_K_INNER)
+    // N-contiguous (BLK_K contiguous) for LDSM_T compatibility
+    // Swizzle<3,3,3> with column-major atom following CUTLASS proven pattern
+    auto sB_atom_ldsmt = composition(
+        Swizzle<3, 3, 3>{},
+        make_layout(make_shape(Int<BLK_K>{}, _8{}),
+                    make_stride(_1{}, Int<BLK_K>{})));
+    auto sB_layout = tile_to_shape(sB_atom_ldsmt,
+        make_shape(Int<BLK_K>{}, Int<BLK_K_INNER>{}, Int<bP_dc_b>{}));
+    auto sA_layout = tile_to_shape(smem_bk, make_shape(Int<BLK_M>{}, Int<BLK_K>{}));
+    auto sR_layout = tile_to_shape(smem_bk, make_shape(Int<rs>{}, Int<BLK_K>{}, Int<bP_r>{}));
+    auto sAR_temp_layout = make_layout(make_shape(Int<BLK_M>{}, Int<rs>{}), LayoutRight{});
 
     extern __shared__ half_t smem_raw[];
     half_t* p = smem_raw;
-    auto sdC      = make_tensor(make_smem_ptr(p), sdC_layout);      p += cosize(sdC_layout);
-    auto sBt      = make_tensor(make_smem_ptr(p), sBt_layout);      p += cosize(sBt_layout);
-    auto sdAR     = make_tensor(make_smem_ptr(p), sdAR_layout);     p += cosize(sdAR_layout);
-    auto sA       = make_tensor(make_smem_ptr(p), sA_layout);       p += cosize(sA_layout);
-    auto sR_buf   = make_tensor(make_smem_ptr(p), sR_layout);       p += cosize(sR_layout);
-    auto sRt_buf  = make_tensor(make_smem_ptr(p), sRt_layout);      p += cosize(sRt_layout);
+    // sdC and sB are allocated first — they're aliased with sdH (used in different phases)
+    auto sdC = make_tensor(make_smem_ptr(p), sdC_layout);
+    half_t* sB_start = p + cosize(sdC_layout);
+    auto sB  = make_tensor(make_smem_ptr(sB_start), sB_layout);
+    // sdH F32 overlaps sdC+sB memory (used after GEMM, before next group's GEMM)
+    float* sdH = reinterpret_cast<float*>(p);
+    // Advance past max(sdC+sB, sdH)
+    constexpr int sdC_sB_halfs = decltype(cosize(sdC_layout) + cosize(sB_layout))::value;
+    constexpr int sdH_halfs = (BLK_M * BLK_K * sizeof(float) + sizeof(half_t) - 1) / sizeof(half_t);
+    p += (sdC_sB_halfs > sdH_halfs) ? sdC_sB_halfs : sdH_halfs;
+    auto sA  = make_tensor(make_smem_ptr(p), sA_layout);  p += cosize(sA_layout);
+    auto sR  = make_tensor(make_smem_ptr(p), sR_layout);  p += cosize(sR_layout);
     auto sAR_temp = make_tensor(make_smem_ptr(p), sAR_temp_layout);
 
     __syncthreads();
 
     if (threadIdx.x >= n_consumer_threads) {
-        dAdR_producer<BLK_M, gs, rs, GATED>(
+        dAdR_producer_v2<BLK_M, BLK_K, BLK_K_INNER, gs, rs, GATED>(
             dC_ptr, ldDC, B_ptr, ldB,
-            sdC, sBt, sdAR,
-            M, N, K, b, m_start, n_groups,
+            sdC, sB, sdH,
+            M, N, K, m_start, k_start, n_groups,
             threadIdx.x - n_consumer_threads,
-            warp_layout_producer, warp_layout_consumer);
+            wlp_t{}, wlc_t{});
     } else {
-        dAdR_consumer<BLK_M, gs, rs, GATED>(
+        dAdR_consumer_v2<BLK_M, BLK_K, gs, rs, GATED>(
             A_ptr, ldA, R_ptr, ldR, dA_ptr, ldDA, dR_partial,
-            sA, sR_buf, sRt_buf, sAR_temp, sdAR,
-            M, K, b, m_start, n_groups, n_buf_slots, buf_slot,
+            sA, sR, sdH, sAR_temp,
+            M, K, m_start, k_start,
+            n_groups, n_buf_slots, buf_slot,
             threadIdx.x,
-            warp_layout_producer, warp_layout_consumer);
+            wlp_t{}, wlc_t{});
     }
 }
-
 
 // =============================================================================
 // dR reduction kernel
 // =============================================================================
 __global__ void dR_reduce_kernel(
-    const float* __restrict__ dR_partial,
-    half* __restrict__ dR,
-    int dR_elements,
-    int n_buf_slots)
+    const float* __restrict__ dR_partial, half* __restrict__ dR,
+    int dR_elements, int n_buf_slots)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= dR_elements) return;
@@ -569,9 +564,8 @@ __global__ void dR_reduce_kernel(
     dR[idx] = __float2half(sum);
 }
 
-
 // =============================================================================
-// Host launchers (split into dA+dR and dB for independent invocation)
+// Host launcher
 // =============================================================================
 void oft_backward_dA_dR_launch(
     int m, int n, int k,
@@ -586,26 +580,20 @@ void oft_backward_dA_dR_launch(
 {
     constexpr int gs = CurrKernelParams::group_size;
     constexpr int rs = CurrKernelParams::reconn_sz;
-
-    constexpr int BLK_M_dAdR = cute::BwdDAdRParams::bM;
+    constexpr int BLK_M = cute::BwdDAdRParams::bM;
+    constexpr int BLK_K = cute::BwdDAdRParams::bK;
+    constexpr int BLK_K_INNER = cute::BwdDAdRParams::bK_inner;
     constexpr int bP_dc_b = cute::BwdDAdRParams::bP_dc_b;
-    constexpr int bP_dar = cute::BwdDAdRParams::bP_dar;
-    constexpr int bP_a_r = cute::BwdDAdRParams::bP_a_r;
+    constexpr int bP_dh = cute::BwdDAdRParams::bP_dh;
+    constexpr int bP_r = cute::BwdDAdRParams::bP_r;
     constexpr int n_buf_slots_param = cute::BwdDAdRParams::n_buf_slots;
-    using wlp_dAdR = typename cute::BwdDAdRParams::warp_layout_arb;
-    using wlc_dAdR = typename cute::BwdDAdRParams::warp_layout_ar;
-    constexpr int n_threads_dAdR = (size(wlp_dAdR{}) + size(wlc_dAdR{})) * 32;
+    using wlp_t = typename cute::BwdDAdRParams::warp_layout_arb;
+    using wlc_t = typename cute::BwdDAdRParams::warp_layout_ar;
+    constexpr int n_threads = (size(wlp_t{}) + size(wlc_t{})) * 32;
 
     int n_groups = n / gs;
-    int n_blocks = k / rs;
-
-    auto dC_h = reinterpret_cast<half_t const*>(dC);
-    auto A_h  = reinterpret_cast<half_t const*>(A);
-    auto B_h  = reinterpret_cast<half_t const*>(B);
-    auto R_h  = reinterpret_cast<half_t const*>(R);
-    auto dA_h = reinterpret_cast<half_t*>(dA);
-
-    int n_m_tiles = (m + BLK_M_dAdR - 1) / BLK_M_dAdR;
+    int n_k_tiles = (k + BLK_K - 1) / BLK_K;
+    int n_m_tiles = (m + BLK_M - 1) / BLK_M;
     int n_buf_slots = min(n_buf_slots_param, n_m_tiles);
     if (n_buf_slots < 1) n_buf_slots = 1;
     int dR_elements = n_groups * rs * k;
@@ -614,29 +602,37 @@ void oft_backward_dA_dR_launch(
     cudaMalloc(&dR_partial_buf, (int64_t)n_buf_slots * dR_elements * sizeof(float));
     cudaMemsetAsync(dR_partial_buf, 0, (int64_t)n_buf_slots * dR_elements * sizeof(float), stream);
 
-    dim3 grid(n_blocks * n_m_tiles);
-    dim3 block(n_threads_dAdR);
+    auto smem_ki = get_smem_atom(cute::Int<BLK_K_INNER>{});
+    auto smem_bk = get_smem_atom(cute::Int<BLK_K>{});
+    // sdC + sB are aliased with sdH (used in different phases)
+    int sdC_sB_halfs = cosize(tile_to_shape(smem_ki, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K_INNER>{}, cute::Int<bP_dc_b>{})))
+                     + cosize(tile_to_shape(
+                         composition(Swizzle<3,3,3>{},
+                                     make_layout(make_shape(cute::Int<BLK_K>{}, _8{}),
+                                                 make_stride(_1{}, cute::Int<BLK_K>{}))),
+                         make_shape(cute::Int<BLK_K>{}, cute::Int<BLK_K_INNER>{}, cute::Int<bP_dc_b>{})));
+    int sdH_halfs = (BLK_M * BLK_K * (int)sizeof(float) + (int)sizeof(half_t) - 1) / (int)sizeof(half_t);
+    int aliased_halfs = (sdC_sB_halfs > sdH_halfs) ? sdC_sB_halfs : sdH_halfs;
+    int smem_halfs = aliased_halfs
+                   + cosize(tile_to_shape(smem_bk, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K>{})))
+                   + cosize(tile_to_shape(smem_bk, make_shape(cute::Int<rs>{}, cute::Int<BLK_K>{}, cute::Int<bP_r>{})))
+                   + BLK_M * rs;
+    int smem = smem_halfs * sizeof(half_t) + 256;
 
-    constexpr int K_atom = (gs < 16) ? 8 : 16;
-    auto smem_producer = get_smem_atom(cute::Int<K_atom>{});
-    auto smem_rs = get_smem_atom(cute::Int<rs>{});
-    int smem = (cosize(tile_to_shape(smem_producer, make_shape(cute::Int<BLK_M_dAdR>{}, cute::Int<gs>{}, cute::Int<bP_dc_b>{})))
-                + cosize(tile_to_shape(smem_producer, make_shape(cute::Int<rs>{}, cute::Int<gs>{}, cute::Int<bP_dc_b>{})))
-                + cosize(tile_to_shape(smem_rs, make_shape(cute::Int<BLK_M_dAdR>{}, cute::Int<rs>{}, cute::Int<bP_dar>{})))
-                + cosize(tile_to_shape(smem_rs, make_shape(cute::Int<BLK_M_dAdR>{}, cute::Int<rs>{})))
-                + cosize(tile_to_shape(smem_rs, make_shape(cute::Int<rs>{}, cute::Int<rs>{}, cute::Int<bP_a_r>{})))
-                + cosize(tile_to_shape(smem_rs, make_shape(cute::Int<rs>{}, cute::Int<rs>{}, cute::Int<bP_a_r>{})))
-                + cosize(tile_to_shape(smem_rs, make_shape(cute::Int<BLK_M_dAdR>{}, cute::Int<rs>{}))))
-               * sizeof(half_t) + 256;
+    dim3 grid(n_k_tiles * n_m_tiles);
+    dim3 block(n_threads);
 
-    auto kernel = gated ? fused_dA_dR_kernel<BLK_M_dAdR, gs, rs, true>
-                        : fused_dA_dR_kernel<BLK_M_dAdR, gs, rs, false>;
+    auto kernel = gated ? fused_dA_dR_kernel_v2<BLK_M, BLK_K, BLK_K_INNER, gs, rs, true>
+                        : fused_dA_dR_kernel_v2<BLK_M, BLK_K, BLK_K_INNER, gs, rs, false>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     kernel<<<grid, block, smem, stream>>>(
-        dC_h, ldDC, A_h, ldA, B_h, ldB, R_h, ldR, dA_h, ldDA,
-        dR_partial_buf, m, n, k, n_groups, n_blocks, n_buf_slots);
+        reinterpret_cast<half_t const*>(dC), ldDC,
+        reinterpret_cast<half_t const*>(A), ldA,
+        reinterpret_cast<half_t const*>(B), ldB,
+        reinterpret_cast<half_t const*>(R), ldR,
+        reinterpret_cast<half_t*>(dA), ldDA,
+        dR_partial_buf, m, n, k, n_groups, n_buf_slots);
 
-    // Reduce dR
     {
         int threads = 256;
         int blocks_r = (dR_elements + threads - 1) / threads;

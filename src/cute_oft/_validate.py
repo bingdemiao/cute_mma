@@ -104,19 +104,33 @@ def compute_smem_bytes(
 
 def compute_smem_bytes_bwd_dadr(
     bM: int,
+    bK: int,
+    bK_inner: int,
     group_size: int,
     reconn_sz: int,
     bP_dc_b: int,
-    bP_dar: int,
-    bP_a_r: int,
+    bP_dh: int,
+    bP_r: int,
 ) -> int:
     """Compute shared memory usage for backward dA+dR kernel.
 
     Mirrors the smem calculation in oft_backward_dA_dR_launch().
+    Layout: sA(bM, bK) + sdC(bM, bK_inner, bP_dc_b) + sB(bK, bK_inner, bP_dc_b)
+          + sDH(bM, bK, bP_dh) + sR(rs, bK, bP_r) + sAR_temp(bM, rs)
     """
-    gs, rs = group_size, reconn_sz
-    smem = (bM * gs * bP_dc_b + rs * gs * bP_dc_b + bM * rs * bP_dar
-            + bM * rs + rs * rs * bP_a_r + rs * rs * bP_a_r + bM * rs) * 2 + 256
+    rs = reconn_sz
+    size_A = bM * bK
+    size_dC = bM * bK_inner * bP_dc_b
+    size_B = bK * bK_inner * bP_dc_b
+    size_dH = bM * bK * bP_dh
+    size_R = rs * bK * bP_r
+    size_AR_temp = bM * rs  # gated only, but always counted
+    # sdH (F32) is aliased with sdC+sB (used in different phases)
+    sdC_sB_bytes = (size_dC + size_B) * 2
+    sdH_bytes = bM * bK * 4  # sizeof(float)
+    aliased_bytes = max(sdC_sB_bytes, sdH_bytes)
+    other_bytes = (size_A + size_R + size_AR_temp) * 2
+    smem = aliased_bytes + other_bytes + 256
     return smem
 
 
