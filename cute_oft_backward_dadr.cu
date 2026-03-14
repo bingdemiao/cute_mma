@@ -299,8 +299,8 @@ fused_dA_dR_kernel_v2(
                 }
                 gemm(cons_mma, rDH_frag, rR_frag, rDA_blk[b]);
 
-                // Step 5: dR per reconn block (needs full-block sync for cross-warp sAR_temp)
-                __syncthreads();
+                // Step 5: dR per reconn block
+                __syncthreads();  // ensure all warps' sAR_temp visible
                 {
                     constexpr int threads_per_elem = n_total_threads / (rs * rs);
                     for (int idx = threadIdx.x; idx < rs * rs * threads_per_elem; idx += n_total_threads) {
@@ -319,7 +319,7 @@ fused_dA_dR_kernel_v2(
                         }
                     }
                 }
-                __syncthreads();  // before next reconn block overwrites sAR_temp
+                __syncthreads();  // before next reconn block
             }  // end reconn block loop
         } else {
             // Non-gated: dA per warp via sdH reads + scalar
