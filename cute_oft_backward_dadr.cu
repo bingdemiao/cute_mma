@@ -366,15 +366,23 @@ void dAdR_consumer_v2(
                 }
                 gemm(cons_mma, rDH_frag, rR_frag, rDA_blk[b]);
 
-                // dR partial sums (scalar)
-                for (int idx = thread_idx; idx < rs * rs; idx += n_consumer_threads) {
-                    int i = idx / rs, j = idx % rs;
-                    float val = 0.0f;
-                    for (int mi = 0; mi < m_valid; ++mi)
-                        val += float(sAR_temp(mi, i)) * float(sA(mi, k_off + j));
-                    if (val != 0.0f) {
-                        int dR_rows = n_groups * rs;
-                        atomicAdd(&dR_partial[buf_slot * dR_rows * K + (g * rs + i) * K + k_start + k_off + j], val);
+                // dR partial sums — parallelize mi reduction
+                {
+                    constexpr int threads_per_elem = n_consumer_threads / (rs * rs);
+                    for (int idx = thread_idx; idx < rs * rs * threads_per_elem; idx += n_consumer_threads) {
+                        int elem = idx / threads_per_elem;
+                        int chunk = idx % threads_per_elem;
+                        int i = elem / rs, j = elem % rs;
+                        int mi_start = chunk * (m_valid / threads_per_elem);
+                        int mi_end = (chunk + 1) * (m_valid / threads_per_elem);
+                        if (chunk == threads_per_elem - 1) mi_end = m_valid;
+                        float val = 0.0f;
+                        for (int mi = mi_start; mi < mi_end; ++mi)
+                            val += float(sAR_temp(mi, i)) * float(sA(mi, k_off + j));
+                        if (val != 0.0f) {
+                            int dR_rows = n_groups * rs;
+                            atomicAdd(&dR_partial[buf_slot * dR_rows * K + (g * rs + i) * K + k_start + k_off + j], val);
+                        }
                     }
                 }
             }
@@ -415,13 +423,22 @@ void dAdR_consumer_v2(
                 gemm(cons_mma, rDH_frag, rR_frag, rDA_blk[b]);
             }
 
-            // dR partial sums (scalar — reduction over M, not a matmul shape)
+            // dR partial sums — parallelize mi reduction across all threads
+            // Each (i, j, mi_chunk) is handled by one thread
+            // rs*rs=64 elements, BLK_M=64 mi positions → 4096 work items for 128 threads = 32 each
             for (int b = 0; b < n_reconn_blocks; ++b) {
                 int k_off = b * rs;
-                for (int idx = thread_idx; idx < rs * rs; idx += n_consumer_threads) {
-                    int i = idx / rs, j = idx % rs;
+                constexpr int mi_chunks = (BLK_M + n_consumer_threads / (rs * rs) - 1) / (n_consumer_threads / (rs * rs));
+                constexpr int threads_per_elem = n_consumer_threads / (rs * rs);  // 128/64 = 2
+                for (int idx = thread_idx; idx < rs * rs * threads_per_elem; idx += n_consumer_threads) {
+                    int elem = idx / threads_per_elem;
+                    int chunk = idx % threads_per_elem;
+                    int i = elem / rs, j = elem % rs;
+                    int mi_start = chunk * (m_valid / threads_per_elem);
+                    int mi_end = (chunk + 1) * (m_valid / threads_per_elem);
+                    if (chunk == threads_per_elem - 1) mi_end = m_valid;  // handle remainder
                     float val = 0.0f;
-                    for (int mi = 0; mi < m_valid; ++mi)
+                    for (int mi = mi_start; mi < mi_end; ++mi)
                         val += sdH[mi * BLK_K + k_off + i] * float(sA(mi, k_off + j));
                     if (val != 0.0f) {
                         int dR_rows = n_groups * rs;
