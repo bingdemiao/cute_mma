@@ -41,8 +41,14 @@ fused_dA_dR_kernel_v2(
 {
     constexpr int gs = GROUP_SIZE;
     constexpr int rs = RECONN_SZ;
+    // BLK_K and rs are decoupled: only need BLK_K % rs == 0
+    static_assert(BLK_K % rs == 0, "BLK_K must be divisible by reconn_sz");
     constexpr int n_reconn_blocks = BLK_K / rs;
-    constexpr int tiles_per_group = gs / BLK_N;  // N-tiles per group
+    // gs and BLK_N are decoupled: only need gs % BLK_N == 0 (or BLK_N % gs == 0 for large BLK_N)
+    static_assert(gs % BLK_N == 0 || BLK_N % gs == 0,
+                  "group_size and BLK_N must have a divisibility relationship");
+    constexpr int tiles_per_group = (gs >= BLK_N) ? gs / BLK_N : 1;
+    constexpr int groups_per_tile = (BLK_N >= gs) ? BLK_N / gs : 1;
     constexpr int n_threads = 256;  // 8 warps
 
     int lane_idx = threadIdx.x % 32;
