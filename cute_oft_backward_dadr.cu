@@ -30,7 +30,7 @@ void dAdR_producer_v2(
     const half_t* __restrict__ dC_ptr, int ldDC,
     const half_t* __restrict__ B_ptr,  int ldB,
     SmemDC& sdC, SmemB& sB,
-    float* __restrict__ sdH,  // F32 shared memory, row-major (BLK_M, BLK_K)
+    half_t* __restrict__ sdH,  // F16 shared memory, pipelined (BLK_M, BLK_K, bP_dh)
     int M, int N, int K, int m_start, int k_start,
     int n_groups,
     int thread_idx,
@@ -60,18 +60,14 @@ void dAdR_producer_v2(
                                Tile<Int<BLK_M>, Int<BLK_K>>{});
     auto thr_mma = mma.get_slice(lane_idx + warp_idx * 32);
 
-    // F32 sdH tensor for r2s copy (non-swizzled, row-major)
-    auto sdH_tensor = make_tensor(make_smem_ptr(sdH),
-        make_layout(make_shape(Int<BLK_M>{}, Int<BLK_K>{}), LayoutRight{}));
+    // F32 MMA accumulator for dH
+    auto rDH = thr_mma.make_fragment_C(thr_mma.partition_C(
+        make_tensor(static_cast<half_t*>(nullptr),
+                    make_layout(make_shape(Int<BLK_M>{}, Int<BLK_K>{}), LayoutRight{}))));
 
-    auto rDH = thr_mma.make_fragment_C(thr_mma.partition_C(sdH_tensor));
-
-    // r2s copy for F32 dH writeback using MMA C-fragment layout
-    using r2s_dH_atom = Copy_Atom<UniversalCopy<uint32_t>, float>;
-    auto r2s_dh = make_tiled_copy_C(r2s_dH_atom{}, mma);
-    auto r2s_dh_thr = r2s_dh.get_slice(lane_idx + warp_idx * 32);
-    auto tXrDH = r2s_dh_thr.retile_S(rDH);
-    auto tXsdH = r2s_dh_thr.partition_D(sdH_tensor);
+    // Identity tensor for F32→F16 writeback to pipelined sdH
+    auto tCdH_id = thr_mma.partition_C(make_identity_tensor(
+        make_shape(Int<BLK_M>{}, Int<BLK_K>{})));
 
     // -- LDSM s2r atoms --
     // dC (A-operand): LDSM_N (K_INNER contiguous in smem)
@@ -125,10 +121,8 @@ void dAdR_producer_v2(
     int dh_pipe_write = 0;
 
     for (int g = 0; g < n_groups; ++g) {
-        // Wait for consumer to finish with sdH BEFORE loading dC+B (aliased memory!)
-        asm volatile("bar.sync %0, %1;\n"
-            : : "r"(dh_pipe_write + BAR_CONSUMED_BASE), "n"(n_total_threads));
-
+        // sdH is NOT aliased with sdC+sB — producer can start GEMM immediately
+        // CONSUMED barrier moved to before sdH write (below)
         clear(rDH);
         int pipe_w = bP_dc_b - 1, pipe_r = 0;
 
@@ -180,14 +174,25 @@ void dAdR_producer_v2(
             if (++pipe_r == bP_dc_b) pipe_r = 0;
         }
 
-        // Ensure ALL outstanding async copies are complete before writing sdH
-        // (the last iteration's wait<bP_dc_b-1> may leave 1 fence outstanding)
+        // Ensure ALL outstanding async copies are complete
         cp_async_wait<0>();
         asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
 
-        // Write F32 rDH → F32 sdH via r2s tiled copy (uses MMA C-fragment layout)
-        // Consumer already signaled CONSUMED at the start of this group's loop iteration
-        copy(r2s_dH_atom{}, tXrDH, tXsdH);
+        // Wait for consumer to finish reading the sdH pipe slot we're about to overwrite
+        asm volatile("bar.sync %0, %1;\n"
+            : : "r"(dh_pipe_write + BAR_CONSUMED_BASE), "n"(n_total_threads));
+
+        // Write F32 rDH → F16 sdH using identity coordinate mapping
+        // sdH is F16 pipelined: sdH[pipe * BLK_M * BLK_K + mi * BLK_K + ki]
+        {
+            constexpr int sdH_stride = BLK_M * BLK_K;
+            half_t* sdH_slot = reinterpret_cast<half_t*>(sdH) + dh_pipe_write * sdH_stride;
+            for (int i = 0; i < size(rDH); ++i) {
+                auto coord = tCdH_id(i);
+                int mi = get<0>(coord), ki = get<1>(coord);
+                sdH_slot[mi * BLK_K + ki] = half_t(rDH(i));  // F32 → F16
+            }
+        }
         asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
 
         asm volatile("bar.arrive %0, %1;\n"
@@ -208,7 +213,7 @@ void dAdR_consumer_v2(
     const half_t* __restrict__ R_ptr, int ldR,
     half_t* __restrict__ dA_ptr, int ldDA,
     float* __restrict__ dR_partial,
-    SmemA& sA, SmemR& sR, const float* __restrict__ sdH, SmemARtemp& sAR_temp,
+    SmemA& sA, SmemR& sR, const half_t* __restrict__ sdH, SmemARtemp& sAR_temp,
     int M, int K, int m_start, int k_start,
     int n_groups, int n_buf_slots, int buf_slot,
     int thread_idx,
@@ -307,9 +312,12 @@ void dAdR_consumer_v2(
         cp_async_wait<bP_r - 1>();
         asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
 
-        // Wait for producer's dH (F32)
+        // Wait for producer's dH (F16 pipelined)
         asm volatile("bar.sync %0, %1;\n"
             : : "r"(dh_pipe_r + BAR_READY_BASE), "n"(n_total_threads));
+
+        // Pointer to current sdH pipe slot (F16, row-major within slot)
+        const half_t* sdH_cur = sdH + dh_pipe_r * BLK_M * BLK_K;
 
         if constexpr (GATED) {
             // Gated path: per-reconn-block AR recompute, SiLU, dA accumulation via MMA
@@ -347,8 +355,17 @@ void dAdR_consumer_v2(
                     int ri = get<1>(coord);
                     if (mi < m_valid) {
                         float ar_f = rAR(i);
-                        float sigma = 1.0f / (1.0f + __expf(-ar_f));
-                        float dH_val = sdH[mi * BLK_K + k_off + ri];
+                        // Fast sigmoid via tanh.approx: sigmoid(x) = 0.5 + 0.5*tanh(0.5*x)
+                        half_t ar_h = half_t(ar_f);
+                        half_t half_ar_h;
+                        asm("mul.f16 %0, %1, %2;" : "=h"(*(uint16_t*)&half_ar_h)
+                            : "h"(*(uint16_t*)&ar_h), "h"(uint16_t(0x3800)));  // 0.5 in f16
+                        half_t tanh_h;
+                        asm("tanh.approx.f16 %0, %1;" : "=h"(*(uint16_t*)&tanh_h)
+                            : "h"(*(uint16_t*)&half_ar_h));
+                        float sigma = 0.5f + 0.5f * float(tanh_h);
+
+                        float dH_val = float(sdH_cur[mi * BLK_K + k_off + ri]);
                         float a_val = float(sA(mi, k_off + ri));
 
                         rDA_blk[b](i) += dH_val * ar_f * sigma;  // dH * SiLU(AR)
@@ -394,7 +411,7 @@ void dAdR_consumer_v2(
                 // Step 1: Copy F32 sdH slice → F16 sAR_temp (all consumer threads cooperate)
                 for (int idx = thread_idx; idx < BLK_M * rs; idx += n_consumer_threads) {
                     int mi = idx / rs, ri = idx % rs;
-                    sAR_temp(mi, ri) = (mi < m_valid) ? half_t(sdH[mi * BLK_K + k_off + ri]) : half_t(0);
+                    sAR_temp(mi, ri) = (mi < m_valid) ? sdH_cur[mi * BLK_K + k_off + ri] : half_t(0);
                 }
                 asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
 
@@ -439,7 +456,7 @@ void dAdR_consumer_v2(
                     if (chunk == threads_per_elem - 1) mi_end = m_valid;  // handle remainder
                     float val = 0.0f;
                     for (int mi = mi_start; mi < mi_end; ++mi)
-                        val += sdH[mi * BLK_K + k_off + i] * float(sA(mi, k_off + j));
+                        val += float(sdH_cur[mi * BLK_K + k_off + i]) * float(sA(mi, k_off + j));
                     if (val != 0.0f) {
                         int dR_rows = n_groups * rs;
                         atomicAdd(&dR_partial[buf_slot * dR_rows * K + (g * rs + i) * K + k_start + k_off + j], val);
@@ -530,23 +547,27 @@ fused_dA_dR_kernel_v2(
     auto sR_layout = tile_to_shape(smem_bk, make_shape(Int<rs>{}, Int<BLK_K>{}, Int<bP_r>{}));
     auto sAR_temp_layout = make_layout(make_shape(Int<BLK_M>{}, Int<rs>{}), LayoutRight{});
 
+    // sdH as F16 with pipeline (bP_dh stages) — SEPARATE from sdC+sB for producer-consumer overlap
+    auto sdH_layout = make_layout(
+        make_shape(Int<BLK_M>{}, Int<BLK_K>{}, Int<bP_dh>{}),
+        make_stride(Int<BLK_K * bP_dh>{}, Int<bP_dh>{}, Int<1>{}));
+
     extern __shared__ half_t smem_raw[];
     half_t* p = smem_raw;
-    // sdC and sB are allocated first — they're aliased with sdH (used in different phases)
-    auto sdC = make_tensor(make_smem_ptr(p), sdC_layout);
-    half_t* sB_start = p + cosize(sdC_layout);
-    auto sB  = make_tensor(make_smem_ptr(sB_start), sB_layout);
-    // sdH F32 overlaps sdC+sB memory (used after GEMM, before next group's GEMM)
-    float* sdH = reinterpret_cast<float*>(p);
-    // Advance past max(sdC+sB, sdH)
-    constexpr int sdC_sB_halfs = decltype(cosize(sdC_layout) + cosize(sB_layout))::value;
-    constexpr int sdH_halfs = (BLK_M * BLK_K * sizeof(float) + sizeof(half_t) - 1) / sizeof(half_t);
-    p += (sdC_sB_halfs > sdH_halfs) ? sdC_sB_halfs : sdH_halfs;
+    auto sdC = make_tensor(make_smem_ptr(p), sdC_layout); p += cosize(sdC_layout);
+    auto sB  = make_tensor(make_smem_ptr(p), sB_layout);  p += cosize(sB_layout);
+    // sdH is SEPARATE (not aliased) — enables producer-consumer overlap with bP_dh=2
+    auto sdH_tensor = make_tensor(make_smem_ptr(p), sdH_layout); p += cosize(sdH_layout);
     auto sA  = make_tensor(make_smem_ptr(p), sA_layout);  p += cosize(sA_layout);
     auto sR  = make_tensor(make_smem_ptr(p), sR_layout);  p += cosize(sR_layout);
     auto sAR_temp = make_tensor(make_smem_ptr(p), sAR_temp_layout);
 
     __syncthreads();
+
+    // Raw pointer to sdH F16 pipelined buffer
+    half_t* sdH = &sdH_tensor(0, 0, 0);
+    // Also as float* for producer's F32→F16 conversion
+    // (producer writes F16 directly via identity mapping)
 
     if (threadIdx.x >= n_consumer_threads) {
         dAdR_producer_v2<BLK_M, BLK_K, BLK_K_INNER, gs, rs, GATED>(
@@ -621,16 +642,14 @@ void oft_backward_dA_dR_launch(
 
     auto smem_ki = get_smem_atom(cute::Int<BLK_K_INNER>{});
     auto smem_bk = get_smem_atom(cute::Int<BLK_K>{});
-    // sdC + sB are aliased with sdH (used in different phases)
-    int sdC_sB_halfs = cosize(tile_to_shape(smem_ki, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K_INNER>{}, cute::Int<bP_dc_b>{})))
-                     + cosize(tile_to_shape(
-                         composition(Swizzle<3,3,3>{},
-                                     make_layout(make_shape(cute::Int<BLK_K>{}, _8{}),
-                                                 make_stride(_1{}, cute::Int<BLK_K>{}))),
-                         make_shape(cute::Int<BLK_K>{}, cute::Int<BLK_K_INNER>{}, cute::Int<bP_dc_b>{})));
-    int sdH_halfs = (BLK_M * BLK_K * (int)sizeof(float) + (int)sizeof(half_t) - 1) / (int)sizeof(half_t);
-    int aliased_halfs = (sdC_sB_halfs > sdH_halfs) ? sdC_sB_halfs : sdH_halfs;
-    int smem_halfs = aliased_halfs
+    // sdC + sB + sdH (F16, separate, pipelined) + sA + sR + sAR_temp
+    int smem_halfs = cosize(tile_to_shape(smem_ki, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K_INNER>{}, cute::Int<bP_dc_b>{})))
+                   + cosize(tile_to_shape(
+                       composition(Swizzle<3,3,3>{},
+                                   make_layout(make_shape(cute::Int<BLK_K>{}, _8{}),
+                                               make_stride(_1{}, cute::Int<BLK_K>{}))),
+                       make_shape(cute::Int<BLK_K>{}, cute::Int<BLK_K_INNER>{}, cute::Int<bP_dc_b>{})))
+                   + BLK_M * BLK_K * bP_dh  // F16 sdH (non-swizzled, pipelined)
                    + cosize(tile_to_shape(smem_bk, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K>{})))
                    + cosize(tile_to_shape(smem_bk, make_shape(cute::Int<rs>{}, cute::Int<BLK_K>{}, cute::Int<bP_r>{})))
                    + BLK_M * rs;

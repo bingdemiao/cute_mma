@@ -125,12 +125,8 @@ def compute_smem_bytes_bwd_dadr(
     size_dH = bM * bK * bP_dh
     size_R = rs * bK * bP_r
     size_AR_temp = bM * rs  # gated only, but always counted
-    # sdH (F32) is aliased with sdC+sB (used in different phases)
-    sdC_sB_bytes = (size_dC + size_B) * 2
-    sdH_bytes = bM * bK * 4  # sizeof(float)
-    aliased_bytes = max(sdC_sB_bytes, sdH_bytes)
-    other_bytes = (size_A + size_R + size_AR_temp) * 2
-    smem = aliased_bytes + other_bytes + 256
+    # sdH (F16) is separate from sdC+sB (enables producer-consumer overlap)
+    smem = (size_dC + size_B + size_dH + size_A + size_R + size_AR_temp) * 2 + 256
     return smem
 
 

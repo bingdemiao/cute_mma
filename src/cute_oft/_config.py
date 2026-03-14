@@ -153,7 +153,7 @@ class BwdDAdRCompParams:
     bK_inner: int = 32     # Inner K tile for dH GEMM (tiles over gs dimension)
     n_buf_slots: int = 8   # Number of dR buffer slots (controls atomic contention)
     bP_dc_b: int = 2       # Pipeline depth: dC+B async loads (producer)
-    bP_dh: int = 1         # Pipeline depth: dH producer→consumer (1 = no double-buffer)
+    bP_dh: int = 2         # Pipeline depth: dH producer→consumer (2 = double-buffer for overlap)
     bP_r: int = 2          # Pipeline depth: R loads (consumer)
     # Heavy GEMM producer (dC @ B, gs-reduction)
     warp_layout_arb: tuple[int, ...] = (2, 2)  # 4 warps
@@ -198,6 +198,6 @@ class BwdDAdRCompParams:
         return cls(
             bM=64, bK=64, bK_inner=32,
             n_buf_slots=8,
-            bP_dc_b=2, bP_dh=1, bP_r=2,
+            bP_dc_b=2, bP_dh=2, bP_r=2,
             warp_layout_arb=(2, 2), warp_layout_ar=(4,),
         )
