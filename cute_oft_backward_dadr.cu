@@ -271,7 +271,40 @@ bwd_dadr_kernel(
                 int k_off = b * rs;
 
                 if constexpr (GATED) {
-                    // Write dH slice to sDH_temp
+                    // --- AR via MMA (compute ONCE, reuse sigma for Steps A & B) ---
+                    // Copy sA_slice → sDH_temp for LDSM
+                    for (int i = lane_idx; i < WARP_M_reconn * rs; i += 32) {
+                        int mi = i / rs, ri = i % rs;
+                        sDH_temp(warp_idx * WARP_M_reconn + mi, ri) =
+                            sA(warp_idx * WARP_M_reconn + mi, k_off + ri);
+                    }
+                    __syncthreads();
+
+                    // LDSM sA + load R^T + MMA: AR = sA @ R^T (F32 accum)
+                    // NOTE: AR uses R^T in B-frag: B(n,k) = R(n, k_off+k) = sR(get<0>, k_off+get<1>)
+                    // This is SWAPPED from the reconn dA loading which uses R: B(j,n) = R(n, k_off+j)
+                    copy(cons_s2r_A{}, tXsDH_w, tXrDH_reconn);
+                    auto rR_frag_ar = cons_thr.make_fragment_B(cons_thr.partition_B(
+                        make_tensor(static_cast<half_t*>(nullptr),
+                                    make_layout(make_shape(Int<rs>{}, Int<rs>{}), LayoutRight{}))));
+                    {
+                        auto tBid = cons_thr.partition_B(
+                            make_identity_tensor(make_shape(Int<rs>{}, Int<rs>{})));
+                        for (int i = 0; i < size(rR_frag_ar); ++i) {
+                            auto coord2 = tBid(i);
+                            // Swapped: get<0>=N_out=ri, get<1>=K_red=k → sR(ri, k_off+k)
+                            rR_frag_ar(i) = sR(get<0>(coord2), k_off + get<1>(coord2), r_pipe_r);
+                        }
+                    }
+                    frag_c_type rAR;
+                    clear(rAR);
+                    gemm(cons_mma, rDH_reconn, rR_frag_ar, rAR);
+
+                    // CRITICAL: sync before scatter — GEMM warps cover different rows than
+                    // reconn warps, so one warp's scatter can clobber another's LDSM source
+                    __syncthreads();
+
+                    // Scatter dH → sDH_temp (overwriting sA)
                     for (int i = 0; i < size(rDH); ++i) {
                         auto coord = tCid(i);
                         int mi = get<0>(coord);
@@ -281,51 +314,75 @@ bwd_dadr_kernel(
                     }
                     __syncthreads();
 
-                    // Step A: dA += dH * SiLU(AR)
-                    for (int i = 0; i < size(rDA_blk[b]); ++i) {
-                        auto coord2 = tCdA_id(i);
-                        int mi = get<0>(coord2) + warp_idx * WARP_M_reconn;
-                        int ri = get<1>(coord2);
-                        if (mi < m_valid) {
-                            float ar = 0.0f;
-                            for (int j = 0; j < rs; ++j)
-                                ar += float(sA(mi, k_off + j)) * float(sR(ri, k_off + j, r_pipe_r));
-                            float t;
-                            asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(ar * 0.5f));
-                            float sigma = 0.5f * (1.0f + t);
-                            float dH_val = float(sDH_temp(mi, ri));
-                            rDA_blk[b](i) += dH_val * ar * sigma;
-                        }
+                    // Compute sigma ONCE per element pair (packed f16x2, reused in A & B)
+                    constexpr int n_frag = decltype(size(rAR))::value;
+                    constexpr int n_pairs = n_frag / 2;
+                    __half2 rSigma[n_pairs], rAR_h2[n_pairs];
+                    for (int p = 0; p < n_pairs; ++p) {
+                        rAR_h2[p] = __floats2half2_rn(rAR(p * 2), rAR(p * 2 + 1));
+                        __half2 half_ar = __hmul2(rAR_h2[p], __float2half2_rn(0.5f));
+                        __half2 tanh_val;
+                        asm("tanh.approx.f16x2 %0, %1;"
+                            : "=r"(reinterpret_cast<uint32_t&>(tanh_val))
+                            : "r"(reinterpret_cast<const uint32_t&>(half_ar)));
+                        rSigma[p] = __hmul2(__float2half2_rn(0.5f),
+                                            __hadd2(__float2half2_rn(1.0f), tanh_val));
                     }
 
-                    // Step B: dS → overwrite sDH_temp
-                    for (int idx = threadIdx.x; idx < m_valid * rs; idx += n_threads) {
-                        int mi = idx / rs, ri = idx % rs;
-                        float ar = 0.0f;
-                        for (int j = 0; j < rs; ++j)
-                            ar += float(sA(mi, k_off + j)) * float(sR(ri, k_off + j, r_pipe_r));
-                        float dH_val = float(sDH_temp(mi, ri));
-                        float a_val = float(sA(mi, k_off + ri));
-                        float t;
-                        asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(ar * 0.5f));
-                        float sigma = 0.5f * (1.0f + t);
-                        float silu_prime = sigma * (1.0f + ar * (1.0f - sigma));
-                        sDH_temp(mi, ri) = half_t(dH_val * a_val * silu_prime);
+                    // --- Step A: dA += dH * AR * sigma (packed f16x2) ---
+                    for (int p = 0; p < n_pairs; ++p) {
+                        int i = p * 2;
+                        auto c0 = tCdA_id(i), c1 = tCdA_id(i + 1);
+                        int mi0 = get<0>(c0) + warp_idx * WARP_M_reconn;
+                        int mi1 = get<0>(c1) + warp_idx * WARP_M_reconn;
+                        if (mi0 >= m_valid) continue;
+                        __half2 dH2 = __halves2half2(
+                            reinterpret_cast<const __half&>(sDH_temp(mi0, get<1>(c0))),
+                            reinterpret_cast<const __half&>(sDH_temp(mi1, get<1>(c1))));
+                        __half2 result = __hmul2(__hmul2(dH2, rAR_h2[p]), rSigma[p]);
+                        rDA_blk[b](i)     += __half2float(__low2half(result));
+                        rDA_blk[b](i + 1) += __half2float(__high2half(result));
+                    }
+
+                    // --- Step B: dS = dH * A * SiLU'(AR) → overwrite sDH_temp (per-warp) ---
+                    // SiLU'(x) = sigma * (1 + x * (1 - sigma)), reuse rSigma & rAR_h2
+                    for (int p = 0; p < n_pairs; ++p) {
+                        int i = p * 2;
+                        auto c0 = tCdA_id(i), c1 = tCdA_id(i + 1);
+                        int mi0 = get<0>(c0) + warp_idx * WARP_M_reconn;
+                        int mi1 = get<0>(c1) + warp_idx * WARP_M_reconn;
+                        int ri0 = get<1>(c0), ri1 = get<1>(c1);
+                        if (mi0 >= BLK_M) continue;
+                        __half2 one_h2 = __float2half2_rn(1.0f);
+                        __half2 silu_prime = __hmul2(rSigma[p],
+                            __hfma2(rAR_h2[p], __hsub2(one_h2, rSigma[p]), one_h2));
+                        __half2 dH2 = __halves2half2(
+                            reinterpret_cast<const __half&>(sDH_temp(mi0, ri0)),
+                            reinterpret_cast<const __half&>(sDH_temp(mi1, ri1)));
+                        __half2 a2 = __halves2half2(
+                            reinterpret_cast<const __half&>(sA(mi0, k_off + ri0)),
+                            reinterpret_cast<const __half&>(sA(mi1, k_off + ri1)));
+                        __half2 dS = __hmul2(__hmul2(dH2, a2), silu_prime);
+                        sDH_temp(mi0, ri0) = half_t(__low2half(dS));
+                        sDH_temp(mi1, ri1) = half_t(__high2half(dS));
                     }
                     __syncthreads();
 
-                    // Step C: dA += dS @ R via MMA
+                    // --- Step C: dA += dS @ R via MMA ---
+                    // Load R with reconn convention (NOT swapped like AR)
                     copy(cons_s2r_A{}, tXsDH_w, tXrDH_reconn);
-                    auto rR_frag = cons_thr.make_fragment_B(cons_thr.partition_B(
+                    auto rR_frag_reconn = cons_thr.make_fragment_B(cons_thr.partition_B(
                         make_tensor(static_cast<half_t*>(nullptr),
                                     make_layout(make_shape(Int<rs>{}, Int<rs>{}), LayoutRight{}))));
-                    auto tBid = cons_thr.partition_B(
-                        make_identity_tensor(make_shape(Int<rs>{}, Int<rs>{})));
-                    for (int i = 0; i < size(rR_frag); ++i) {
-                        auto coord2 = tBid(i);
-                        rR_frag(i) = sR(get<1>(coord2), k_off + get<0>(coord2), r_pipe_r);
+                    {
+                        auto tBid = cons_thr.partition_B(
+                            make_identity_tensor(make_shape(Int<rs>{}, Int<rs>{})));
+                        for (int i = 0; i < size(rR_frag_reconn); ++i) {
+                            auto coord2 = tBid(i);
+                            rR_frag_reconn(i) = sR(get<1>(coord2), k_off + get<0>(coord2), r_pipe_r);
+                        }
                     }
-                    gemm(cons_mma, rDH_reconn, rR_frag, rDA_blk[b]);
+                    gemm(cons_mma, rDH_reconn, rR_frag_reconn, rDA_blk[b]);
                 } else {
                     // Non-gated: write dH slice to sDH_temp, then dA += dH @ R via MMA
                     for (int i = 0; i < size(rDH); ++i) {
