@@ -148,7 +148,7 @@ class BwdDAdRCompParams:
     amplification from K/reconn_sz to K/bK.
     """
 
-    bM: int = 64           # M tile size (output rows)
+    bM: int = 128          # M tile size (must be >= 16 * n_warps for MMA atom compatibility)
     bK: int = 64           # K tile size (output cols, covers bK/rs reconn blocks)
     bK_inner: int = 32     # Inner K tile for dH GEMM (tiles over gs dimension)
     n_buf_slots: int = 8   # Number of dR buffer slots (controls atomic contention)
@@ -196,7 +196,7 @@ class BwdDAdRCompParams:
     def safe_defaults(cls) -> BwdDAdRCompParams:
         """Conservative defaults that compile for all valid shapes."""
         return cls(
-            bM=64, bK=64, bK_inner=32,
+            bM=128, bK=64, bK_inner=32,
             n_buf_slots=8,
             bP_dc_b=2, bP_dh=2, bP_r=2,
             warp_layout_arb=(2, 2), warp_layout_ar=(4,),

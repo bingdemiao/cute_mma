@@ -271,7 +271,7 @@ bwd_dadr_kernel(
                 int k_off = b * rs;
 
                 if constexpr (GATED) {
-                    // Write dH slice to sDH_temp first
+                    // Write dH slice to sDH_temp
                     for (int i = 0; i < size(rDH); ++i) {
                         auto coord = tCid(i);
                         int mi = get<0>(coord);
@@ -282,37 +282,23 @@ bwd_dadr_kernel(
                     __syncthreads();
 
                     // Step A: dA += dH * SiLU(AR)
-                    // sigmoid(x) = 0.5*(1+tanh(x/2)) via tanh.approx
-                    for (int i = 0; i < size(rDA_blk[b]); i += 2) {
-                        auto c0 = tCdA_id(i), c1 = tCdA_id(i + 1);
-                        int mi0 = get<0>(c0) + warp_idx * WARP_M_reconn;
-                        int mi1 = get<0>(c1) + warp_idx * WARP_M_reconn;
-                        int ri0 = get<1>(c0), ri1 = get<1>(c1);
-                        if (mi0 >= m_valid) continue;
-                        // AR dot products (scalar f32)
-                        float ar0 = 0.0f, ar1 = 0.0f;
-                        for (int j = 0; j < rs; ++j) {
-                            ar0 += float(sA(mi0, k_off + j)) * float(sR(ri0, k_off + j, r_pipe_r));
-                            ar1 += float(sA(mi1, k_off + j)) * float(sR(ri1, k_off + j, r_pipe_r));
+                    for (int i = 0; i < size(rDA_blk[b]); ++i) {
+                        auto coord2 = tCdA_id(i);
+                        int mi = get<0>(coord2) + warp_idx * WARP_M_reconn;
+                        int ri = get<1>(coord2);
+                        if (mi < m_valid) {
+                            float ar = 0.0f;
+                            for (int j = 0; j < rs; ++j)
+                                ar += float(sA(mi, k_off + j)) * float(sR(ri, k_off + j, r_pipe_r));
+                            float t;
+                            asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(ar * 0.5f));
+                            float sigma = 0.5f * (1.0f + t);
+                            float dH_val = float(sDH_temp(mi, ri));
+                            rDA_blk[b](i) += dH_val * ar * sigma;
                         }
-                        // Packed f16x2 sigmoid + SiLU
-                        __half2 ar2 = __floats2half2_rn(ar0, ar1);
-                        __half2 half_ar = __hmul2(ar2, __float2half2_rn(0.5f));
-                        __half2 tanh_val;
-                        asm("tanh.approx.f16x2 %0, %1;"
-                            : "=r"(reinterpret_cast<uint32_t&>(tanh_val))
-                            : "r"(reinterpret_cast<const uint32_t&>(half_ar)));
-                        __half2 sigma = __hmul2(__float2half2_rn(0.5f),
-                                               __hadd2(__float2half2_rn(1.0f), tanh_val));
-                        __half2 dH2 = __halves2half2(
-                            reinterpret_cast<const __half&>(sDH_temp(mi0, ri0)),
-                            reinterpret_cast<const __half&>(sDH_temp(mi1, ri1)));
-                        __half2 result = __hmul2(__hmul2(dH2, ar2), sigma);
-                        rDA_blk[b](i)     += __half2float(__low2half(result));
-                        rDA_blk[b](i + 1) += __half2float(__high2half(result));
                     }
 
-                    // Step B: compute dS → overwrite sDH_temp (all threads cooperate)
+                    // Step B: dS → overwrite sDH_temp
                     for (int idx = threadIdx.x; idx < m_valid * rs; idx += n_threads) {
                         int mi = idx / rs, ri = idx % rs;
                         float ar = 0.0f;
