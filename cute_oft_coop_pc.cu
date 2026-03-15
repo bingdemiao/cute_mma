@@ -199,8 +199,8 @@ void oft_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
 
 #if OFT_GATED
             // Apply SiLU gating in smem: sAR(m,c) = sA(m,a_col) * SiLU(sAR(m,c))
-            // Must be done in smem because MMA A and C fragments have different
-            // register-to-position mappings — cannot cross-index between them.
+            // Uses packed f16x2 + tanh.approx.f16x2:
+            //   sigma = 0.5*(1+tanh(ar*0.5)), silu = ar*sigma
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_threads1)); // ensure r2s complete
             {
                 constexpr int n_grp = decltype(n_groups)::value;
@@ -211,17 +211,31 @@ void oft_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
                 // sAR column c maps to (r, b, g) via producer_layout_n strides:
                 //   g = c % n_grp, b = (c / n_grp) % n_cb, r = c / (n_cb * n_grp)
                 // Corresponding sA column: j * c_width + b * rs + r
-                for (int idx = thread_idx; idx < total; idx += n_threads1) {
-                    int m = idx / (rs * n_cb * n_grp);
-                    int c = idx % (rs * n_cb * n_grp);
-                    int g = c % n_grp;
-                    int b = (c / n_grp) % n_cb;
-                    int r = c / (n_cb * n_grp);
-                    int a_col = j * rs * n_cb + r * n_cb + b;
-                    float ar = float(sAR(m, c, ar_pipe_write));
-                    float a = float(sA(m, a_col, smem_pipe_read));
-                    float silu_ar = ar / (1.0f + __expf(-ar));
-                    sAR(m, c, ar_pipe_write) = half_t(a * silu_ar);
+                for (int idx = 2 * thread_idx; idx < total; idx += 2 * n_threads1) {
+                    int m0 = idx / (rs * n_cb * n_grp);
+                    int c0 = idx % (rs * n_cb * n_grp);
+                    int g0 = c0 % n_grp, b0 = (c0 / n_grp) % n_cb, r0 = c0 / (n_cb * n_grp);
+                    int a_col0 = j * rs * n_cb + r0 * n_cb + b0;
+                    int m1 = (idx + 1) / (rs * n_cb * n_grp);
+                    int c1 = (idx + 1) % (rs * n_cb * n_grp);
+                    int g1 = c1 % n_grp, b1 = (c1 / n_grp) % n_cb, r1 = c1 / (n_cb * n_grp);
+                    int a_col1 = j * rs * n_cb + r1 * n_cb + b1;
+                    __half2 ar2 = __halves2half2(
+                        reinterpret_cast<const __half&>(sAR(m0, c0, ar_pipe_write)),
+                        reinterpret_cast<const __half&>(sAR(m1, c1, ar_pipe_write)));
+                    __half2 a2 = __halves2half2(
+                        reinterpret_cast<const __half&>(sA(m0, a_col0, smem_pipe_read)),
+                        reinterpret_cast<const __half&>(sA(m1, a_col1, smem_pipe_read)));
+                    __half2 half_ar = __hmul2(ar2, __float2half2_rn(0.5f));
+                    __half2 tanh_val;
+                    asm("tanh.approx.f16x2 %0, %1;"
+                        : "=r"(reinterpret_cast<uint32_t&>(tanh_val))
+                        : "r"(reinterpret_cast<const uint32_t&>(half_ar)));
+                    __half2 sigma = __hmul2(__float2half2_rn(0.5f),
+                                           __hadd2(__float2half2_rn(1.0f), tanh_val));
+                    __half2 result = __hmul2(a2, __hmul2(ar2, sigma));
+                    sAR(m0, c0, ar_pipe_write) = half_t(__low2half(result));
+                    sAR(m1, c1, ar_pipe_write) = half_t(__high2half(result));
                 }
             }
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_threads1)); // ensure gating complete
