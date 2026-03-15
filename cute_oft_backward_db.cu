@@ -118,30 +118,17 @@ void dB_producer(
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
 
             if constexpr (GATED) {
-                // SiLU gating: sAR_temp = A * SiLU(AR)
-                // sigma = 0.5*(1+tanh(ar*0.5)), silu = ar*sigma
-                // Packed f16x2 + tanh.approx.f16x2
+                // SiLU gating: sAR_temp = A * SiLU(AR), packed f16x2
                 for (int idx = 2 * lane_idx; idx < WARP_M * rs; idx += 64) {
                     int mi0 = idx / rs, ri0 = idx % rs;
                     int mi1 = (idx + 1) / rs, ri1 = (idx + 1) % rs;
                     int gmi0 = warp_idx * WARP_M + mi0;
                     int gmi1 = warp_idx * WARP_M + mi1;
-                    __half2 ar2 = __halves2half2(
-                        reinterpret_cast<const __half&>(sAR_temp(gmi0, ri0)),
-                        reinterpret_cast<const __half&>(sAR_temp(gmi1, ri1)));
-                    __half2 a2 = __halves2half2(
-                        reinterpret_cast<const __half&>(sA(gmi0, kb * rs + ri0, smem_pipe_read)),
-                        reinterpret_cast<const __half&>(sA(gmi1, kb * rs + ri1, smem_pipe_read)));
-                    __half2 half_ar = __hmul2(ar2, __float2half2_rn(0.5f));
-                    __half2 tanh_val;
-                    asm("tanh.approx.f16x2 %0, %1;"
-                        : "=r"(reinterpret_cast<uint32_t&>(tanh_val))
-                        : "r"(reinterpret_cast<const uint32_t&>(half_ar)));
-                    __half2 sigma = __hmul2(__float2half2_rn(0.5f),
-                                           __hadd2(__float2half2_rn(1.0f), tanh_val));
-                    __half2 result = __hmul2(a2, __hmul2(ar2, sigma));
-                    sAR_temp(gmi0, ri0) = half_t(__low2half(result));
-                    sAR_temp(gmi1, ri1) = half_t(__high2half(result));
+                    __half2 ar2 = load_half2(sAR_temp(gmi0, ri0), sAR_temp(gmi1, ri1));
+                    __half2 a2 = load_half2(sA(gmi0, kb * rs + ri0, smem_pipe_read),
+                                            sA(gmi1, kb * rs + ri1, smem_pipe_read));
+                    __half2 result = __hmul2(a2, silu_h2(ar2));
+                    store_half2(sAR_temp(gmi0, ri0), sAR_temp(gmi1, ri1), result);
                 }
                 asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
             }

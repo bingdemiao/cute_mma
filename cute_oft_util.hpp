@@ -1,5 +1,53 @@
 #pragma once
+#include <cuda_fp16.h>
 #include <cute/tensor.hpp>
+
+// =============================================================================
+// Packed f16x2 sigmoid / SiLU primitives
+// sigmoid(x) = 0.5*(1+tanh(x*0.5))  — avoids reciprocal
+// SiLU(x) = x * sigmoid(x)
+// SiLU'(x) = sigma * (1 + x*(1-sigma))
+// =============================================================================
+
+/// Packed sigmoid: returns sigma(x) for two half values
+__device__ __forceinline__
+__half2 sigmoid_h2(__half2 x) {
+    __half2 half_x = __hmul2(x, __float2half2_rn(0.5f));
+    __half2 tanh_val;
+    asm("tanh.approx.f16x2 %0, %1;"
+        : "=r"(reinterpret_cast<uint32_t&>(tanh_val))
+        : "r"(reinterpret_cast<const uint32_t&>(half_x)));
+    return __hmul2(__float2half2_rn(0.5f),
+                   __hadd2(__float2half2_rn(1.0f), tanh_val));
+}
+
+/// Packed SiLU: returns x * sigmoid(x)
+__device__ __forceinline__
+__half2 silu_h2(__half2 x) {
+    return __hmul2(x, sigmoid_h2(x));
+}
+
+/// Packed SiLU derivative: returns sigma * (1 + x*(1-sigma))
+__device__ __forceinline__
+__half2 silu_prime_h2(__half2 x, __half2 sigma) {
+    __half2 one = __float2half2_rn(1.0f);
+    return __hmul2(sigma, __hfma2(x, __hsub2(one, sigma), one));
+}
+
+/// Load two half_t values from smem as __half2
+__device__ __forceinline__
+__half2 load_half2(const cute::half_t& a, const cute::half_t& b) {
+    return __halves2half2(
+        reinterpret_cast<const __half&>(a),
+        reinterpret_cast<const __half&>(b));
+}
+
+/// Store __half2 low/high to two smem half_t locations
+__device__ __forceinline__
+void store_half2(cute::half_t& dst0, cute::half_t& dst1, __half2 val) {
+    dst0 = cute::half_t(__low2half(val));
+    dst1 = cute::half_t(__high2half(val));
+}
 
 template <class WARP_N, class N_GROUPS>
 CUTE_HOST_DEVICE constexpr

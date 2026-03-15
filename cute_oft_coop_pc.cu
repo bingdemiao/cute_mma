@@ -220,22 +220,13 @@ void oft_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
                     int c1 = (idx + 1) % (rs * n_cb * n_grp);
                     int g1 = c1 % n_grp, b1 = (c1 / n_grp) % n_cb, r1 = c1 / (n_cb * n_grp);
                     int a_col1 = j * rs * n_cb + r1 * n_cb + b1;
-                    __half2 ar2 = __halves2half2(
-                        reinterpret_cast<const __half&>(sAR(m0, c0, ar_pipe_write)),
-                        reinterpret_cast<const __half&>(sAR(m1, c1, ar_pipe_write)));
-                    __half2 a2 = __halves2half2(
-                        reinterpret_cast<const __half&>(sA(m0, a_col0, smem_pipe_read)),
-                        reinterpret_cast<const __half&>(sA(m1, a_col1, smem_pipe_read)));
-                    __half2 half_ar = __hmul2(ar2, __float2half2_rn(0.5f));
-                    __half2 tanh_val;
-                    asm("tanh.approx.f16x2 %0, %1;"
-                        : "=r"(reinterpret_cast<uint32_t&>(tanh_val))
-                        : "r"(reinterpret_cast<const uint32_t&>(half_ar)));
-                    __half2 sigma = __hmul2(__float2half2_rn(0.5f),
-                                           __hadd2(__float2half2_rn(1.0f), tanh_val));
-                    __half2 result = __hmul2(a2, __hmul2(ar2, sigma));
-                    sAR(m0, c0, ar_pipe_write) = half_t(__low2half(result));
-                    sAR(m1, c1, ar_pipe_write) = half_t(__high2half(result));
+                    __half2 ar2 = load_half2(sAR(m0, c0, ar_pipe_write),
+                                             sAR(m1, c1, ar_pipe_write));
+                    __half2 a2 = load_half2(sA(m0, a_col0, smem_pipe_read),
+                                            sA(m1, a_col1, smem_pipe_read));
+                    __half2 result = __hmul2(a2, silu_h2(ar2));
+                    store_half2(sAR(m0, c0, ar_pipe_write),
+                                sAR(m1, c1, ar_pipe_write), result);
                 }
             }
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_threads1)); // ensure gating complete

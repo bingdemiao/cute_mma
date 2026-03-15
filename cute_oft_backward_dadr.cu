@@ -314,38 +314,30 @@ bwd_dadr_kernel(
                     }
                     __syncthreads();
 
-                    // Compute sigma ONCE per element pair (packed f16x2, reused in A & B)
+                    // Compute sigma ONCE per element pair, reused in Steps A & B
                     constexpr int n_frag = decltype(size(rAR))::value;
                     constexpr int n_pairs = n_frag / 2;
                     __half2 rSigma[n_pairs], rAR_h2[n_pairs];
                     for (int p = 0; p < n_pairs; ++p) {
                         rAR_h2[p] = __floats2half2_rn(rAR(p * 2), rAR(p * 2 + 1));
-                        __half2 half_ar = __hmul2(rAR_h2[p], __float2half2_rn(0.5f));
-                        __half2 tanh_val;
-                        asm("tanh.approx.f16x2 %0, %1;"
-                            : "=r"(reinterpret_cast<uint32_t&>(tanh_val))
-                            : "r"(reinterpret_cast<const uint32_t&>(half_ar)));
-                        rSigma[p] = __hmul2(__float2half2_rn(0.5f),
-                                            __hadd2(__float2half2_rn(1.0f), tanh_val));
+                        rSigma[p] = sigmoid_h2(rAR_h2[p]);
                     }
 
-                    // --- Step A: dA += dH * AR * sigma (packed f16x2) ---
+                    // --- Step A: dA += dH * AR * sigma ---
                     for (int p = 0; p < n_pairs; ++p) {
                         int i = p * 2;
                         auto c0 = tCdA_id(i), c1 = tCdA_id(i + 1);
                         int mi0 = get<0>(c0) + warp_idx * WARP_M_reconn;
                         int mi1 = get<0>(c1) + warp_idx * WARP_M_reconn;
                         if (mi0 >= m_valid) continue;
-                        __half2 dH2 = __halves2half2(
-                            reinterpret_cast<const __half&>(sDH_temp(mi0, get<1>(c0))),
-                            reinterpret_cast<const __half&>(sDH_temp(mi1, get<1>(c1))));
+                        __half2 dH2 = load_half2(sDH_temp(mi0, get<1>(c0)),
+                                                 sDH_temp(mi1, get<1>(c1)));
                         __half2 result = __hmul2(__hmul2(dH2, rAR_h2[p]), rSigma[p]);
                         rDA_blk[b](i)     += __half2float(__low2half(result));
                         rDA_blk[b](i + 1) += __half2float(__high2half(result));
                     }
 
-                    // --- Step B: dS = dH * A * SiLU'(AR) → overwrite sDH_temp (per-warp) ---
-                    // SiLU'(x) = sigma * (1 + x * (1 - sigma)), reuse rSigma & rAR_h2
+                    // --- Step B: dS = dH * A * SiLU'(AR) → overwrite sDH_temp ---
                     for (int p = 0; p < n_pairs; ++p) {
                         int i = p * 2;
                         auto c0 = tCdA_id(i), c1 = tCdA_id(i + 1);
@@ -353,18 +345,11 @@ bwd_dadr_kernel(
                         int mi1 = get<0>(c1) + warp_idx * WARP_M_reconn;
                         int ri0 = get<1>(c0), ri1 = get<1>(c1);
                         if (mi0 >= BLK_M) continue;
-                        __half2 one_h2 = __float2half2_rn(1.0f);
-                        __half2 silu_prime = __hmul2(rSigma[p],
-                            __hfma2(rAR_h2[p], __hsub2(one_h2, rSigma[p]), one_h2));
-                        __half2 dH2 = __halves2half2(
-                            reinterpret_cast<const __half&>(sDH_temp(mi0, ri0)),
-                            reinterpret_cast<const __half&>(sDH_temp(mi1, ri1)));
-                        __half2 a2 = __halves2half2(
-                            reinterpret_cast<const __half&>(sA(mi0, k_off + ri0)),
-                            reinterpret_cast<const __half&>(sA(mi1, k_off + ri1)));
-                        __half2 dS = __hmul2(__hmul2(dH2, a2), silu_prime);
-                        sDH_temp(mi0, ri0) = half_t(__low2half(dS));
-                        sDH_temp(mi1, ri1) = half_t(__high2half(dS));
+                        __half2 sp = silu_prime_h2(rAR_h2[p], rSigma[p]);
+                        __half2 dH2 = load_half2(sDH_temp(mi0, ri0), sDH_temp(mi1, ri1));
+                        __half2 a2 = load_half2(sA(mi0, k_off + ri0), sA(mi1, k_off + ri1));
+                        __half2 dS = __hmul2(__hmul2(dH2, a2), sp);
+                        store_half2(sDH_temp(mi0, ri0), sDH_temp(mi1, ri1), dS);
                     }
                     __syncthreads();
 
