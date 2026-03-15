@@ -108,25 +108,25 @@ def compute_smem_bytes_bwd_dadr(
     bK_inner: int,
     group_size: int,
     reconn_sz: int,
-    bP_dc_b: int,
-    bP_dh: int,
-    bP_r: int,
 ) -> int:
     """Compute shared memory usage for backward dA+dR kernel.
 
     Mirrors the smem calculation in oft_backward_dA_dR_launch().
-    Layout: sA(bM, bK) + sdC(bM, bK_inner, bP_dc_b) + sB(bK, bK_inner, bP_dc_b)
-          + sDH(bM, bK, bP_dh) + sR(rs, bK, bP_r) + sAR_temp(bM, rs)
+    All buffers use hardcoded double-buffering (_2{}) except sA and sDH_temp.
+    dH is accumulated in registers, not shared memory.
+
+    Layout: sdC(bM, bK_inner, 2) + sB(bK, bK_inner, 2)
+          + sA(bM, bK) + sR(rs, bK, 2) + sDH_temp(bM, rs)
+          + sDR_acc(rs, bK) [float]
     """
     rs = reconn_sz
-    size_A = bM * bK
-    size_dC = bM * bK_inner * bP_dc_b
-    size_B = bK * bK_inner * bP_dc_b
-    size_dH = bM * bK * bP_dh
-    size_R = rs * bK * bP_r
-    size_AR_temp = bM * rs  # gated only, but always counted
-    # sdH (F16) is separate from sdC+sB (enables producer-consumer overlap)
-    smem = (size_dC + size_B + size_dH + size_A + size_R + size_AR_temp) * 2 + 256
+    size_dC = bM * bK_inner * 2     # double-buffered
+    size_B = bK * bK_inner * 2      # double-buffered
+    size_A = bM * bK                 # single buffer
+    size_R = rs * bK * 2             # double-buffered
+    size_dH_temp = bM * rs           # scratch for reconn epilogue
+    half_elems = size_dC + size_B + size_A + size_R + size_dH_temp
+    smem = half_elems * 2 + rs * bK * 4 + 256  # +float sDR_acc +alignment
     return smem
 
 

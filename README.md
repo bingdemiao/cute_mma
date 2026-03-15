@@ -275,7 +275,7 @@ Each kernel type has its own frozen dataclass controlling tile sizes, pipeline d
 | Class | Kernel | Key parameters |
 |-------|--------|----------------|
 | `CompParams` | Forward | `bM`, `bN`, `bK`, `c_width`, `bP_a_r`, `bP_ar`, `bP_b`, `warp_layout_ar`, `warp_layout_arb` |
-| `BwdDAdRCompParams` | Backward dA+dR | `bM`, `n_buf_slots`, `bP_dc_b`, `bP_dar`, `bP_a_r`, `warp_layout_arb`, `warp_layout_ar` |
+| `BwdDAdRCompParams` | Backward dA+dR | `bM`, `bK`, `bK_inner`, `n_buf_slots`, `warp_layout_arb`, `warp_layout_ar` |
 | `BwdDBCompParams` | Backward dB | `bM`, `bK`, `bP_a`, `bP_ar`, `bP_dc`, `warp_layout_ar`, `warp_layout_arb` |
 
 All three classes provide:

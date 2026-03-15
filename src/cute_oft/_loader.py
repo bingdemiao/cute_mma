@@ -30,8 +30,8 @@ def get_or_compile(
 
     Returns a module with the appropriate function(s) for the kernel type:
     - fwd: forward(A, B, R, group_size, reconn_sz)
-    - bwd_dadr: backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated)
-    - bwd_db: backward_dB(dC, A, R, group_size, reconn_sz, gated)
+    - bwd_dadr: backward_dA_dR(dC, A, B, R, group_size, reconn_sz)
+    - bwd_db: backward_dB(dC, A, R, group_size, reconn_sz)
     """
     if backend == "cublas":
         # cuBLAS has a single module for all operations

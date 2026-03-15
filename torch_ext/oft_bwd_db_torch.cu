@@ -29,8 +29,7 @@ torch::Tensor oft_backward_dB(
     torch::Tensor A,
     torch::Tensor R,
     int64_t group_size,
-    int64_t reconn_sz,
-    bool gated)
+    int64_t reconn_sz)
 {
     validate_backward_inputs(dC, A, R, group_size, reconn_sz);
 
@@ -55,7 +54,6 @@ torch::Tensor oft_backward_dB(
         static_cast<int>(R.stride(0)),
         reinterpret_cast<half*>(dB.data_ptr<at::Half>()),
         static_cast<int>(dB.stride(0)),
-        gated,
         stream
     );
 

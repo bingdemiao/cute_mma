@@ -82,25 +82,38 @@ void dB_producer(
     auto rR_frag = thr_mma_ar.make_fragment_B(thr_mma_ar.partition_B(sR_divided(_,_,_0{})));
     auto tXrR = s2r_r_thr.retile_D(rR_frag);
 
+    // cp.async tiled copy for A loading (vectorized 128-bit loads)
+    auto copy_a = cp_layout<uint128_t, half_t>(Int<BLK_M>{}, Int<BLK_K>{}, Int<n_producer_threads>{});
+    auto thr_copy_a = copy_a.get_slice(thread_idx);
+    auto tCsA_cp = thr_copy_a.partition_D(sA);
+
+    auto load_A_async = [&](int m_start, int pipe) {
+        if (m_start + BLK_M <= M) {
+            auto gA = make_tensor(
+                make_gmem_ptr(A_ptr + m_start * ldA + k_start),
+                make_layout(make_shape(Int<BLK_M>{}, Int<BLK_K>{}),
+                            make_stride(ldA, Int<1>{})));
+            copy(copy_a, thr_copy_a.partition_S(gA), tCsA_cp(_,_,_,pipe));
+        } else {
+            // Partial last tile: scalar fallback with boundary check
+            for (int i = thread_idx; i < BLK_M * BLK_K; i += n_producer_threads) {
+                int r = i / BLK_K, c = i % BLK_K;
+                sA(r, c, pipe) = load_or_zero(A_ptr, (m_start + r) * ldA + k_start + c, m_start + r < M);
+            }
+        }
+    };
+
     int smem_pipe_write = bP_a - 1, smem_pipe_read = 0;
     int ar_pipe_write = 0, m_tile_next = 0, m_tiles_remaining = n_m_tiles;
 
     for (int p = 0; p < bP_a - 1 && m_tiles_remaining > 0; ++p) {
-        int m_s = m_tile_next * BLK_M;
-        for (int i = thread_idx; i < BLK_M * BLK_K; i += n_producer_threads) {
-            int r = i / BLK_K, c = i % BLK_K;
-            sA(r, c, p) = load_or_zero(A_ptr, (m_s + r) * ldA + k_start + c, m_s + r < M);
-        }
+        load_A_async(m_tile_next * BLK_M, p);
         cp_async_fence(); --m_tiles_remaining; ++m_tile_next;
     }
 
     for (int mt = 0; mt < n_m_tiles; ++mt) {
         if (m_tiles_remaining > 0) {
-            int m_s = m_tile_next * BLK_M;
-            for (int i = thread_idx; i < BLK_M * BLK_K; i += n_producer_threads) {
-                int r = i / BLK_K, c = i % BLK_K;
-                sA(r, c, smem_pipe_write) = load_or_zero(A_ptr, (m_s + r) * ldA + k_start + c, m_s + r < M);
-            }
+            load_A_async(m_tile_next * BLK_M, smem_pipe_write);
             --m_tiles_remaining; ++m_tile_next;
         }
         cp_async_fence(); cp_async_wait<bP_a - 1>();
@@ -357,7 +370,6 @@ void oft_backward_dB_launch(
     half const* A,  int ldA,
     half const* R,  int ldR,
     half* dB, int ldDB,
-    bool gated,
     cudaStream_t stream)
 {
     constexpr int gs = CurrKernelParams::group_size;
@@ -388,8 +400,11 @@ void oft_backward_dB_launch(
                     make_shape(cute::Int<gs>{}, cute::Int<BLK_M>{}, cute::Int<bP_dc>{}))))
                * sizeof(half_t) + 256;
 
-    auto kernel = gated ? dB_pc_kernel<BLK_M, BLK_K, gs, rs, true>
-                        : dB_pc_kernel<BLK_M, BLK_K, gs, rs, false>;
+#if OFT_GATED
+    auto kernel = dB_pc_kernel<BLK_M, BLK_K, gs, rs, true>;
+#else
+    auto kernel = dB_pc_kernel<BLK_M, BLK_K, gs, rs, false>;
+#endif
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     kernel<<<grid, block, smem, stream>>>(
         reinterpret_cast<half_t const*>(dC), ldDC,

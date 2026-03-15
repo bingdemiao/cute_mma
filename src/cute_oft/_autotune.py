@@ -91,43 +91,58 @@ def default_search_space_bwd_dadr(
     reconn_sz: int,
     device: int = 0,
 ) -> list[BwdDAdRCompParams]:
-    """Generate candidate BwdDAdRCompParams configurations."""
-    # Warp presets: (warp_layout_arb, warp_layout_ar)
-    # arb = heavy producer (dH GEMM), ar = light consumer (reconn ops)
+    """Generate candidate BwdDAdRCompParams configurations.
+
+    The kernel uses all warps cooperatively (no producer-consumer split).
+    Both warp layouts only contribute to total warp count, which must be even
+    (kernel splits warps as n_warps_M × n_warps_K=2 for the GEMM).
+    """
+    # Warp presets: (warp_layout_arb, warp_layout_ar) → total warps
+    # Total must be even for the n_warps_K=2 GEMM layout.
     warp_presets: list[tuple[tuple[int, ...], tuple[int, ...]]] = [
-        ((2, 2), (2,)),  # 4 producer + 2 consumer (recommended)
-        ((2,), (2,)),    # 2 producer + 2 consumer (balanced)
-        ((2, 2), (4,)),  # 4 producer + 4 consumer
+        ((2, 2), (2,)),  # 6 warps total
+        ((2, 2), (4,)),  # 8 warps total
+        ((2,), (2,)),    # 4 warps total
     ]
 
     candidates: list[BwdDAdRCompParams] = []
     for bM in (64, 128):
         for bK in (64, 128):
             for bK_inner in (16, 32):
+                if group_size % bK_inner != 0:
+                    continue
                 for n_buf_slots in (8,):
-                    for bP_dc_b in (2, 3):
-                        for bP_dh in (2,):
-                            for bP_r in (2,):
-                                for wl_arb, wl_ar in warp_presets:
-                                    params = BwdDAdRCompParams(
-                                        bM=bM, bK=bK, bK_inner=bK_inner,
-                                        n_buf_slots=n_buf_slots,
-                                        bP_dc_b=bP_dc_b, bP_dh=bP_dh,
-                                        bP_r=bP_r,
-                                        warp_layout_arb=wl_arb,
-                                        warp_layout_ar=wl_ar,
-                                    )
-                                    try:
-                                        smem = compute_smem_bytes_bwd_dadr(
-                                            bM, bK, bK_inner,
-                                            group_size, reconn_sz,
-                                            bP_dc_b, bP_dh, bP_r,
-                                        )
-                                        check_smem_limit(smem, device)
-                                    except (RuntimeError, ValueError):
-                                        continue
-                                    candidates.append(params)
+                    for wl_arb, wl_ar in warp_presets:
+                        n_warps = _warp_count(wl_arb) + _warp_count(wl_ar)
+                        if n_warps % 2 != 0:
+                            continue
+                        n_warps_M = n_warps // 2
+                        if bM % n_warps_M != 0:
+                            continue
+                        params = BwdDAdRCompParams(
+                            bM=bM, bK=bK, bK_inner=bK_inner,
+                            n_buf_slots=n_buf_slots,
+                            warp_layout_arb=wl_arb,
+                            warp_layout_ar=wl_ar,
+                        )
+                        try:
+                            smem = compute_smem_bytes_bwd_dadr(
+                                bM, bK, bK_inner,
+                                group_size, reconn_sz,
+                            )
+                            check_smem_limit(smem, device)
+                        except (RuntimeError, ValueError):
+                            continue
+                        candidates.append(params)
     return candidates
+
+
+def _warp_count(layout: tuple[int, ...]) -> int:
+    """Compute total warp count from a warp layout shape tuple."""
+    result = 1
+    for s in layout:
+        result *= s
+    return result
 
 
 def default_search_space_bwd_db(
@@ -153,6 +168,9 @@ def default_search_space_bwd_db(
                 for bP_ar in (2, 3):
                     for bP_dc in (2, 3):
                         for wl_ar, wl_arb in warp_presets:
+                            n_producer_warps = _warp_count(wl_ar)
+                            if bM % n_producer_warps != 0:
+                                continue
                             params = BwdDBCompParams(
                                 bM=bM, bK=bK,
                                 bP_a=bP_a, bP_ar=bP_ar, bP_dc=bP_dc,
@@ -523,11 +541,11 @@ def _benchmark_one(
     elif kernel_type == "bwd_dadr":
         call = lambda: module.backward_dA_dR(
             tensors["dC"], tensors["A"], tensors["B"], tensors["R"],
-            group_size, reconn_sz, gated)
+            group_size, reconn_sz)
     elif kernel_type == "bwd_db":
         call = lambda: module.backward_dB(
             tensors["dC"], tensors["A"], tensors["R"],
-            group_size, reconn_sz, gated)
+            group_size, reconn_sz)
     else:
         return None
 
@@ -859,7 +877,7 @@ def _config_summary(config) -> str:
     elif isinstance(config, BwdDAdRCompParams):
         return (
             f"bM={config.bM} bK={config.bK} bKi={config.bK_inner} "
-            f"P={config.bP_dc_b}/{config.bP_dh}/{config.bP_r}"
+            f"bufs={config.n_buf_slots}"
         )
     elif isinstance(config, BwdDBCompParams):
         return (

@@ -5,8 +5,7 @@ torch::Tensor oft_backward_dB(
     torch::Tensor A,
     torch::Tensor R,
     int64_t group_size,
-    int64_t reconn_sz,
-    bool gated);
+    int64_t reconn_sz);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_dB", &oft_backward_dB,
@@ -15,6 +14,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("A"),
           py::arg("R"),
           py::arg("group_size") = 256,
-          py::arg("reconn_sz") = 8,
-          py::arg("gated") = false);
+          py::arg("reconn_sz") = 8);
 }

@@ -496,7 +496,6 @@ void oft_backward_dA_dR_launch(
     half const* R,  int ldR,
     half* dA, int ldDA,
     half* dR, int ldDR,
-    bool gated,
     cudaStream_t stream)
 {
     constexpr int gs = CurrKernelParams::group_size;
@@ -539,8 +538,11 @@ void oft_backward_dA_dR_launch(
     dim3 grid(n_k_tiles * n_m_tiles);
     dim3 block(n_threads);
 
-    auto kernel = gated ? bwd_dadr_kernel<BLK_M, BLK_K, BLK_N, gs, rs, true>
-                        : bwd_dadr_kernel<BLK_M, BLK_K, BLK_N, gs, rs, false>;
+#if OFT_GATED
+    auto kernel = bwd_dadr_kernel<BLK_M, BLK_K, BLK_N, gs, rs, true>;
+#else
+    auto kernel = bwd_dadr_kernel<BLK_M, BLK_K, BLK_N, gs, rs, false>;
+#endif
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     kernel<<<grid, block, smem, stream>>>(
         reinterpret_cast<half_t const*>(dC), ldDC,

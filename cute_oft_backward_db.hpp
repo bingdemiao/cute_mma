@@ -10,5 +10,4 @@ void oft_backward_dB_launch(
     half const* A,  int ldA,
     half const* R,  int ldR,
     half* dB, int ldDB,
-    bool gated,
     cudaStream_t stream);

@@ -272,7 +272,7 @@ def backward(
                 gated=gated, kernel_type="bwd_dadr",
                 bwd_dadr_params=bwd_dadr_params,
             )
-        grads = dadr_module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated)
+        grads = dadr_module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz)
         dA, dR = grads[0], grads[1]
 
         if gated:
@@ -301,7 +301,7 @@ def backward(
                     gated=gated, kernel_type="bwd_db",
                     bwd_db_params=bwd_db_params,
                 )
-            dB_out = db_module.backward_dB(dC, A, R, group_size, reconn_sz, gated)
+            dB_out = db_module.backward_dB(dC, A, R, group_size, reconn_sz)
         else:
             dB_out = None
 

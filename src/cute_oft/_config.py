@@ -138,11 +138,14 @@ class BwdDBCompParams:
 
 @dataclasses.dataclass(frozen=True)
 class BwdDAdRCompParams:
-    """Performance parameters for the backward fused dA+dR kernel (producer-consumer).
+    """Performance parameters for the backward fused dA+dR kernel.
 
-    The kernel tiles over (M, K_output) and loops over groups. For each group:
-      Producer: computes dH(bM, bK) = dC_g(bM, gs) @ B_g(gs, bK) via pipelined MMA.
-      Consumer: uses dH + A + R for per-reconn-block dA/dR accumulation.
+    All warps cooperate on both the GEMM and the group-boundary epilogue
+    (no producer-consumer split). The kernel tiles over (M, K) with z-curve
+    ordering and loops over the N dimension for each group.
+
+    GEMM: dH(bM, bK) += dC(bM, bK_inner) @ B(bK, bK_inner)^T
+    Epilogue: per-reconn-block dA accumulation + dR reduction via shuffle.
 
     bK covers multiple reconn blocks (bK/reconn_sz), reducing dC read
     amplification from K/reconn_sz to K/bK.
@@ -152,13 +155,10 @@ class BwdDAdRCompParams:
     bK: int = 64           # K tile size (output cols, covers bK/rs reconn blocks)
     bK_inner: int = 32     # Inner K tile for dH GEMM (tiles over gs dimension)
     n_buf_slots: int = 8   # Number of dR buffer slots (controls atomic contention)
-    bP_dc_b: int = 2       # Pipeline depth: dC+B async loads (producer)
-    bP_dh: int = 2         # Pipeline depth: dH producer→consumer (2 = double-buffer for overlap)
-    bP_r: int = 2          # Pipeline depth: R loads (consumer)
-    # Heavy GEMM producer (dC @ B, gs-reduction)
-    warp_layout_arb: tuple[int, ...] = (2, 2)  # 4 warps
-    # Light reconn consumer (dA/dR accumulation)
-    warp_layout_ar: tuple[int, ...] = (4,)     # 4 warps (keeps per-thread arrays small)
+    # All warps cooperate on GEMM + reconn epilogue (no producer-consumer split).
+    # Both layouts only contribute to total warp count, which must be even.
+    warp_layout_arb: tuple[int, ...] = (2, 2)  # contributes 4 warps
+    warp_layout_ar: tuple[int, ...] = (4,)     # contributes 4 warps
 
     def to_header(self) -> str:
         """Generate the C++ struct definition."""
@@ -168,9 +168,6 @@ class BwdDAdRCompParams:
         static const unsigned int bK = {self.bK};
         static const unsigned int bK_inner = {self.bK_inner};
         static const unsigned int n_buf_slots = {self.n_buf_slots};
-        static const unsigned int bP_dc_b = {self.bP_dc_b};
-        static const unsigned int bP_dh = {self.bP_dh};
-        static const unsigned int bP_r = {self.bP_r};
         using warp_layout_arb = {_layout_type(self.warp_layout_arb)};
         using warp_layout_ar = {_layout_type(self.warp_layout_ar)};
     }};"""
@@ -190,6 +187,9 @@ class BwdDAdRCompParams:
         for key in ("warp_layout_arb", "warp_layout_ar"):
             if key in d and isinstance(d[key], list):
                 d[key] = tuple(d[key])
+        # Remove legacy pipeline depth fields (no longer used by kernel)
+        for key in ("bP_dc_b", "bP_dh", "bP_r"):
+            d.pop(key, None)
         return cls(**d)
 
     @classmethod
@@ -198,6 +198,5 @@ class BwdDAdRCompParams:
         return cls(
             bM=128, bK=64, bK_inner=32,
             n_buf_slots=8,
-            bP_dc_b=2, bP_dh=2, bP_r=2,
             warp_layout_arb=(2, 2), warp_layout_ar=(4,),
         )

@@ -12,5 +12,4 @@ void oft_backward_dA_dR_launch(
     half const* R,  int ldR,
     half* dA, int ldDA,
     half* dR, int ldDR,
-    bool gated,
     cudaStream_t stream);

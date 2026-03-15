@@ -30,8 +30,7 @@ std::vector<torch::Tensor> oft_backward_dA_dR(
     torch::Tensor B,
     torch::Tensor R,
     int64_t group_size,
-    int64_t reconn_sz,
-    bool gated)
+    int64_t reconn_sz)
 {
     TORCH_CHECK(B.is_cuda() && B.scalar_type() == torch::kHalf && B.is_contiguous(),
                 "B must be a contiguous CUDA float16 tensor");
@@ -63,7 +62,6 @@ std::vector<torch::Tensor> oft_backward_dA_dR(
         static_cast<int>(dA.stride(0)),
         reinterpret_cast<half*>(dR.data_ptr<at::Half>()),
         static_cast<int>(dR.stride(0)),
-        gated,
         stream
     );
 
