@@ -79,6 +79,22 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
 - `time_ms` is `None` for failed compilations/runs (also cached)
 - Supports generators for adaptive/early-stopping strategies
 
+## CUDA kernel coding rules
+
+These are **mandatory** rules when writing or modifying CUDA kernels in this project. Violating them produces slow code that must be rewritten.
+
+1. **Never use scalar loops for small matrix multiplies.** Any reduction of the form `sum_j A(m,j) * B(j,n)` or dot product over a tile dimension MUST use MMA tensor core instructions via CuTe's `gemm()`, not a scalar `for` loop. Scalar FMA loops are orders of magnitude slower than tensor cores.
+
+2. **Never use scalar smem loads when LDSM is available.** Loading data from shared memory into MMA operand registers MUST use LDSM copy atoms (`SM75_U32x{1,2,4}_LDSM_N` or `SM75_U16x{2,4,8}_LDSM_T`) via CuTe's `make_tiled_copy_A/B` + `copy()`. Never manually loop over smem elements with scalar loads to fill MMA fragments.
+
+3. **Use packed f16x2 instructions for activation functions.** Sigmoid, tanh, SiLU, and their derivatives MUST use:
+   - `tanh.approx.f16x2` PTX instruction (not f32 `__expf` or `tanh.approx.f32`)
+   - Packed `__half2` arithmetic: `__hmul2`, `__hadd2`, `__hsub2`, `__hfma2`
+   - Compute `sigmoid(x) = 0.5 * (1 + tanh(x * 0.5))` to avoid reciprocal
+   - Process 2 elements per instruction whenever possible
+
+4. **Use `make_tiled_copy_C` for R2S writes from MMA fragments.** Writing MMA C-fragment data to shared memory should use CuTe's `make_tiled_copy_C` with `Copy_Atom<UniversalCopy<uint32_t>, half_t>`, not manual loops with `partition_C(identity_tensor)` coordinate lookups.
+
 ## Misc
 - This file should be keep updated with the progress of the project.
 - When running the kernels using the cute backend with autotuning enabled, make sure to set `CUTE_OFT_COMPILE_WORKERS` environnment variable to 2. So that it will not trigger OOM error on my machine and kill my wsl
