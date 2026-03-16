@@ -146,72 +146,38 @@ void movmatrix_trans_b16(unsigned int& reg) {
     asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %0;" : "+r"(reg));
 }
 
-// Apply movmatrix transpose to all u32 elements in a CuTe register tensor.
-// The tensor should contain MMA fragment data arranged as 8x8 b16 matrices.
+// In-place transpose of MMA fragment register tensor via movmatrix.
+//
+// Input shape:  (2, MMA_M, MMA_K) — 2 halfs (one u32) per 8x8 sub-block
+// Output shape: (2, MMA_K, MMA_M) — dims 1 and 2 swapped
+//
+// The user must group modes into this 3D shape before calling.
+// For example, a fragment ((2,2), 2, 4) should first be grouped via
+// group_modes<0,1> to get (2*2, 2, 4) = (4, 2, 4), then the caller
+// interprets the first mode as the u32 pairs.
+//
+// Actually: the innermost mode must be exactly 2 (one u32 = 2 f16 values).
+// movmatrix transposes each 8x8 block distributed across the warp.
+// Swapping modes 1↔2 reinterprets M-atoms as K-atoms and vice versa.
 template <class Engine, class Layout>
 __device__ __forceinline__
-auto inplace_transpose(cute::Tensor<Engine, Layout>& mma_tensor) {
+auto inplace_transpose(cute::Tensor<Engine, Layout>& tensor) {
     using namespace cute;
-    static_assert(rank(Layout{}) == _3{}, "Layout must be 3D");
-    static_assert(sizeof(typename Engine::value_type) == 2, "Engine value type must be 16-bit");
-    auto mma_inner = get<0>(Layout{});
-    if constexpr (rank(mma_inner) == _1{}) {
-        // Flat inner mode: (2) — single u32 per atom, no sub-blocks
-        // Tensor shape: (2, outer_M, outer_K)
-        static_assert(size(mma_inner) == _2{}, "Inner mode must be a single u32 (2 halfs)");
-        # pragma unroll
-        for (int i = 0; i < size<1>(Layout{}); ++i) {
-            # pragma unroll
-            for (int j = 0; j < size<2>(Layout{}); ++j) {
-                auto& reg = reinterpret_cast<unsigned int&>(mma_tensor(0, i, j));
-                movmatrix_trans_b16(reg);
-            }
+    static_assert(rank(Layout{}) == _3{}, "Expected shape (2, MMA_M, MMA_K)");
+    static_assert(size<0>(Layout{}) == _2{}, "Mode 0 must be 2 (one u32 = 2 f16)");
+    static_assert(sizeof(typename Engine::value_type) == 2, "Value type must be 16-bit");
+
+    // Apply movmatrix to every u32
+    #pragma unroll
+    for (int i = 0; i < size<1>(Layout{}); ++i) {
+        #pragma unroll
+        for (int j = 0; j < size<2>(Layout{}); ++j) {
+            auto& reg = reinterpret_cast<unsigned int&>(tensor(0, i, j));
+            movmatrix_trans_b16(reg);
         }
-        // Swap outer dims: (inner, M_atoms, K_atoms) → (inner, K_atoms, M_atoms)
-        auto final_layout = make_layout(get<0>(Layout{}), get<2>(Layout{}), get<1>(Layout{}));
-        return make_tensor(&mma_tensor(0), final_layout);
-    } else if constexpr (rank(mma_inner) == _2{}) {
-        // Inner mode: (2, MMA_M) — MMA_M sub-blocks, each one u32
-        // Tensor shape: ((2, MMA_M), outer_M, outer_K)
-        static_assert(size(get<0>(mma_inner)) == _2{}, "Innermost must be 2 (one u32)");
-        # pragma unroll
-        for (int i = 0; i < size<1>(Layout{}); ++i) {
-            # pragma unroll
-            for (int j = 0; j < size<2>(Layout{}); ++j) {
-                # pragma unroll
-                for (int ii = 0; ii < size(get<1>(mma_inner)); ++ii) {
-                    auto& reg = reinterpret_cast<unsigned int&>(mma_tensor(make_coord(0, ii), i, j));
-                    movmatrix_trans_b16(reg);
-                }
-            }
-        }
-        // Swap outer dims, keep inner as-is (MMA_M stays, movmatrix handled the 8x8 transpose)
-        // ((2, MMA_M), outer_M, outer_K) → ((2, MMA_M), outer_K, outer_M)
-        auto final_layout = make_layout(get<0>(Layout{}), get<2>(Layout{}), get<1>(Layout{}));
-        return make_tensor(&mma_tensor(0), final_layout);
-    } else {
-        // Inner mode: (2, MMA_M, MMA_N) — multiple 8x8 sub-blocks per atom
-        // Tensor shape: ((2, MMA_M, MMA_N), outer_M, outer_K)
-        static_assert(rank(mma_inner) == _3{}, "Inner mode must be (2, MMA_M, MMA_N)");
-        static_assert(size(get<0>(mma_inner)) == _2{}, "Innermost must be 2 (one u32)");
-        # pragma unroll
-        for (int i = 0; i < size<1>(Layout{}); ++i) {
-            # pragma unroll
-            for (int j = 0; j < size<2>(Layout{}); ++j) {
-                # pragma unroll
-                for (int ii = 0; ii < size(get<1>(mma_inner)); ++ii) {
-                    # pragma unroll
-                    for (int jj = 0; jj < size(get<2>(mma_inner)); ++jj) {
-                        auto& reg = reinterpret_cast<unsigned int&>(mma_tensor(make_coord(0, ii, jj), i, j));
-                        movmatrix_trans_b16(reg);
-                    }
-                }
-            }
-        }
-        // Swap both inner sub-blocks and outer atom dims:
-        // ((2, MMA_M, MMA_N), outer_M, outer_K) → ((2, MMA_N, MMA_M), outer_K, outer_M)
-        auto inner_T = make_layout(get<0>(mma_inner), get<2>(mma_inner), get<1>(mma_inner));
-        auto final_layout = make_layout(inner_T, get<2>(Layout{}), get<1>(Layout{}));
-        return make_tensor(&mma_tensor(0), final_layout);
     }
+
+    // Return view with modes 1 and 2 swapped: (2, MMA_M, MMA_K) → (2, MMA_K, MMA_M)
+    auto final_layout = make_layout(get<0>(Layout{}), get<2>(Layout{}), get<1>(Layout{}));
+    return make_tensor(&tensor(0), final_layout);
 }
