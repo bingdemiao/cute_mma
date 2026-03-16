@@ -136,3 +136,24 @@ auto get_smem_atom(cute::Int<_k_width>) {
         return composition(sw, base_layout);
     }
 }
+
+// In-place 8x8 matrix transpose in registers via PTX movmatrix instruction.
+// Each thread in a warp holds one u32 (= 2 f16 values) of the 8x8 matrix.
+// After transpose, each thread's u32 holds the transposed elements.
+// Works in-place (d == a is valid, verified empirically).
+__device__ __forceinline__
+void movmatrix_trans_b16(unsigned int& reg) {
+    asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %0;" : "+r"(reg));
+}
+
+// Apply movmatrix transpose to all u32 elements in a CuTe register tensor.
+// The tensor should contain MMA fragment data arranged as 8x8 b16 matrices.
+template <class Engine, class Layout>
+__device__ __forceinline__
+void movmatrix_trans_b16(cute::Tensor<Engine, Layout>& tensor) {
+    auto* raw = reinterpret_cast<unsigned int*>(&tensor(0));
+    int n_u32 = cute::size(tensor) * sizeof(cutlass::half_t) / sizeof(unsigned int);
+    for (int i = 0; i < n_u32; ++i) {
+        movmatrix_trans_b16(raw[i]);
+    }
+}
