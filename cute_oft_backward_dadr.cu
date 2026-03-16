@@ -87,7 +87,9 @@ bwd_dadr_kernel(
     auto sB_layout = tile_to_shape(sB_atom, make_shape(Int<BLK_K>{}, Int<BLK_N>{}, _2{}));
     auto sA_layout = tile_to_shape(get_smem_atom(Int<BLK_K>{}), make_shape(Int<BLK_M>{}, Int<BLK_K>{}));
     auto sR_layout = tile_to_shape(get_smem_atom(Int<BLK_K>{}), make_shape(Int<rs>{}, Int<BLK_K>{}, _2{}));
-    auto sDH_exch_layout = make_layout(make_shape(Int<BLK_M>{}, Int<BLK_K>{}), LayoutRight{});
+    // sDH_exch uses same swizzle as sA for make_tiled_copy_C compatibility
+    auto sDH_exch_layout = tile_to_shape(get_smem_atom(Int<BLK_K>{}),
+        make_shape(Int<BLK_M>{}, Int<BLK_K>{}));
     constexpr int sDR_acc_elems = rs * BLK_K;
 
     extern __shared__ half_t smem_raw[];
@@ -321,13 +323,11 @@ bwd_dadr_kernel(
                     copy(cons_s2r_A{}, tXsDH_rb, tXrA_dA);
 
                     // LDSM load B-operand (R) via tiled sub-view
-                    // For reconn dA: B[n=j, k=i] = R^T[j,i] = R[i,j] = sR(i, k_off+j)
-                    // sR(rs, BLK_K) → tiled by rs → sub at rb_idx gives (rs, rs)
-                    // This sub-view maps B[n, k] → sR(n, k_off+k) which is NOT the reconn convention
-                    // Reconn wants B[j, i] = sR(i, k_off+j) — transposed.
-                    // Since LDSM_N rearranges non-K-major → K-major, and the sub-view has
-                    // sR rows (N dim) with swizzled K columns, LDSM loads B in its natural form.
-                    // But the reconn convention needs a TRANSPOSED B. For this, manual load is needed.
+                    // Reconn: B[j, i] = sR(i, k_off+j) = R^T — transposed from sR's natural (rs, rs) sub-tile
+                    // LDSM loads sR sub-tile as B(N=rs, K=rs), but the reconn convention swaps indices.
+                    // For rs=8 with SM80_16x8x8: the B-operand is 8×8, loaded by LDSM_N which rearranges
+                    // from N-major to K-major. The reconn convention effectively transposes R, which means
+                    // LDSM would load the wrong element mapping. Manual load needed for transposed R.
                     auto tBdA_id_reconn = cons_thr.partition_B(
                         make_identity_tensor(make_shape(Int<rs>{}, Int<rs>{})));
                     auto rB_R = cons_thr.make_fragment_B(cons_thr.partition_B(
@@ -342,17 +342,12 @@ bwd_dadr_kernel(
                     if constexpr (!GATED) {
                         gemm(cons_mma, rA_dA, rB_R, rDA[rb]);
                     } else {
-                        // AR: load sA (swizzled layout → scalar for now)
-                        auto tAdA_id_ar = cons_thr.partition_A(
-                            make_identity_tensor(make_shape(Int<WARP_M_reconn>{}, Int<rs>{})));
-                        auto rA_sA = cons_thr.make_fragment_A(cons_thr.partition_A(
-                            make_tensor(static_cast<half_t*>(nullptr),
-                                        make_layout(make_shape(Int<WARP_M_reconn>{}, Int<rs>{}), LayoutRight{}))));
-                        for (int f = 0; f < size(rA_sA); ++f) {
-                            auto coord = tAdA_id_ar(f);
-                            int mi = get<0>(coord), ki = get<1>(coord);
-                            rA_sA(f) = (mi < HALF_M) ? sA(warp_m * HALF_M + mi, blk_k_off + ki) : half_t(0);
-                        }
+                        // AR: LDSM load sA via tiled sub-view
+                        Tensor sA_rb = sA_tiled(make_coord(_, warp_m), make_coord(_, rb_idx));
+                        auto tXsA_rb = cons_s2r_a_thr.partition_S(sA_rb);
+                        auto rA_sA = cons_thr.make_fragment_A(cons_thr.partition_A(sA_rb));
+                        auto tXrA_sA = cons_s2r_a_thr.retile_D(rA_sA);
+                        copy(cons_s2r_A{}, tXsA_rb, tXrA_sA);
 
                         // R^T for AR: B[r,k] = sR(r, k_off+k)
                         // Same physical R but different access convention (swapped N/K)
