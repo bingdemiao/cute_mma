@@ -61,8 +61,16 @@ void dB_producer(
         make_tile(make_layout(Int<rs>{}), make_layout(Int<WARP_M>{}), _));
     // Shape: ((rs, n_blocks_k), (WARP_M, n_warps), bP_ar)
 
-    // R2S for AR result → transposed sub-view of sAR_pipe
-    using r2s_atom_AR = Copy_Atom<UniversalCopy<uint32_t>, half_t>;
+    // Consumer's MMA atom (f16 variant) for R2S via partition_B
+    using mma_atom_cons = std::conditional_t<(BLK_M < 16),
+        MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
+        MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
+    using mma_op_cons = std::conditional_t<(BLK_M < 16),
+        SM80_16x8x8_F16F16F16F16_TN,
+        SM80_16x8x16_F16F16F16F16_TN>;
+    auto r2s_mma = make_tiled_mma(mma_op_cons{}, Layout<Shape<_1, _1>>{},
+                                   Tile<Int<GROUP_SIZE>, Int<rs>>{});
+    auto r2s_thr_mma = r2s_mma.get_slice(lane_idx);
 
     // LDSM for A and R operands
     constexpr int a_u32 = (WARP_M * rs) / 64;
@@ -127,37 +135,29 @@ void dB_producer(
             copy(s2r_A{}, tXsA(_,_,_,kb,smem_pipe_read), tXrA);
             copy(s2r_R{}, tXsR(_,_,_,kb), tXrR);
 
-            // MMA: AR = A @ R → write to sAR_pipe via make_tiled_copy_C
-            // Use a temp (WARP_M, rs) LayoutRight buffer for R2S, then scatter to sAR_pipe
-            // sAR_temp_warp: per-warp scratch (WARP_M, rs) — reused from old sAR_temp approach
-            // We allocate it in registers and write via make_tiled_copy_C to a temp smem,
-            // then the transpose is implicit when writing to sAR_pipe.
-            //
-            // Actually: use the divided sub-view. sAR_pipe_divided at (kb, warp, pipe)
-            // gives (rs, WARP_M) in smem. Swap dimensions → (WARP_M, rs) transposed view.
-            // But swizzled strides prevent explicit stride extraction.
-            //
-            // Simplest correct approach: write AR to per-warp rows of sAR_pipe
-            // using coordinate-based copy (make_tiled_copy_C + partition_C identity).
+            // MMA: AR[WARP_M, rs] = A @ R^T
             auto rAR = thr_mma_ar.make_fragment_C(thr_mma_ar.partition_C(
                 make_tensor(static_cast<half_t*>(nullptr),
                     make_layout(make_shape(Int<WARP_M>{}, Int<rs>{}), LayoutRight{}))));
             clear(rAR);
             gemm(mma_ar, rA_frag, rR_frag, rAR);
 
-            // TODO(LDSM): Write AR to sAR_pipe via make_tiled_copy_C to a transposed
-            // sub-view. Currently uses scalar coordinate loop because the swizzled
-            // sAR_pipe layout doesn't allow stride extraction for transposed views.
-            // Fix: use a non-swizzled sAR_pipe or find a CuTe-compatible transpose.
+            // Transpose AR in registers and write to sAR_pipe:
+            // blocken_C → inplace_transpose → construct_B → partition_B → auto-vectorized copy
             {
-                auto tCid_ar = thr_mma_ar.partition_C(
-                    make_identity_tensor(make_shape(Int<WARP_M>{}, Int<rs>{})));
-                for (int f = 0; f < size(rAR); ++f) {
-                    auto coord = tCid_ar(f);
-                    int mi = get<0>(coord), ri = get<1>(coord);
-                    if (mi < WARP_M && ri < rs)
-                        sAR_pipe(kb * rs + ri, warp_idx * WARP_M + mi, ar_pipe_write) = rAR(f);
-                }
+                auto blocked = blocken_operand_C<mma_atom_ar>(rAR);
+                auto transposed = inplace_transpose(blocked);
+                auto rB = construct_operand_B<mma_atom_cons>(transposed);
+
+                // partition_B on smem sub-view → per-thread smem addresses matching rB shape
+                auto sAR_sub = local_tile(
+                    sAR_pipe(_, _, ar_pipe_write),
+                    make_tile(Int<rs>{}, Int<WARP_M>{}),
+                    make_coord(kb, warp_idx));
+                auto thr_sB = r2s_thr_mma.partition_B(sAR_sub);
+
+                // CuTe auto-vectorizing copy (register → smem)
+                copy(rB, thr_sB);
             }
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
 
@@ -348,15 +348,18 @@ dB_pc_kernel(
 
     auto sA_layout = tile_to_shape(smem_k, make_shape(Int<BLK_M>{}, Int<BLK_K>{}, Int<bP_a>{}));
     auto sR_layout = tile_to_shape(smem_k, make_shape(Int<rs>{}, Int<BLK_K>{}));
-    // sAR_pipe: (BLK_K, BLK_M, bP_ar) — no swizzle, same as forward kernel's sAR.
-    // get_smem_atom<false> provides the base layout without swizzle composition.
-    auto sAR_pipe_layout = tile_to_shape(get_smem_atom<false>(Int<BLK_M>{}),
+    // sAR_pipe: (BLK_K, BLK_M, bP_ar) — no swizzle.
+    // Atom width = WARP_M (not BLK_M) so per-warp sub-views are atom-aligned
+    // for both producer R2S and consumer LDSM.
+    constexpr int n_prod_warps = size(wlp_t{});
+    constexpr int WARP_M_k = BLK_M / n_prod_warps;
+    auto sAR_pipe_layout = tile_to_shape(get_smem_atom<false>(Int<WARP_M_k>{}),
         make_shape(Int<BLK_K>{}, Int<BLK_M>{}, Int<bP_ar>{}));
-    // sdCt unchanged
+    // sdCt: column-major layout for transposed dC. Atom width = gs.
     auto sdCt_atom = composition(
         Swizzle<3, 3, 3>{},
-        make_layout(make_shape(_64{}, _8{}),
-                    make_stride(_1{}, _64{})));
+        make_layout(make_shape(Int<gs>{}, _8{}),
+                    make_stride(Int<1>{}, Int<gs>{})));
     auto sdCt_layout = tile_to_shape(sdCt_atom, make_shape(Int<gs>{}, Int<BLK_M>{}, Int<bP_dc>{}));
 
     extern __shared__ half_t smem_raw[];
@@ -418,7 +421,8 @@ void oft_backward_dB_launch(
                 + BLK_M * BLK_K * bP_ar      // sAR_pipe (replaces sAR_temp + sARt)
                 + cosize(tile_to_shape(
                     composition(Swizzle<3,3,3>{},
-                                make_layout(make_shape(_64{}, _8{}), make_stride(_1{}, _64{}))),
+                                make_layout(make_shape(cute::Int<gs>{}, _8{}),
+                                            make_stride(cute::Int<gs>{}, cute::Int<1>{}))),
                     make_shape(cute::Int<gs>{}, cute::Int<BLK_M>{}, cute::Int<bP_dc>{}))))
                * sizeof(half_t) + 256;
 

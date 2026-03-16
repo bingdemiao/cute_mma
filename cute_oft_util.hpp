@@ -181,3 +181,243 @@ auto inplace_transpose(cute::Tensor<Engine, Layout>& tensor) {
     auto final_layout = make_layout(get<0>(Layout{}), get<2>(Layout{}), get<1>(Layout{}));
     return make_tensor(&tensor(0), final_layout);
 }
+
+// Store a blockened register tensor (2, dim1_blocks, dim2_blocks) to a 2D smem tensor.
+//
+// Within each 8x8 block, the MMA C-fragment distribution is:
+//   thread t holds row (t/4), columns (t%4)*2 and (t%4)*2+1
+// This matches both the original C-fragment and the post-movmatrix layout.
+//
+// The smem tensor must have shape (dim1_blocks*8, dim2_blocks*8) with any layout.
+// Addressing goes through the smem tensor's indexing to handle swizzled/non-RowMajor layouts.
+template <class RegEngine, class RegLayout, class SmemEngine, class SmemLayout>
+__device__ __forceinline__
+void store_blocks_to_smem(const cute::Tensor<RegEngine, RegLayout>& tensor,
+                          cute::Tensor<SmemEngine, SmemLayout>& smem,
+                          int lane_idx) {
+    using namespace cute;
+    static_assert(rank(RegLayout{}) == _3{}, "Expected shape (2, dim1_blocks, dim2_blocks)");
+    static_assert(size<0>(RegLayout{}) == _2{}, "Mode 0 must be 2 (one u32 = 2 f16)");
+
+    int row_in_block = lane_idx / 4;
+    int col_pair     = lane_idx % 4;
+
+    #pragma unroll
+    for (int b1 = 0; b1 < size<1>(RegLayout{}); ++b1) {
+        #pragma unroll
+        for (int b2 = 0; b2 < size<2>(RegLayout{}); ++b2) {
+            int smem_row = b1 * 8 + row_in_block;
+            int smem_col = b2 * 8 + col_pair * 2;
+            smem(smem_row, smem_col)     = tensor(0, b1, b2);
+            smem(smem_row, smem_col + 1) = tensor(1, b1, b2);
+        }
+    }
+}
+
+// Helper: build atom inner layout from (halves, mma_dim, mma_k) sub-layouts,
+// dropping size-1 modes to match CuTe's MMA fragment convention.
+// E.g. (2, 2, 1) → (2, 2);  (2, 1, 2) → (2, 2);  (2, 2, 2) → (2, 2, 2);  (2, 1, 1) → (2)
+template <class L_halves, class L_dim, class L_k>
+CUTE_HOST_DEVICE constexpr auto make_atom_inner(L_halves l_h, L_dim l_d, L_k l_k) {
+    using namespace cute;
+    if constexpr (size(L_dim{}) == 1 && size(L_k{}) == 1) {
+        return l_h;
+    } else if constexpr (size(L_dim{}) == 1) {
+        return make_layout(l_h, l_k);
+    } else if constexpr (size(L_k{}) == 1) {
+        return make_layout(l_h, l_d);
+    } else {
+        return make_layout(l_h, l_d, l_k);
+    }
+}
+
+// Blocken MMA A-operand fragment back to (2, M_blocks, K_blocks) for inplace_transpose.
+// Inverse of construct_operand_A: merges per-atom sub-modes back into flat block dimensions.
+//
+// Input:  ((2, [MMA_M], [MMA_K]), outer_M, outer_K) — from CuTe fragment or construct_operand_A
+// Output: (2, MMA_M * outer_M, MMA_K * outer_K)
+template <class MMA_ATOM, class Engine, class Layout>
+__device__ __forceinline__
+auto blocken_operand_A(cute::Tensor<Engine, Layout>& tensor) {
+    using namespace cute;
+    static_assert(rank(Layout{}) == _3{}, "Expected rank-3 fragment");
+    static_assert(sizeof(typename Engine::value_type) == 2, "Value type must be 16-bit");
+
+    using atom_shape = typename MMA_ATOM::Shape_MNK;
+    constexpr int MMA_M = get<0>(atom_shape{}) / 8;
+    constexpr int MMA_K = get<2>(atom_shape{}) / 8;
+
+    auto dl = tensor.layout();
+    if constexpr (MMA_M == 1 && MMA_K == 1) {
+        // inner is (2), modes 1,2 are already the full block dims
+        return tensor;
+    } else if constexpr (MMA_K == 1) {
+        // inner is (2, MMA_M) → merge MMA_M with outer_M
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),                                // halves
+            make_layout(get<0,1>(dl), get<1>(dl)),       // (MMA_M, outer_M)
+            get<2>(dl)                                   // outer_K
+        ));
+    } else if constexpr (MMA_M == 1) {
+        // inner is (2, MMA_K) → merge MMA_K with outer_K
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),                                // halves
+            get<1>(dl),                                  // outer_M
+            make_layout(get<0,1>(dl), get<2>(dl))        // (MMA_K, outer_K)
+        ));
+    } else {
+        // inner is (2, MMA_M, MMA_K) → merge both
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),                                    // halves
+            make_layout(get<0,1>(dl), get<1>(dl)),           // (MMA_M, outer_M)
+            make_layout(get<0,2>(dl), get<2>(dl))            // (MMA_K, outer_K)
+        ));
+    }
+}
+
+// Blocken MMA B-operand fragment back to (2, N_blocks, K_blocks) for inplace_transpose.
+// Inverse of construct_operand_B: merges per-atom sub-modes back into flat block dimensions.
+//
+// Input:  ((2, [MMA_N], [MMA_K]), outer_N, outer_K) — from CuTe fragment or construct_operand_B
+// Output: (2, MMA_N * outer_N, MMA_K * outer_K)
+template <class MMA_ATOM, class Engine, class Layout>
+__device__ __forceinline__
+auto blocken_operand_B(cute::Tensor<Engine, Layout>& tensor) {
+    using namespace cute;
+    static_assert(rank(Layout{}) == _3{}, "Expected rank-3 fragment");
+    static_assert(sizeof(typename Engine::value_type) == 2, "Value type must be 16-bit");
+
+    using atom_shape = typename MMA_ATOM::Shape_MNK;
+    constexpr int MMA_N = get<1>(atom_shape{}) / 8;
+    constexpr int MMA_K = get<2>(atom_shape{}) / 8;
+
+    auto dl = tensor.layout();
+    if constexpr (MMA_N == 1 && MMA_K == 1) {
+        return tensor;
+    } else if constexpr (MMA_K == 1) {
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),
+            make_layout(get<0,1>(dl), get<1>(dl)),
+            get<2>(dl)
+        ));
+    } else if constexpr (MMA_N == 1) {
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),
+            get<1>(dl),
+            make_layout(get<0,1>(dl), get<2>(dl))
+        ));
+    } else {
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),
+            make_layout(get<0,1>(dl), get<1>(dl)),
+            make_layout(get<0,2>(dl), get<2>(dl))
+        ));
+    }
+}
+
+// Blocken MMA C-operand fragment back to (2, M_blocks, N_blocks) for inplace_transpose.
+// C-fragment has dimensions (M, N), with MMA_M = M_atom/8, MMA_N = N_atom/8.
+//
+// Input:  ((2, [MMA_M], [MMA_N]), outer_M, outer_N) — from CuTe C-fragment
+// Output: (2, MMA_M * outer_M, MMA_N * outer_N)
+template <class MMA_ATOM, class Engine, class Layout>
+__device__ __forceinline__
+auto blocken_operand_C(cute::Tensor<Engine, Layout>& tensor) {
+    using namespace cute;
+    static_assert(rank(Layout{}) == _3{}, "Expected rank-3 fragment");
+    static_assert(sizeof(typename Engine::value_type) == 2, "Value type must be 16-bit");
+
+    using atom_shape = typename MMA_ATOM::Shape_MNK;
+    constexpr int MMA_M = get<0>(atom_shape{}) / 8;
+    constexpr int MMA_N = get<1>(atom_shape{}) / 8;
+
+    auto dl = tensor.layout();
+    if constexpr (MMA_M == 1 && MMA_N == 1) {
+        return tensor;
+    } else if constexpr (MMA_N == 1) {
+        // inner is (2, MMA_M) → merge MMA_M with outer_M
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),                                // halves
+            make_layout(get<0,1>(dl), get<1>(dl)),       // (MMA_M, outer_M)
+            get<2>(dl)                                   // outer_N
+        ));
+    } else if constexpr (MMA_M == 1) {
+        // inner is (2, MMA_N) → merge MMA_N with outer_N
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),                                // halves
+            get<1>(dl),                                  // outer_M
+            make_layout(get<0,1>(dl), get<2>(dl))        // (MMA_N, outer_N)
+        ));
+    } else {
+        // inner is (2, MMA_M, MMA_N) → merge both
+        return make_tensor(tensor.data(), make_layout(
+            get<0,0>(dl),                                    // halves
+            make_layout(get<0,1>(dl), get<1>(dl)),           // (MMA_M, outer_M)
+            make_layout(get<0,2>(dl), get<2>(dl))            // (MMA_N, outer_N)
+        ));
+    }
+}
+
+// Construct MMA A-operand from a block tensor of shape (2, M_blocks, K_blocks).
+// Groups 8x8 blocks into atom-sized chunks matching MMA_ATOM's A-operand layout.
+//
+// MMA_ATOM's A-operand has (M_atom, K_atom) = (16, K_atom). In 8x8 blocks:
+//   MMA_M = M_atom / 8 = 2,  MMA_K = K_atom / 8
+//
+// Input:  (2, total_M_blocks, total_K_blocks)
+// Output: ((2, [MMA_M], [MMA_K]), outer_M, outer_K) — size-1 modes dropped
+template <class MMA_ATOM, class Engine, class Layout>
+__device__ __forceinline__
+auto construct_operand_A(cute::Tensor<Engine, Layout>& tensor) {
+    using namespace cute;
+    static_assert(rank(Layout{}) == _3{}, "Expected shape (2, M_blocks, K_blocks)");
+    static_assert(size<0>(Layout{}) == _2{}, "Mode 0 must be 2 (one u32 = 2 f16)");
+    static_assert(sizeof(typename Engine::value_type) == 2, "Value type must be 16-bit");
+
+    // Get atom A shape: (M_atom, K_atom) in elements, convert to 8x8 blocks
+    using atom_shape = typename MMA_ATOM::Shape_MNK;
+    constexpr int MMA_M = get<0>(atom_shape{}) / 8;  // 16/8 = 2 for SM80
+    constexpr int MMA_K = get<2>(atom_shape{}) / 8;  // 8/8=1 or 16/8=2
+
+    // Divide M and K block dimensions by per-atom block counts
+    auto divided = logical_divide(tensor,
+        make_tile(_, make_layout(Int<MMA_M>{}), make_layout(Int<MMA_K>{})));
+    // Shape: (2, (MMA_M, outer_M), (MMA_K, outer_K))
+
+    // Build atom inner layout: (2, [MMA_M], [MMA_K]) with size-1 modes dropped
+    auto dl = divided.layout();
+    auto atom_inner = make_atom_inner(get<0>(dl), get<1,0>(dl), get<2,0>(dl));
+    return make_tensor(divided.data(), make_layout(atom_inner, get<1,1>(dl), get<2,1>(dl)));
+}
+
+// Construct MMA B-operand from a block tensor of shape (2, N_blocks, K_blocks).
+// Groups 8x8 blocks into atom-sized chunks matching MMA_ATOM's B-operand layout.
+//
+// MMA_ATOM's B-operand has (N_atom, K_atom) = (8, K_atom). In 8x8 blocks:
+//   MMA_N = N_atom / 8 = 1,  MMA_K = K_atom / 8
+//
+// Input:  (2, total_N_blocks, total_K_blocks)
+// Output: ((2, [MMA_N], [MMA_K]), outer_N, outer_K) — size-1 modes dropped
+template <class MMA_ATOM, class Engine, class Layout>
+__device__ __forceinline__
+auto construct_operand_B(cute::Tensor<Engine, Layout>& tensor) {
+    using namespace cute;
+    static_assert(rank(Layout{}) == _3{}, "Expected shape (2, N_blocks, K_blocks)");
+    static_assert(size<0>(Layout{}) == _2{}, "Mode 0 must be 2 (one u32 = 2 f16)");
+    static_assert(sizeof(typename Engine::value_type) == 2, "Value type must be 16-bit");
+
+    // Get atom B shape: (N_atom, K_atom) in elements, convert to 8x8 blocks
+    using atom_shape = typename MMA_ATOM::Shape_MNK;
+    constexpr int MMA_N = get<1>(atom_shape{}) / 8;  // 8/8 = 1 for SM80
+    constexpr int MMA_K = get<2>(atom_shape{}) / 8;  // 8/8=1 or 16/8=2
+
+    // Divide N and K block dimensions by per-atom block counts
+    auto divided = logical_divide(tensor,
+        make_tile(_, make_layout(Int<MMA_N>{}), make_layout(Int<MMA_K>{})));
+    // Shape: (2, (MMA_N, outer_N), (MMA_K, outer_K))
+
+    // Build atom inner layout: (2, [MMA_N], [MMA_K]) with size-1 modes dropped
+    auto dl = divided.layout();
+    auto atom_inner = make_atom_inner(get<0>(dl), get<1,0>(dl), get<2,0>(dl));
+    return make_tensor(divided.data(), make_layout(atom_inner, get<1,1>(dl), get<2,1>(dl)));
+}
