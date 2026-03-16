@@ -246,8 +246,7 @@ void dB_consumer(
     auto rDCt = thr_mma.make_fragment_A(thr_mma.partition_A(sdCt(_,_,_0{})));
     auto tXrdCt = s2r_a_thr.retile_D(rDCt);
 
-    // B-operand from sAR_pipe: (BLK_K, BLK_M, bP_ar) — same layout as old sARt
-    // LDSM_N loads B-operand directly
+    // B-operand from sAR_pipe: (BLK_K, BLK_M, bP_ar) with smem_m swizzle
     using s2r_atom_b = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
     auto s2r_b = make_tiled_copy_B(s2r_atom_b{}, mma);
     auto s2r_b_thr = s2r_b.get_slice(lane_idx + warp_idx * 32);
@@ -349,9 +348,8 @@ dB_pc_kernel(
 
     auto sA_layout = tile_to_shape(smem_k, make_shape(Int<BLK_M>{}, Int<BLK_K>{}, Int<bP_a>{}));
     auto sR_layout = tile_to_shape(smem_k, make_shape(Int<rs>{}, Int<BLK_K>{}));
-    // sAR_pipe: (BLK_K, BLK_M, bP_ar) — same orientation as old sARt but filled
-    // directly by make_tiled_copy_C without explicit transpose loop.
-    // Uses smem_m swizzle for LDSM-compatible B-operand access.
+    // sAR_pipe: (BLK_K, BLK_M, bP_ar) — uses smem_m swizzle for LDSM compatibility.
+    // LDSM requires specific stride patterns that plain LayoutRight doesn't satisfy.
     auto smem_m = get_smem_atom(Int<BLK_M>{});
     auto sAR_pipe_layout = tile_to_shape(smem_m,
         make_shape(Int<BLK_K>{}, Int<BLK_M>{}, Int<bP_ar>{}));
