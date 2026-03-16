@@ -349,8 +349,10 @@ bwd_dadr_kernel(
                     auto tXrA_dA = cons_s2r_a_thr.retile_D(rA_dA);
                     copy(cons_s2r_A{}, tXsDH_rb, tXrA_dA);
 
-                    // R B-operand: reconn wants B[j,i] = sR(i, k_off+j) = R^T
-                    // Transposed access from swizzled sR — scalar load
+                    // TODO(LDSM): R reconn B-operand uses transposed access B[j,i]=sR(i,k_off+j).
+                    // Needs LDSM load of natural sR sub-tile + movmatrix to transpose.
+                    // Challenge: fragment dimension swap between load MMA and compute MMA
+                    // (dr_load ((2,2),M_atoms,1) vs dr_mma ((2,2),1,K_atoms) layout mismatch).
                     Tensor sR_rb = sR_tiled(_, make_coord(_, rb_idx), r_pipe_r);
                     auto tBdA_id_reconn = cons_thr.partition_B(
                         make_identity_tensor(make_shape(Int<rs>{}, Int<rs>{})));
@@ -435,8 +437,11 @@ bwd_dadr_kernel(
                     auto rDR = dr_thr.make_fragment_C(dr_thr.partition_C(dr_C_dummy));
                     clear(rDR);
 
-                    // dR operands: transposed access from sDH_exch and sA
-                    // A[i, k] = sDH_exch[k, blk_k_off + i], B[j, k] = sA[k, blk_k_off + j]
+                    // TODO(LDSM): dR operands use transposed access A[i,k]=sDH[k,k_off+i],
+                    // B[j,k]=sA[k,k_off+j]. Needs LDSM load of (BLK_M,rs) natural orientation
+                    // + movmatrix per 8x8 sub-block + fragment dimension swap (M-atoms→K-atoms).
+                    // Challenge: dr_load fragment ((2,2),4,1) has 16 elems but dr_mma fragment
+                    // ((2,2),1,4+phantom) has 32 elems due to M<atom_M padding.
                     auto rA_dr2 = dr_thr.make_fragment_A(dr_thr.partition_A(dr_A_dummy));
                     auto rB_dr2 = dr_thr.make_fragment_B(dr_thr.partition_B(dr_B_dummy));
                     for (int f = 0; f < size(rA_dr2); ++f) {
