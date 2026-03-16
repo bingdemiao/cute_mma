@@ -336,9 +336,12 @@ bwd_dadr_kernel(
                 // Write rDH sub-fragment to sDH_exch (ALL warps write simultaneously)
                 copy(r2s_c_atom{}, tXrDH_c(_,_,rb), tXsDH_c(_,_,rb));
 
-                // Must sync ALL warps: make_tiled_copy_C distributes the full
-                // (BLK_M, BLK_K) tile across all threads, so every warp writes
-                // to sDH_exch. Pairwise sync is insufficient.
+                // TODO(pairwise_sync): Currently __syncthreads because the swizzled
+                // sDH_exch layout (get_smem_atom(BLK_K)) causes physical address aliasing
+                // across column pairs — a warp's logical_divide sub-view at its own K range
+                // reads physical smem addresses written by other column pairs' warps.
+                // To restore pairwise bar.sync: use a column-pair-aligned swizzle atom
+                // (width = 2*rs = 16 instead of BLK_K = 64), or separate smem per pair.
                 __syncthreads();
 
                 // --- dA ---
@@ -426,6 +429,9 @@ bwd_dadr_kernel(
                             store_half2(sDH_exch(gm0, blk_k_off + ri0),
                                         sDH_exch(gm1, blk_k_off + ri1), dS);
                         }
+                        // TODO(pairwise_sync): same swizzle aliasing issue as above.
+                        // Step B writes only to own K-column slice, but swizzled addresses
+                        // may overlap with other pairs' read regions.
                         __syncthreads();
 
                         // Step C: reload dS from sDH_exch via LDSM
@@ -469,6 +475,8 @@ bwd_dadr_kernel(
                     }
                 }
 
+                // TODO(pairwise_sync): this sync guards the next iteration's
+                // make_tiled_copy_C write. Same swizzle aliasing issue.
                 __syncthreads();
             }
 
