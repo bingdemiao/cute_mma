@@ -333,10 +333,13 @@ bwd_dadr_kernel(
             for (int rb = 0; rb < reconn_per_col; ++rb) {
                 int blk_k_off = col_k_base + rb * col_k_stride;
 
-                // Write rDH sub-fragment to sDH_exch
+                // Write rDH sub-fragment to sDH_exch (ALL warps write simultaneously)
                 copy(r2s_c_atom{}, tXrDH_c(_,_,rb), tXsDH_c(_,_,rb));
 
-                asm volatile("bar.sync %0, 64;\n" : : "r"(pair_bar));
+                // Must sync ALL warps: make_tiled_copy_C distributes the full
+                // (BLK_M, BLK_K) tile across all threads, so every warp writes
+                // to sDH_exch. Pairwise sync is insufficient.
+                __syncthreads();
 
                 // --- dA ---
                 {
@@ -423,7 +426,7 @@ bwd_dadr_kernel(
                             store_half2(sDH_exch(gm0, blk_k_off + ri0),
                                         sDH_exch(gm1, blk_k_off + ri1), dS);
                         }
-                        asm volatile("bar.sync %0, 64;\n" : : "r"(pair_bar));
+                        __syncthreads();
 
                         // Step C: reload dS from sDH_exch via LDSM
                         // sDH_rb still points to the right sub-view (Step B wrote in-place)
@@ -466,10 +469,9 @@ bwd_dadr_kernel(
                     }
                 }
 
-                asm volatile("bar.sync %0, 64;\n" : : "r"(pair_bar));
+                __syncthreads();
             }
 
-            __syncthreads();
 
             {
                 int dR_rows = n_groups * rs;
