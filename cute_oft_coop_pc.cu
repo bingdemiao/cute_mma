@@ -195,42 +195,22 @@ void oft_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
                                 :
                                 : "r"(ar_pipe_write + K_PIPE2_MAX), "n"(n_threads_total)); // wait for the previous data to be consumed
 
-            copy(r2s_atom_AR{}, tXrAR, tXsAR(_,_,_,_,ar_pipe_write));
-
 #if OFT_GATED
-            // Apply SiLU gating in smem: sAR(m,c) = sA(m,a_col) * SiLU(sAR(m,c))
-            // Uses packed f16x2 + tanh.approx.f16x2:
-            //   sigma = 0.5*(1+tanh(ar*0.5)), silu = ar*sigma
-            asm volatile("bar.sync 14, %0;\n" : : "n"(n_threads1)); // ensure r2s complete
+            // Apply SiLU gating in registers: AR = A * SiLU(AR)
+            // A and C fragments have identical (M, K=N) element-to-thread mapping,
+            // so corresponding elements share the same (m, k=n) position.
+            // The innermost mode (size 2, stride 1) is a packed __half2.
             {
-                constexpr int n_grp = decltype(n_groups)::value;
-                constexpr int n_cb = decltype(c_blocks)::value;
-                constexpr int rs = decltype(reconn_sz)::value;
-                constexpr int blk_m = decltype(size<0>(sAR))::value;
-                constexpr int total = blk_m * rs * n_cb * n_grp;
-                // sAR column c maps to (r, b, g) via producer_layout_n strides:
-                //   g = c % n_grp, b = (c / n_grp) % n_cb, r = c / (n_cb * n_grp)
-                // Corresponding sA column: j * c_width + b * rs + r
-                for (int idx = 2 * thread_idx; idx < total; idx += 2 * n_threads1) {
-                    int m0 = idx / (rs * n_cb * n_grp);
-                    int c0 = idx % (rs * n_cb * n_grp);
-                    int g0 = c0 % n_grp, b0 = (c0 / n_grp) % n_cb, r0 = c0 / (n_cb * n_grp);
-                    int a_col0 = j * rs * n_cb + r0 * n_cb + b0;
-                    int m1 = (idx + 1) / (rs * n_cb * n_grp);
-                    int c1 = (idx + 1) % (rs * n_cb * n_grp);
-                    int g1 = c1 % n_grp, b1 = (c1 / n_grp) % n_cb, r1 = c1 / (n_cb * n_grp);
-                    int a_col1 = j * rs * n_cb + r1 * n_cb + b1;
-                    __half2 ar2 = load_half2(sAR(m0, c0, ar_pipe_write),
-                                             sAR(m1, c1, ar_pipe_write));
-                    __half2 a2 = load_half2(sA(m0, a_col0, smem_pipe_read),
-                                            sA(m1, a_col1, smem_pipe_read));
-                    __half2 result = __hmul2(a2, silu_h2(ar2));
-                    store_half2(sAR(m0, c0, ar_pipe_write),
-                                sAR(m1, c1, ar_pipe_write), result);
+                constexpr int frag_sz = decltype(size(tCrAR))::value;
+                #pragma unroll
+                for (int i = 0; i < frag_sz; i += 2) {
+                    auto& ar2 = reinterpret_cast<__half2&>(tCrAR(i));
+                    auto& a2  = reinterpret_cast<const __half2&>(tCrA(i));
+                    ar2 = __hmul2(a2, silu_h2(ar2));
                 }
             }
-            asm volatile("bar.sync 14, %0;\n" : : "n"(n_threads1)); // ensure gating complete
 #endif
+            copy(r2s_atom_AR{}, tXrAR, tXsAR(_,_,_,_,ar_pipe_write));
             asm volatile("bar.arrive %0, %1;\n"
                                 :
                                 : "r"(ar_pipe_write), "n"(n_threads_total)); // signal that the data is ready

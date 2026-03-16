@@ -215,6 +215,7 @@ bwd_dadr_kernel(
         make_tensor(static_cast<half_t*>(nullptr),
                     make_layout(make_shape(Int<WARP_M_reconn>{}, Int<rs>{}), LayoutRight{})))));
     frag_c_type rDA[reconn_per_col];
+    #pragma unroll
     for (int i = 0; i < reconn_per_col; ++i) clear(rDA[i]);
 
     // === dR MMA: K=BLK_M reduction, only warp_m=0 computes ===
@@ -330,6 +331,7 @@ bwd_dadr_kernel(
             __syncthreads();
 
             // === Per-column-pair reconn block loop ===
+            #pragma unroll
             for (int rb = 0; rb < reconn_per_col; ++rb) {
                 int blk_k_off = col_k_base + rb * col_k_stride;
 
@@ -355,21 +357,21 @@ bwd_dadr_kernel(
                     auto tXrA_dA = cons_s2r_a_thr.retile_D(rA_dA);
                     copy(cons_s2r_A{}, tXsDH_rb, tXrA_dA);
 
-                    // TODO(LDSM): R reconn B-operand uses transposed access B[j,i]=sR(i,k_off+j).
-                    // Needs LDSM load of natural sR sub-tile + movmatrix to transpose.
-                    // Challenge: fragment dimension swap between load MMA and compute MMA
-                    // (dr_load ((2,2),M_atoms,1) vs dr_mma ((2,2),1,K_atoms) layout mismatch).
+                    // R reconn B-operand: LDSM natural load + movmatrix transpose
+                    // B[n,k] = sR(k, k_off+n) — transposed access
+                    // Load sR_rb naturally as B-fragment, then blocken → transpose → construct_B
                     Tensor sR_rb = sR_tiled(_, make_coord(_, rb_idx), r_pipe_r);
-                    auto tBdA_id_reconn = cons_thr.partition_B(
-                        make_identity_tensor(make_shape(Int<rs>{}, Int<rs>{})));
-                    auto rB_R = cons_thr.make_fragment_B(cons_thr.partition_B(
-                        make_tensor(static_cast<half_t*>(nullptr),
-                                    make_layout(make_shape(Int<rs>{}, Int<rs>{}), LayoutRight{}))));
-                    for (int f = 0; f < size(rB_R); ++f) {
-                        auto coord = tBdA_id_reconn(f);
-                        int ni = get<0>(coord), ki = get<1>(coord);
-                        rB_R(f) = sR(ki, blk_k_off + ni, r_pipe_r);
-                    }
+                    auto tXsR_reconn = cons_s2r_b_thr.partition_S(sR_rb);
+                    auto rB_R_nat = cons_thr.make_fragment_B(cons_thr.partition_B(sR_rb));
+                    auto tXrB_R_nat = cons_s2r_b_thr.retile_D(rB_R_nat);
+                    copy(cons_s2r_B{}, tXsR_reconn, tXrB_R_nat);
+                    // Transpose in registers: B[n,k]=sR(n,k) → B[n,k]=sR(k,n)
+                    using cons_mma_atom_f16 = std::conditional_t<(rs < 16),
+                        MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
+                        MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
+                    auto blocked_R = blocken_operand_B<cons_mma_atom_f16>(rB_R_nat);
+                    auto transposed_R = inplace_transpose(blocked_R);
+                    auto rB_R = construct_operand_B<cons_mma_atom_f16>(transposed_R);
 
                     if constexpr (!GATED) {
                         gemm(cons_mma, rA_dA, rB_R, rDA[rb]);
@@ -393,12 +395,14 @@ bwd_dadr_kernel(
                         constexpr int n_frag = decltype(size(rAR))::value;
                         constexpr int n_pairs = n_frag / 2;
                         __half2 rSigma[n_pairs], rAR_h2[n_pairs];
+                        #pragma unroll
                         for (int pp = 0; pp < n_pairs; ++pp) {
                             rAR_h2[pp] = __floats2half2_rn(rAR(pp * 2), rAR(pp * 2 + 1));
                             rSigma[pp] = sigmoid_h2(rAR_h2[pp]);
                         }
 
                         // Step A
+                        #pragma unroll
                         for (int pp = 0; pp < n_pairs; ++pp) {
                             int idx = pp * 2;
                             auto c0 = tCdA_id(idx), c1 = tCdA_id(idx + 1);
@@ -413,6 +417,7 @@ bwd_dadr_kernel(
                         }
 
                         // Step B
+                        #pragma unroll
                         for (int pp = 0; pp < n_pairs; ++pp) {
                             int idx = pp * 2;
                             auto c0 = tCdA_id(idx), c1 = tCdA_id(idx + 1);
@@ -447,10 +452,9 @@ bwd_dadr_kernel(
                     clear(rDR);
 
                     // TODO(LDSM): dR operands use transposed access A[i,k]=sDH[k,k_off+i],
-                    // B[j,k]=sA[k,k_off+j]. Needs LDSM load of (BLK_M,rs) natural orientation
-                    // + movmatrix per 8x8 sub-block + fragment dimension swap (M-atoms→K-atoms).
-                    // Challenge: dr_load fragment ((2,2),4,1) has 16 elems but dr_mma fragment
-                    // ((2,2),1,4+phantom) has 32 elems due to M<atom_M padding.
+                    // B[j,k]=sA[k,k_off+j]. Fragment size mismatch between dr_load (16 elems)
+                    // and dr_mma (32 elems with phantom M-padding) prevents direct transpose.
+                    // Keeping scalar loop until a clean solution is found.
                     auto rA_dr2 = dr_thr.make_fragment_A(dr_thr.partition_A(dr_A_dummy));
                     auto rB_dr2 = dr_thr.make_fragment_B(dr_thr.partition_B(dr_B_dummy));
                     for (int f = 0; f < size(rA_dr2); ++f) {
@@ -502,6 +506,7 @@ bwd_dadr_kernel(
     }
 
     // Write dA
+    #pragma unroll
     for (int rb = 0; rb < reconn_per_col; ++rb) {
         int blk_k_off = col_k_base + rb * col_k_stride;
         for (int f = 0; f < size(rDA[rb]); ++f) {
