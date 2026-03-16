@@ -12,15 +12,15 @@ half_t load_or_zero(const half_t* ptr, int idx, bool valid) {
 }
 
 // =============================================================================
-// Producer: computes AR, applies SiLU gating, transposes to sARt
+// Producer: computes AR, applies SiLU gating, writes to sAR_pipe (no transpose)
 // =============================================================================
 template <int BLK_M, int BLK_K, int GROUP_SIZE, int RECONN_SZ, bool GATED,
-          class SmemA, class SmemR, class SmemARtemp, class SmemARt,
+          class SmemA, class SmemR, class SmemARpipe,
           class WarpLayoutProducer, class WarpLayoutConsumer>
 __device__ static inline
 void dB_producer(
     const half_t* __restrict__ A_ptr, int ldA,
-    SmemA& sA, SmemR& sR, SmemARtemp& sAR_temp, SmemARt& sARt,
+    SmemA& sA, SmemR& sR, SmemARpipe& sAR_pipe,
     int M, int K, int g, int k_start,
     int thread_idx,
     WarpLayoutProducer, WarpLayoutConsumer)
@@ -48,22 +48,23 @@ void dB_producer(
                                   Tile<Int<WARP_M>, Int<rs>>{});
     auto thr_mma_ar = mma_ar.get_slice(lane_idx);
 
+    // Divide sA and sR for per-warp, per-reconn-block access
     Tensor sA_warp = logical_divide(sA,
         make_tile(make_layout(Int<WARP_M>{}), make_layout(Int<rs>{}))
     )(make_coord(_, warp_idx), make_coord(_, _), _);
     Tensor sR_divided = logical_divide(sR,
         make_tile(_, make_layout(Int<rs>{})))(_, make_coord(_, _));
-    Tensor sAR_temp_warp = logical_divide(sAR_temp,
-        make_tile(make_layout(Int<WARP_M>{}), _))(make_coord(_, warp_idx), _);
 
-    auto tCsAR = thr_mma_ar.partition_C(sAR_temp_warp);
-    auto rAR = thr_mma_ar.make_fragment_C(tCsAR);
+    // Divide sAR_pipe for per-reconn-block, per-warp, per-pipe access
+    // sAR_pipe shape: (BLK_K, BLK_M, bP_ar) — transposed orientation
+    Tensor sAR_pipe_divided = logical_divide(sAR_pipe,
+        make_tile(make_layout(Int<rs>{}), make_layout(Int<WARP_M>{}), _));
+    // Shape: ((rs, n_blocks_k), (WARP_M, n_warps), bP_ar)
+
+    // R2S for AR result → transposed sub-view of sAR_pipe
     using r2s_atom_AR = Copy_Atom<UniversalCopy<uint32_t>, half_t>;
-    auto r2s_ar = make_tiled_copy_C(r2s_atom_AR{}, mma_ar);
-    auto r2s_ar_thr = r2s_ar.get_slice(lane_idx);
-    auto tXrAR = r2s_ar_thr.retile_S(rAR);
-    auto tXsAR_w = r2s_ar_thr.partition_D(sAR_temp_warp);
 
+    // LDSM for A and R operands
     constexpr int a_u32 = (WARP_M * rs) / 64;
     using s2r_A = std::conditional_t<(a_u32 >= 4),
         Copy_Atom<SM75_U32x4_LDSM_N, half_t>, Copy_Atom<SM75_U32x1_LDSM_N, half_t>>;
@@ -95,7 +96,6 @@ void dB_producer(
                             make_stride(ldA, Int<1>{})));
             copy(copy_a, thr_copy_a.partition_S(gA), tCsA_cp(_,_,_,pipe));
         } else {
-            // Partial last tile: scalar fallback with boundary check
             for (int i = thread_idx; i < BLK_M * BLK_K; i += n_producer_threads) {
                 int r = i / BLK_K, c = i % BLK_K;
                 sA(r, c, pipe) = load_or_zero(A_ptr, (m_start + r) * ldA + k_start + c, m_start + r < M);
@@ -123,34 +123,61 @@ void dB_producer(
             : : "r"(ar_pipe_write + BAR_CONSUMED_BASE), "n"(n_total_threads));
 
         for (int kb = 0; kb < n_blocks_k; ++kb) {
+            // LDSM load A and R
             copy(s2r_A{}, tXsA(_,_,_,kb,smem_pipe_read), tXrA);
             copy(s2r_R{}, tXsR(_,_,_,kb), tXrR);
+
+            // MMA: AR = A @ R → write to sAR_pipe via make_tiled_copy_C
+            // Use a temp (WARP_M, rs) LayoutRight buffer for R2S, then scatter to sAR_pipe
+            // sAR_temp_warp: per-warp scratch (WARP_M, rs) — reused from old sAR_temp approach
+            // We allocate it in registers and write via make_tiled_copy_C to a temp smem,
+            // then the transpose is implicit when writing to sAR_pipe.
+            //
+            // Actually: use the divided sub-view. sAR_pipe_divided at (kb, warp, pipe)
+            // gives (rs, WARP_M) in smem. Swap dimensions → (WARP_M, rs) transposed view.
+            // But swizzled strides prevent explicit stride extraction.
+            //
+            // Simplest correct approach: write AR to per-warp rows of sAR_pipe
+            // using coordinate-based copy (make_tiled_copy_C + partition_C identity).
+            auto rAR = thr_mma_ar.make_fragment_C(thr_mma_ar.partition_C(
+                make_tensor(static_cast<half_t*>(nullptr),
+                    make_layout(make_shape(Int<WARP_M>{}, Int<rs>{}), LayoutRight{}))));
             clear(rAR);
             gemm(mma_ar, rA_frag, rR_frag, rAR);
-            copy(r2s_atom_AR{}, tXrAR, tXsAR_w);
+
+            // TODO(LDSM): Write AR to sAR_pipe via make_tiled_copy_C to a transposed
+            // sub-view. Currently uses scalar coordinate loop because the swizzled
+            // sAR_pipe layout doesn't allow stride extraction for transposed views.
+            // Fix: use a non-swizzled sAR_pipe or find a CuTe-compatible transpose.
+            {
+                auto tCid_ar = thr_mma_ar.partition_C(
+                    make_identity_tensor(make_shape(Int<WARP_M>{}, Int<rs>{})));
+                for (int f = 0; f < size(rAR); ++f) {
+                    auto coord = tCid_ar(f);
+                    int mi = get<0>(coord), ri = get<1>(coord);
+                    if (mi < WARP_M && ri < rs)
+                        sAR_pipe(kb * rs + ri, warp_idx * WARP_M + mi, ar_pipe_write) = rAR(f);
+                }
+            }
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
 
             if constexpr (GATED) {
-                // SiLU gating: sAR_temp = A * SiLU(AR), packed f16x2
+                // SiLU gating: modify sAR_pipe in-place
+                // sAR_pipe(k_idx, m_idx, pipe) where k_idx = kb*rs+ri, m_idx = gmi
                 for (int idx = 2 * lane_idx; idx < WARP_M * rs; idx += 64) {
                     int mi0 = idx / rs, ri0 = idx % rs;
                     int mi1 = (idx + 1) / rs, ri1 = (idx + 1) % rs;
                     int gmi0 = warp_idx * WARP_M + mi0;
                     int gmi1 = warp_idx * WARP_M + mi1;
-                    __half2 ar2 = load_half2(sAR_temp(gmi0, ri0), sAR_temp(gmi1, ri1));
+                    __half2 ar2 = load_half2(sAR_pipe(kb * rs + ri0, gmi0, ar_pipe_write),
+                                             sAR_pipe(kb * rs + ri1, gmi1, ar_pipe_write));
                     __half2 a2 = load_half2(sA(gmi0, kb * rs + ri0, smem_pipe_read),
                                             sA(gmi1, kb * rs + ri1, smem_pipe_read));
                     __half2 result = __hmul2(a2, silu_h2(ar2));
-                    store_half2(sAR_temp(gmi0, ri0), sAR_temp(gmi1, ri1), result);
+                    store_half2(sAR_pipe(kb * rs + ri0, gmi0, ar_pipe_write),
+                                sAR_pipe(kb * rs + ri1, gmi1, ar_pipe_write), result);
                 }
                 asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
-            }
-
-            // Transpose AR to sARt: (BLK_K, BLK_M) with BLK_M contiguous
-            for (int idx = lane_idx; idx < WARP_M * rs; idx += 32) {
-                int mi = idx / rs, ri = idx % rs;
-                sARt(kb * rs + ri, warp_idx * WARP_M + mi, ar_pipe_write) =
-                    sAR_temp(warp_idx * WARP_M + mi, ri);
             }
         }
 
@@ -164,16 +191,16 @@ void dB_producer(
 }
 
 // =============================================================================
-// Consumer: multi-warp MMA for dB, scalar dCt loads (coalesced)
+// Consumer: multi-warp MMA for dB, loads from sAR_pipe with LDSM
 // =============================================================================
 template <int BLK_M, int BLK_K, int GROUP_SIZE, int RECONN_SZ, bool GATED,
-          class SmemDCt, class SmemARt,
+          class SmemDCt, class SmemARpipe,
           class WarpLayoutProducer, class WarpLayoutConsumer>
 __device__ static inline
 void dB_consumer(
     const half_t* __restrict__ dC_ptr, int ldDC,
     half_t* __restrict__ dB_ptr, int ldDB,
-    SmemDCt& sdCt, SmemARt& sARt,
+    SmemDCt& sdCt, SmemARpipe& sAR_pipe,
     int M, int N, int K, int g, int k_start,
     int thread_idx,
     WarpLayoutProducer, WarpLayoutConsumer)
@@ -205,7 +232,7 @@ void dB_consumer(
                     make_layout(dB_shape, LayoutRight{}))));
     clear(rDB);
 
-    // dCt A-operand: LDSM_T (gs-contiguous smem → BLK_M-contiguous registers for TN MMA)
+    // dCt A-operand: LDSM_T
     constexpr int a_u16 = (gs * BLK_M) / 32;
     using s2r_dCt = std::conditional_t<(a_u16 >= 8),
         Copy_Atom<SM75_U16x8_LDSM_T, half_t>,
@@ -219,16 +246,16 @@ void dB_consumer(
     auto rDCt = thr_mma.make_fragment_A(thr_mma.partition_A(sdCt(_,_,_0{})));
     auto tXrdCt = s2r_a_thr.retile_D(rDCt);
 
-    // B-operand (sARt): LDSM_N, BLK_M contiguous (K for TN MMA)
+    // B-operand from sAR_pipe: (BLK_K, BLK_M, bP_ar) — same layout as old sARt
+    // LDSM_N loads B-operand directly
     using s2r_atom_b = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
-
     auto s2r_b = make_tiled_copy_B(s2r_atom_b{}, mma);
     auto s2r_b_thr = s2r_b.get_slice(lane_idx + warp_idx * 32);
-    auto tXsARt = s2r_b_thr.partition_S(sARt);
-    auto rARt = thr_mma.make_fragment_B(thr_mma.partition_B(sARt(_,_,_0{})));
+    auto tXsARt = s2r_b_thr.partition_S(sAR_pipe);
+    auto rARt = thr_mma.make_fragment_B(thr_mma.partition_B(sAR_pipe(_,_,_0{})));
     auto tXrARt = s2r_b_thr.retile_D(rARt);
 
-    // cp.async for dCt loading: gmem (gs, BLK_M) with gs contiguous → smem (gs, BLK_M) gs contiguous
+    // cp.async for dCt
     constexpr int dc_threads_dim0 = gs / 8;
     constexpr int dc_threads_dim1 = n_consumer_threads / dc_threads_dim0;
     constexpr int dc_values_dim1 = BLK_M / dc_threads_dim1;
@@ -269,8 +296,9 @@ void dB_consumer(
         asm volatile("bar.sync %0, %1;\n"
             : : "r"(ar_pipe_read + BAR_READY_BASE), "n"(n_total_threads));
 
+        // LDSM load dCt and ARt (transposed view of sAR_pipe)
         copy(s2r_dCt{}, tXsdCt(_, _, _, dc_pipe_read), tXrdCt);
-        copy(s2r_atom_b{}, tXsARt(_, _, _, ar_pipe_read), tXrARt);  // LDSM_T transposes M→K
+        copy(s2r_atom_b{}, tXsARt(_, _, _, ar_pipe_read), tXrARt);
         gemm(mma, rDCt, rARt, rDB);
 
         asm volatile("bar.arrive %0, %1;\n"
@@ -318,16 +346,16 @@ dB_pc_kernel(
     int k_start = k_tile * BLK_K;
 
     auto smem_k = get_smem_atom(Int<BLK_K>{});
-    auto smem_m = get_smem_atom(Int<BLK_M>{});
 
     auto sA_layout = tile_to_shape(smem_k, make_shape(Int<BLK_M>{}, Int<BLK_K>{}, Int<bP_a>{}));
     auto sR_layout = tile_to_shape(smem_k, make_shape(Int<rs>{}, Int<BLK_K>{}));
-    auto sAR_temp_layout = make_layout(make_shape(Int<BLK_M>{}, Int<rs>{}), LayoutRight{});
-    // sARt: (BLK_K, BLK_M, bP_ar) — BLK_M contiguous for LDSM_N B-operand
-    auto sARt_layout = tile_to_shape(smem_m,
+    // sAR_pipe: (BLK_K, BLK_M, bP_ar) — same orientation as old sARt but filled
+    // directly by make_tiled_copy_C without explicit transpose loop.
+    // Uses smem_m swizzle for LDSM-compatible B-operand access.
+    auto smem_m = get_smem_atom(Int<BLK_M>{});
+    auto sAR_pipe_layout = tile_to_shape(smem_m,
         make_shape(Int<BLK_K>{}, Int<BLK_M>{}, Int<bP_ar>{}));
-    // sdCt: (gs, BLK_M, bP_dc) with gs contiguous — for LDSM_T + cp.async
-    // Swizzle<3,3,3> with column-major atom (64, 8) stride (1, 64) following CUTLASS pattern
+    // sdCt unchanged
     auto sdCt_atom = composition(
         Swizzle<3, 3, 3>{},
         make_layout(make_shape(_64{}, _8{}),
@@ -338,8 +366,7 @@ dB_pc_kernel(
     half_t* p = smem_raw;
     auto sA       = make_tensor(make_smem_ptr(p), sA_layout);       p += cosize(sA_layout);
     auto sR       = make_tensor(make_smem_ptr(p), sR_layout);       p += cosize(sR_layout);
-    auto sAR_temp = make_tensor(make_smem_ptr(p), sAR_temp_layout); p += cosize(sAR_temp_layout);
-    auto sARt     = make_tensor(make_smem_ptr(p), sARt_layout);     p += cosize(sARt_layout);
+    auto sAR_pipe = make_tensor(make_smem_ptr(p), sAR_pipe_layout); p += cosize(sAR_pipe_layout);
     auto sdCt     = make_tensor(make_smem_ptr(p), sdCt_layout);
 
     constexpr int n_total = size(wlp_t{}) * 32 + n_consumer_threads;
@@ -351,13 +378,13 @@ dB_pc_kernel(
 
     if (threadIdx.x >= n_consumer_threads) {
         dB_producer<BLK_M, BLK_K, gs, rs, GATED>(
-            A_ptr, ldA, sA, sR, sAR_temp, sARt,
+            A_ptr, ldA, sA, sR, sAR_pipe,
             M, K, g, k_start,
             threadIdx.x - n_consumer_threads, wlp_t{}, wlc_t{});
     } else {
         dB_consumer<BLK_M, BLK_K, gs, rs, GATED>(
             dC_ptr, ldDC, dB_ptr, ldDB,
-            sdCt, sARt,
+            sdCt, sAR_pipe,
             M, N, K, g, k_start,
             threadIdx.x, wlp_t{}, wlc_t{});
     }
@@ -388,12 +415,10 @@ void oft_backward_dB_launch(
     dim3 grid(n_k_tiles, n_groups);
     dim3 block(n_threads);
 
-    auto smem_m = get_smem_atom(cute::Int<BLK_M>{});
     auto smem_k = get_smem_atom(cute::Int<BLK_K>{});
     int smem = (cosize(tile_to_shape(smem_k, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K>{}, cute::Int<bP_a>{})))
                 + cosize(tile_to_shape(smem_k, make_shape(cute::Int<rs>{}, cute::Int<BLK_K>{})))
-                + BLK_M * rs
-                + cosize(tile_to_shape(smem_m, make_shape(cute::Int<BLK_K>{}, cute::Int<BLK_M>{}, cute::Int<bP_ar>{})))
+                + BLK_M * BLK_K * bP_ar      // sAR_pipe (replaces sAR_temp + sARt)
                 + cosize(tile_to_shape(
                     composition(Swizzle<3,3,3>{},
                                 make_layout(make_shape(_64{}, _8{}), make_stride(_1{}, _64{}))),

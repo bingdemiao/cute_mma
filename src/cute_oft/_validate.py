@@ -139,9 +139,10 @@ def compute_smem_bytes_bwd_db(
     """Compute shared memory usage for backward dB kernel.
 
     Mirrors the smem calculation in oft_backward_dB_launch().
+    sAR_pipe(bM, bK, bP_ar) replaces sAR_temp(bM, rs) + sARt(bK, bM, bP_ar).
     """
     gs, rs = group_size, reconn_sz
-    smem = (bM * bK * bP_a + rs * bK + bM * rs + bK * bM * bP_ar + gs * bM * bP_dc) * 2 + 256
+    smem = (bM * bK * bP_a + rs * bK + bM * bK * bP_ar + gs * bM * bP_dc) * 2 + 256
     return smem
 
 
