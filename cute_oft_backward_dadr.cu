@@ -349,15 +349,19 @@ bwd_dadr_kernel(
                     auto tXrA_dA = cons_s2r_a_thr.retile_D(rA_dA);
                     copy(cons_s2r_A{}, tXsDH_rb, tXrA_dA);
 
-                    // LDSM load B-operand (R): reconn wants B[j,i] = sR(i, k_off+j) = R^T
-                    // Load natural sR sub-tile via LDSM, then movmatrix to transpose
+                    // R B-operand: reconn wants B[j,i] = sR(i, k_off+j) = R^T
+                    // Transposed access from swizzled sR — scalar load
                     Tensor sR_rb = sR_tiled(_, make_coord(_, rb_idx), r_pipe_r);
-                    auto tXsR_rb = cons_s2r_b_thr.partition_S(sR_rb);
-                    auto rB_R = cons_thr.make_fragment_B(cons_thr.partition_B(sR_rb));
-                    auto tXrB_R = cons_s2r_b_thr.retile_D(rB_R);
-                    copy(cons_s2r_B{}, tXsR_rb, tXrB_R);
-                    // movmatrix: transpose 8x8 in registers to get reconn convention
-                    movmatrix_trans_b16(rB_R);
+                    auto tBdA_id_reconn = cons_thr.partition_B(
+                        make_identity_tensor(make_shape(Int<rs>{}, Int<rs>{})));
+                    auto rB_R = cons_thr.make_fragment_B(cons_thr.partition_B(
+                        make_tensor(static_cast<half_t*>(nullptr),
+                                    make_layout(make_shape(Int<rs>{}, Int<rs>{}), LayoutRight{}))));
+                    for (int f = 0; f < size(rB_R); ++f) {
+                        auto coord = tBdA_id_reconn(f);
+                        int ni = get<0>(coord), ki = get<1>(coord);
+                        rB_R(f) = sR(ki, blk_k_off + ni, r_pipe_r);
+                    }
 
                     if constexpr (!GATED) {
                         gemm(cons_mma, rA_dA, rB_R, rDA[rb]);
@@ -369,11 +373,12 @@ bwd_dadr_kernel(
                         auto tXrA_sA = cons_s2r_a_thr.retile_D(rA_sA);
                         copy(cons_s2r_A{}, tXsA_rb, tXrA_sA);
 
-                        // R for AR: B[r,k] = sR(r, k_off+k) — natural convention, no transpose
-                        // LDSM loads directly
+                        // R for AR: B[r,k] = sR(r, k_off+k) — natural convention
+                        // LDSM via tiled sub-view (natural, no transpose)
+                        auto tXsR_ar = cons_s2r_b_thr.partition_S(sR_rb);
                         auto rB_R_ar = cons_thr.make_fragment_B(cons_thr.partition_B(sR_rb));
                         auto tXrB_ar = cons_s2r_b_thr.retile_D(rB_R_ar);
-                        copy(cons_s2r_B{}, tXsR_rb, tXrB_ar);
+                        copy(cons_s2r_B{}, tXsR_ar, tXrB_ar);
                         frag_c_type rAR; clear(rAR);
                         gemm(cons_mma, rA_sA, rB_R_ar, rAR);
 
@@ -427,14 +432,10 @@ bwd_dadr_kernel(
 
                 // --- dR: only warp_m=0 computes (full BLK_M reduction) ---
                 if (warp_m == 0) {
-                    auto rA_dr = dr_thr.make_fragment_A(dr_thr.partition_A(dr_A_dummy));
-                    auto rB_dr = dr_thr.make_fragment_B(dr_thr.partition_B(dr_B_dummy));
-                    auto rDR   = dr_thr.make_fragment_C(dr_thr.partition_C(dr_C_dummy));
+                    auto rDR = dr_thr.make_fragment_C(dr_thr.partition_C(dr_C_dummy));
                     clear(rDR);
 
-                    int dr_rb_idx = blk_k_off / rs;
-
-                    // dR operands: transposed access (scalar load)
+                    // dR operands: transposed access from sDH_exch and sA
                     // A[i, k] = sDH_exch[k, blk_k_off + i], B[j, k] = sA[k, blk_k_off + j]
                     auto rA_dr2 = dr_thr.make_fragment_A(dr_thr.partition_A(dr_A_dummy));
                     auto rB_dr2 = dr_thr.make_fragment_B(dr_thr.partition_B(dr_B_dummy));
