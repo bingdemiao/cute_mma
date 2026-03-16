@@ -112,11 +112,8 @@ def compute_smem_bytes_bwd_dadr(
     """Compute shared memory usage for backward dA+dR kernel.
 
     Mirrors the smem calculation in oft_backward_dA_dR_launch().
-    All buffers use hardcoded double-buffering (_2{}) except sA and sDH_temp.
-    dH is accumulated in registers, not shared memory.
-
     Layout: sdC(bM, bK_inner, 2) + sB(bK, bK_inner, 2)
-          + sA(bM, bK) + sR(rs, bK, 2) + sDH_temp(bM, rs)
+          + sA(bM, bK) + sR(rs, bK, 2) + sDH_exch(bM, bK)
           + sDR_acc(rs, bK) [float]
     """
     rs = reconn_sz
@@ -124,8 +121,8 @@ def compute_smem_bytes_bwd_dadr(
     size_B = bK * bK_inner * 2      # double-buffered
     size_A = bM * bK                 # single buffer
     size_R = rs * bK * 2             # double-buffered
-    size_dH_temp = bM * rs           # scratch for reconn epilogue
-    half_elems = size_dC + size_B + size_A + size_R + size_dH_temp
+    size_dH_exch = bM * bK           # full dH exchange buffer
+    half_elems = size_dC + size_B + size_A + size_R + size_dH_exch
     smem = half_elems * 2 + rs * bK * 4 + 256  # +float sDR_acc +alignment
     return smem
 

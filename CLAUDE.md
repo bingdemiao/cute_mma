@@ -85,7 +85,11 @@ These are **mandatory** rules when writing or modifying CUDA kernels in this pro
 
 1. **Never use scalar loops for small matrix multiplies.** Any reduction of the form `sum_j A(m,j) * B(j,n)` or dot product over a tile dimension MUST use MMA tensor core instructions via CuTe's `gemm()`, not a scalar `for` loop. Scalar FMA loops are orders of magnitude slower than tensor cores.
 
-2. **Never use scalar smem loads when LDSM is available.** Loading data from shared memory into MMA operand registers MUST use LDSM copy atoms (`SM75_U32x{1,2,4}_LDSM_N` or `SM75_U16x{2,4,8}_LDSM_T`) via CuTe's `make_tiled_copy_A/B` + `copy()`. Never manually loop over smem elements with scalar loads to fill MMA fragments.
+2. **Never use scalar smem loads when LDSM is available.** Loading data from shared memory into MMA operand registers MUST use LDSM copy atoms via CuTe's `make_tiled_copy_A/B` + `copy()`. Never manually loop over smem elements with scalar loads to fill MMA fragments.
+   - Ampere tensor cores require both operands to be **K-major** (this is the TN convention — BLAS default is column-major, so T=transposed-A and N=non-transposed-B both give K-contiguous data).
+   - `SM75_U16x{2,4,8}_LDSM_T` (the f16\_T variants): loads a **K-major** operand from smem as-is. No transpose happens — the data is already in the layout tensor cores expect. Use this when smem data has K as the contiguous dimension.
+   - `SM75_U32x{1,2,4}_LDSM_N` (the u32 variants): loads a **non-K-major** operand from smem and rearranges it into K-major register layout. Use this when smem data has M or N as the contiguous dimension.
+   - For f16 operands that are non-K-major in smem: load with `LDSM_T`, then transpose in-register using the PTX instruction `movmatrix.sync.aligned.m8n8.trans.b16 d, a;` (no CuTe trait exists — use inline PTX).
 
 3. **Use packed f16x2 instructions for activation functions.** Sigmoid, tanh, SiLU, and their derivatives MUST use:
    - `tanh.approx.f16x2` PTX instruction (not f32 `__expf` or `tanh.approx.f32`)
