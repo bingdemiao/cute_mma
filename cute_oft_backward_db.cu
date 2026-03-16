@@ -348,10 +348,9 @@ dB_pc_kernel(
 
     auto sA_layout = tile_to_shape(smem_k, make_shape(Int<BLK_M>{}, Int<BLK_K>{}, Int<bP_a>{}));
     auto sR_layout = tile_to_shape(smem_k, make_shape(Int<rs>{}, Int<BLK_K>{}));
-    // sAR_pipe: (BLK_K, BLK_M, bP_ar) — uses smem_m swizzle for LDSM compatibility.
-    // LDSM requires specific stride patterns that plain LayoutRight doesn't satisfy.
-    auto smem_m = get_smem_atom(Int<BLK_M>{});
-    auto sAR_pipe_layout = tile_to_shape(smem_m,
+    // sAR_pipe: (BLK_K, BLK_M, bP_ar) — no swizzle, same as forward kernel's sAR.
+    // get_smem_atom<false> provides the base layout without swizzle composition.
+    auto sAR_pipe_layout = tile_to_shape(get_smem_atom<false>(Int<BLK_M>{}),
         make_shape(Int<BLK_K>{}, Int<BLK_M>{}, Int<bP_ar>{}));
     // sdCt unchanged
     auto sdCt_atom = composition(
