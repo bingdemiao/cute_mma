@@ -55,12 +55,13 @@ bwd_dadr_kernel(
     constexpr int n_warps_K = n_warps / 2;
     static_assert(n_warps_M * n_warps_K == n_warps, "total warps must be even");
     static_assert(BLK_M % n_warps_M == 0 && BLK_K % n_warps_K == 0);
-    static_assert(n_reconn_blocks == n_warps, "Need exactly n_warps reconn blocks");
     using GemmWarpLayout = Layout<Shape<Int<n_warps_M>, Int<n_warps_K>>>;
 
     constexpr int HALF_M = BLK_M / 2;
     constexpr int atom_N = 8;
-    constexpr int reconn_per_col = 2;
+    constexpr int reconn_per_col = n_reconn_blocks / n_warps_K;  // atoms per column pair
+    static_assert(reconn_per_col % 2 == 0, "reconn_per_col must be even for exchange");
+    constexpr int reconn_per_warp = reconn_per_col / 2;  // blocks per warp after exchange
     constexpr int col_k_stride = n_warps_K * atom_N;
 
     int lane_idx = threadIdx.x % 32;
@@ -85,10 +86,12 @@ bwd_dadr_kernel(
     auto sB_atom = composition(Swizzle<3, 3, 3>{},
         make_layout(make_shape(Int<BLK_K>{}, _8{}), make_stride(_1{}, Int<BLK_K>{})));
     auto sB_layout = tile_to_shape(sB_atom, make_shape(Int<BLK_K>{}, Int<BLK_N>{}, _2{}));
-    auto sA_layout = tile_to_shape(get_smem_atom(Int<BLK_K>{}), make_shape(Int<BLK_M>{}, Int<BLK_K>{}));
-    auto sR_layout = tile_to_shape(get_smem_atom(Int<BLK_K>{}), make_shape(Int<rs>{}, Int<BLK_K>{}, _2{}));
-    // sDH_exch uses same swizzle as sA for make_tiled_copy_C compatibility
-    auto sDH_exch_layout = tile_to_shape(get_smem_atom(Int<BLK_K>{}),
+    // sA: atom width = rs so (HALF_M, rs) sub-views are LDSM-compatible (scalar gmem load)
+    auto sA_layout = tile_to_shape(get_smem_atom(Int<rs>{}), make_shape(Int<BLK_M>{}, Int<BLK_K>{}));
+    // sR: swizzled with rs width — LDSM accesses (rs, rs) sub-views
+    auto sR_layout = tile_to_shape(get_smem_atom(Int<rs>{}), make_shape(Int<rs>{}, Int<BLK_K>{}, _2{}));
+    // sDH_exch: atom width = rs so (HALF_M, rs) sub-views are LDSM-compatible
+    auto sDH_exch_layout = tile_to_shape(get_smem_atom(Int<rs>{}),
         make_shape(Int<BLK_M>{}, Int<BLK_K>{}));
     constexpr int sDR_acc_elems = rs * BLK_K;
 
@@ -116,7 +119,7 @@ bwd_dadr_kernel(
     auto tCid = thr_mma.partition_C(make_identity_tensor(make_shape(Int<BLK_M>{}, Int<BLK_K>{})));
 
     // R2S for writing rDH to sDH_exch via make_tiled_copy_C
-    using r2s_c_atom = Copy_Atom<UniversalCopy<uint32_t>, half_t>;
+    using r2s_c_atom = Copy_Atom<UniversalCopy<uint16_t>, half_t>;
     auto r2s_c = make_tiled_copy_C(r2s_c_atom{}, mma);
     auto r2s_c_thr = r2s_c.get_slice(threadIdx.x);
     auto tXrDH_c = r2s_c_thr.retile_S(rDH);
@@ -218,7 +221,7 @@ bwd_dadr_kernel(
     #pragma unroll
     for (int i = 0; i < reconn_per_col; ++i) clear(rDA[i]);
 
-    // === dR MMA: K=BLK_M reduction, only warp_m=0 computes ===
+    // === dR MMA: K=BLK_M reduction, both warps compute ===
     auto dr_mma = make_tiled_mma(
         MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
         Layout<Shape<_1, _1>>{}, Tile<Int<rs>, Int<rs>>{});
@@ -330,78 +333,53 @@ bwd_dadr_kernel(
                 sDR_acc[i] = 0.0f;
             __syncthreads();
 
-            // === Per-column-pair reconn block loop ===
-            #pragma unroll
-            for (int rb = 0; rb < reconn_per_col; ++rb) {
-                int blk_k_off = col_k_base + rb * col_k_stride;
+            // === Phase 1: Write ALL reconn blocks to sDH_exch ===
+            // Each warp writes to its own (M-range, K-range) — non-overlapping.
+            copy(r2s_c_atom{}, tXrDH_c, tXsDH_c);
+            // TODO(pairwise_sync): use pairwise sync once non-swizzled sDH_exch is verified
+            __syncthreads();
 
-                // Write rDH sub-fragment to sDH_exch (ALL warps write simultaneously)
-                copy(r2s_c_atom{}, tXrDH_c(_,_,rb), tXsDH_c(_,_,rb));
+            // === Phase 2 (gated only): Modify sDH_exch for ALL reconn blocks ===
+            // Each warp modifies its own M-range for ALL reconn blocks (needed for dR)
+            if constexpr (GATED) {
+                using cons_mma_atom_f16 = std::conditional_t<(rs < 16),
+                    MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
+                    MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
 
-                // TODO(pairwise_sync): Currently __syncthreads because the swizzled
-                // sDH_exch layout (get_smem_atom(BLK_K)) causes physical address aliasing
-                // across column pairs — a warp's logical_divide sub-view at its own K range
-                // reads physical smem addresses written by other column pairs' warps.
-                // To restore pairwise bar.sync: use a column-pair-aligned swizzle atom
-                // (width = 2*rs = 16 instead of BLK_K = 64), or separate smem per pair.
-                __syncthreads();
+                #pragma unroll
+                for (int rb = 0; rb < reconn_per_col; ++rb) {
+                    int blk_k_off = col_k_base + rb * col_k_stride;
+                    int rb_idx = blk_k_off / rs;
 
-                // --- dA ---
-                {
-                    int rb_idx = blk_k_off / rs;  // reconn block index in K
+                    // AR = A @ R for own HALF_M
+                    Tensor sA_rb = sA_tiled(make_coord(_, warp_m), make_coord(_, rb_idx));
+                    auto tXsA_rb = cons_s2r_a_thr.partition_S(sA_rb);
+                    auto rA_sA = cons_thr.make_fragment_A(cons_thr.partition_A(sA_rb));
+                    auto tXrA_sA = cons_s2r_a_thr.retile_D(rA_sA);
+                    copy(cons_s2r_A{}, tXsA_rb, tXrA_sA);
 
-                    // LDSM load A-operand from sDH_exch via tiled sub-view
-                    Tensor sDH_rb = sDH_tiled(make_coord(_, warp_m), make_coord(_, rb_idx));
-                    auto tXsDH_rb = cons_s2r_a_thr.partition_S(sDH_rb);
-                    auto rA_dA = cons_thr.make_fragment_A(cons_thr.partition_A(sDH_rb));
-                    auto tXrA_dA = cons_s2r_a_thr.retile_D(rA_dA);
-                    copy(cons_s2r_A{}, tXsDH_rb, tXrA_dA);
-
-                    // R reconn B-operand: LDSM natural load + movmatrix transpose
-                    // B[n,k] = sR(k, k_off+n) — transposed access
-                    // Load sR_rb naturally as B-fragment, then blocken → transpose → construct_B
                     Tensor sR_rb = sR_tiled(_, make_coord(_, rb_idx), r_pipe_r);
-                    auto tXsR_reconn = cons_s2r_b_thr.partition_S(sR_rb);
-                    auto rB_R_nat = cons_thr.make_fragment_B(cons_thr.partition_B(sR_rb));
-                    auto tXrB_R_nat = cons_s2r_b_thr.retile_D(rB_R_nat);
-                    copy(cons_s2r_B{}, tXsR_reconn, tXrB_R_nat);
-                    // Transpose in registers: B[n,k]=sR(n,k) → B[n,k]=sR(k,n)
-                    using cons_mma_atom_f16 = std::conditional_t<(rs < 16),
-                        MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
-                        MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
-                    auto blocked_R = blocken_operand_B<cons_mma_atom_f16>(rB_R_nat);
-                    auto transposed_R = inplace_transpose(blocked_R);
-                    auto rB_R = construct_operand_B<cons_mma_atom_f16>(transposed_R);
+                    auto tXsR_ar = cons_s2r_b_thr.partition_S(sR_rb);
+                    auto rB_R_ar = cons_thr.make_fragment_B(cons_thr.partition_B(sR_rb));
+                    auto tXrB_ar = cons_s2r_b_thr.retile_D(rB_R_ar);
+                    copy(cons_s2r_B{}, tXsR_ar, tXrB_ar);
+                    frag_c_type rAR; clear(rAR);
+                    gemm(cons_mma, rA_sA, rB_R_ar, rAR);
 
-                    if constexpr (!GATED) {
-                        gemm(cons_mma, rA_dA, rB_R, rDA[rb]);
-                    } else {
-                        // AR: LDSM load sA via tiled sub-view
-                        Tensor sA_rb = sA_tiled(make_coord(_, warp_m), make_coord(_, rb_idx));
-                        auto tXsA_rb = cons_s2r_a_thr.partition_S(sA_rb);
-                        auto rA_sA = cons_thr.make_fragment_A(cons_thr.partition_A(sA_rb));
-                        auto tXrA_sA = cons_s2r_a_thr.retile_D(rA_sA);
-                        copy(cons_s2r_A{}, tXsA_rb, tXrA_sA);
+                    constexpr int n_frag = decltype(size(rAR))::value;
+                    constexpr int n_pairs = n_frag / 2;
+                    __half2 rSigma[n_pairs], rAR_h2[n_pairs];
+                    #pragma unroll
+                    for (int pp = 0; pp < n_pairs; ++pp) {
+                        rAR_h2[pp] = __floats2half2_rn(rAR(pp * 2), rAR(pp * 2 + 1));
+                        rSigma[pp] = sigmoid_h2(rAR_h2[pp]);
+                    }
 
-                        // R for AR: B[r,k] = sR(r, k_off+k) — natural convention
-                        // LDSM via tiled sub-view (natural, no transpose)
-                        auto tXsR_ar = cons_s2r_b_thr.partition_S(sR_rb);
-                        auto rB_R_ar = cons_thr.make_fragment_B(cons_thr.partition_B(sR_rb));
-                        auto tXrB_ar = cons_s2r_b_thr.retile_D(rB_R_ar);
-                        copy(cons_s2r_B{}, tXsR_ar, tXrB_ar);
-                        frag_c_type rAR; clear(rAR);
-                        gemm(cons_mma, rA_sA, rB_R_ar, rAR);
-
-                        constexpr int n_frag = decltype(size(rAR))::value;
-                        constexpr int n_pairs = n_frag / 2;
-                        __half2 rSigma[n_pairs], rAR_h2[n_pairs];
-                        #pragma unroll
-                        for (int pp = 0; pp < n_pairs; ++pp) {
-                            rAR_h2[pp] = __floats2half2_rn(rAR(pp * 2), rAR(pp * 2 + 1));
-                            rSigma[pp] = sigmoid_h2(rAR_h2[pp]);
-                        }
-
-                        // Step A
+                    // Step A: accumulate dA only for OWNED blocks
+                    bool is_owned = (rb >= warp_m * reconn_per_warp) &&
+                                    (rb < (warp_m + 1) * reconn_per_warp);
+                    if (is_owned) {
+                        int da_idx = rb - warp_m * reconn_per_warp;
                         #pragma unroll
                         for (int pp = 0; pp < n_pairs; ++pp) {
                             int idx = pp * 2;
@@ -412,60 +390,89 @@ bwd_dadr_kernel(
                             __half2 dH2 = load_half2(sDH_exch(gm0, blk_k_off + get<1>(c0)),
                                                      sDH_exch(gm1, blk_k_off + get<1>(c1)));
                             __half2 result = __hmul2(__hmul2(dH2, rAR_h2[pp]), rSigma[pp]);
-                            rDA[rb](idx)     += __half2float(__low2half(result));
-                            rDA[rb](idx + 1) += __half2float(__high2half(result));
+                            rDA[da_idx](idx)     += __half2float(__low2half(result));
+                            rDA[da_idx](idx + 1) += __half2float(__high2half(result));
                         }
+                    }
 
-                        // Step B
-                        #pragma unroll
-                        for (int pp = 0; pp < n_pairs; ++pp) {
-                            int idx = pp * 2;
-                            auto c0 = tCdA_id(idx), c1 = tCdA_id(idx + 1);
-                            int mi0 = get<0>(c0), mi1 = get<0>(c1);
-                            int ri0 = get<1>(c0), ri1 = get<1>(c1);
-                            if (mi0 >= HALF_M) continue;
-                            int gm0 = warp_m * HALF_M + mi0, gm1 = warp_m * HALF_M + mi1;
-                            __half2 sp = silu_prime_h2(rAR_h2[pp], rSigma[pp]);
-                            __half2 dH2 = load_half2(sDH_exch(gm0, blk_k_off + ri0),
-                                                     sDH_exch(gm1, blk_k_off + ri1));
-                            __half2 a2 = load_half2(sA(gm0, blk_k_off + ri0),
-                                                    sA(gm1, blk_k_off + ri1));
-                            __half2 dS = __hmul2(__hmul2(dH2, a2), sp);
-                            store_half2(sDH_exch(gm0, blk_k_off + ri0),
-                                        sDH_exch(gm1, blk_k_off + ri1), dS);
-                        }
-                        // TODO(pairwise_sync): same swizzle aliasing issue as above.
-                        // Step B writes only to own K-column slice, but swizzled addresses
-                        // may overlap with other pairs' read regions.
-                        __syncthreads();
-
-                        // Step C: reload dS from sDH_exch via LDSM
-                        // sDH_rb still points to the right sub-view (Step B wrote in-place)
-                        copy(cons_s2r_A{}, tXsDH_rb, tXrA_dA);  // reloads modified data
-                        gemm(cons_mma, rA_dA, rB_R, rDA[rb]);
+                    // Step B: write dS = dH * A * silu_prime to sDH_exch (own M-range, ALL blocks)
+                    #pragma unroll
+                    for (int pp = 0; pp < n_pairs; ++pp) {
+                        int idx = pp * 2;
+                        auto c0 = tCdA_id(idx), c1 = tCdA_id(idx + 1);
+                        int mi0 = get<0>(c0), mi1 = get<0>(c1);
+                        int ri0 = get<1>(c0), ri1 = get<1>(c1);
+                        if (mi0 >= HALF_M) continue;
+                        int gm0 = warp_m * HALF_M + mi0, gm1 = warp_m * HALF_M + mi1;
+                        __half2 sp = silu_prime_h2(rAR_h2[pp], rSigma[pp]);
+                        __half2 dH2 = load_half2(sDH_exch(gm0, blk_k_off + ri0),
+                                                 sDH_exch(gm1, blk_k_off + ri1));
+                        __half2 a2 = load_half2(sA(gm0, blk_k_off + ri0),
+                                                sA(gm1, blk_k_off + ri1));
+                        __half2 dS = __hmul2(__hmul2(dH2, a2), sp);
+                        store_half2(sDH_exch(gm0, blk_k_off + ri0),
+                                    sDH_exch(gm1, blk_k_off + ri1), dS);
                     }
                 }
+                // Pairwise sync: both warps' M-ranges are now modified
+                __syncthreads();
+            }
 
-                // --- dR: only warp_m=0 computes (full BLK_M reduction) ---
-                if (warp_m == 0) {
+            // === Phase 3: dA for ALL reconn blocks, dR for OWNED blocks ===
+            {
+                using cons_mma_atom_f16 = std::conditional_t<(rs < 16),
+                    MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
+                    MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
+
+                // --- dA: each warp computes for ALL reconn blocks (own HALF_M rows) ---
+                #pragma unroll
+                for (int rb = 0; rb < reconn_per_col; ++rb) {
+                    int blk_k_off = col_k_base + rb * col_k_stride;
+                    int rb_idx = blk_k_off / rs;
+
+                    // LDSM load dH (or dS if gated) from own M-half of sDH_exch
+                    Tensor sDH_rb = sDH_tiled(make_coord(_, warp_m), make_coord(_, rb_idx));
+                    auto tXsDH_rb = cons_s2r_a_thr.partition_S(sDH_rb);
+                    auto rA_dA = cons_thr.make_fragment_A(cons_thr.partition_A(sDH_rb));
+                    auto tXrA_dA = cons_s2r_a_thr.retile_D(rA_dA);
+                    copy(cons_s2r_A{}, tXsDH_rb, tXrA_dA);
+
+                    // R reconn B-operand: LDSM natural + movmatrix transpose
+                    Tensor sR_rb = sR_tiled(_, make_coord(_, rb_idx), r_pipe_r);
+                    auto tXsR_reconn = cons_s2r_b_thr.partition_S(sR_rb);
+                    auto rB_R_nat = cons_thr.make_fragment_B(cons_thr.partition_B(sR_rb));
+                    auto tXrB_R_nat = cons_s2r_b_thr.retile_D(rB_R_nat);
+                    copy(cons_s2r_B{}, tXsR_reconn, tXrB_R_nat);
+                    auto blocked_R = blocken_operand_B<cons_mma_atom_f16>(rB_R_nat);
+                    auto transposed_R = inplace_transpose(blocked_R);
+                    auto rB_R = construct_operand_B<cons_mma_atom_f16>(transposed_R);
+
+                    gemm(cons_mma, rA_dA, rB_R, rDA[rb]);
+                }
+
+                // --- dR: each warp computes for OWNED reconn blocks (full BLK_M) ---
+                // warp_m=0 owns rb={0..reconn_per_warp-1}, warp_m=1 owns the rest
+                #pragma unroll
+                for (int i = 0; i < reconn_per_warp; ++i) {
+                    int rb = warp_m * reconn_per_warp + i;
+                    int blk_k_off = col_k_base + rb * col_k_stride;
+
                     auto rDR = dr_thr.make_fragment_C(dr_thr.partition_C(dr_C_dummy));
                     clear(rDR);
 
-                    // TODO(LDSM): dR operands use transposed access A[i,k]=sDH[k,k_off+i],
-                    // B[j,k]=sA[k,k_off+j]. Fragment size mismatch between dr_load (16 elems)
-                    // and dr_mma (32 elems with phantom M-padding) prevents direct transpose.
-                    // Keeping scalar loop until a clean solution is found.
                     auto rA_dr2 = dr_thr.make_fragment_A(dr_thr.partition_A(dr_A_dummy));
                     auto rB_dr2 = dr_thr.make_fragment_B(dr_thr.partition_B(dr_B_dummy));
                     for (int f = 0; f < size(rA_dr2); ++f) {
                         auto coord = tAdr_id(f);
-                        int i = get<0>(coord), k = get<1>(coord);
-                        rA_dr2(f) = (i < rs && k < m_valid) ? sDH_exch(k, blk_k_off + i) : half_t(0);
+                        int ii = get<0>(coord), k = get<1>(coord);
+                        rA_dr2(f) = (ii < rs && k < m_valid) ?
+                            sDH_exch(k, blk_k_off + ii) : half_t(0);
                     }
                     for (int f = 0; f < size(rB_dr2); ++f) {
                         auto coord = tBdr_id(f);
                         int j = get<0>(coord), k = get<1>(coord);
-                        rB_dr2(f) = (j < rs && k < m_valid) ? sA(k, blk_k_off + j) : half_t(0);
+                        rB_dr2(f) = (j < rs && k < m_valid) ?
+                            sA(k, blk_k_off + j) : half_t(0);
                     }
 
                     gemm(dr_mma, rA_dr2, rB_dr2, rDR);
@@ -473,18 +480,15 @@ bwd_dadr_kernel(
                     // Exclusive write — no atomicAdd needed
                     for (int f = 0; f < size(rDR); ++f) {
                         auto coord = tCdr_id(f);
-                        int i = get<0>(coord), j = get<1>(coord);
-                        if (i < rs && j < rs)
-                            sDR_acc[i * BLK_K + blk_k_off + j] = rDR(f);
+                        int ii = get<0>(coord), j = get<1>(coord);
+                        if (ii < rs && j < rs)
+                            sDR_acc[ii * BLK_K + blk_k_off + j] = rDR(f);
                     }
                 }
-
-                // TODO(pairwise_sync): this sync guards the next iteration's
-                // make_tiled_copy_C write. Same swizzle aliasing issue.
-                __syncthreads();
             }
 
 
+            __syncthreads();  // ensure all warps finished writing sDR_acc
             {
                 int dR_rows = n_groups * rs;
                 for (int idx = threadIdx.x; idx < sDR_acc_elems; idx += n_threads) {
@@ -505,7 +509,7 @@ bwd_dadr_kernel(
         }
     }
 
-    // Write dA
+    // Write dA — each warp writes ALL reconn blocks (own HALF_M rows)
     #pragma unroll
     for (int rb = 0; rb < reconn_per_col; ++rb) {
         int blk_k_off = col_k_base + rb * col_k_stride;
@@ -566,15 +570,17 @@ void oft_backward_dA_dR_launch(
 
     auto smem_n = get_smem_atom(cute::Int<BLK_N>{});
     auto smem_k = get_smem_atom(cute::Int<BLK_K>{});
+    auto smem_rs = get_smem_atom(cute::Int<rs>{});
+    auto smem_dh = get_smem_atom(cute::Int<rs>{});
     auto sB_atom = composition(Swizzle<3, 3, 3>{},
         make_layout(make_shape(cute::Int<BLK_K>{}, _8{}),
                     make_stride(_1{}, cute::Int<BLK_K>{})));
     int smem = (cosize(tile_to_shape(smem_n, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_N>{}, _2{})))
                 + cosize(tile_to_shape(sB_atom,
                     make_shape(cute::Int<BLK_K>{}, cute::Int<BLK_N>{}, _2{})))
-                + cosize(tile_to_shape(smem_k, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K>{})))
-                + cosize(tile_to_shape(smem_k, make_shape(cute::Int<rs>{}, cute::Int<BLK_K>{}, _2{})))
-                + BLK_M * BLK_K)              // sDH_exch
+                + cosize(tile_to_shape(smem_rs, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K>{})))
+                + cosize(tile_to_shape(smem_rs, make_shape(cute::Int<rs>{}, cute::Int<BLK_K>{}, _2{})))
+                + cosize(tile_to_shape(smem_dh, make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K>{}))))
                * sizeof(half_t)
                + rs * BLK_K * sizeof(float)   // sDR_acc
                + 256;
