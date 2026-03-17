@@ -375,11 +375,8 @@ bwd_dadr_kernel(
                         rSigma[pp] = sigmoid_h2(rAR_h2[pp]);
                     }
 
-                    // Step A: accumulate dA only for OWNED blocks
-                    bool is_owned = (rb >= warp_m * reconn_per_warp) &&
-                                    (rb < (warp_m + 1) * reconn_per_warp);
-                    if (is_owned) {
-                        int da_idx = rb - warp_m * reconn_per_warp;
+                    // Step A: accumulate dA for ALL blocks (each warp uses own HALF_M rows)
+                    {
                         #pragma unroll
                         for (int pp = 0; pp < n_pairs; ++pp) {
                             int idx = pp * 2;
@@ -390,8 +387,8 @@ bwd_dadr_kernel(
                             __half2 dH2 = load_half2(sDH_exch(gm0, blk_k_off + get<1>(c0)),
                                                      sDH_exch(gm1, blk_k_off + get<1>(c1)));
                             __half2 result = __hmul2(__hmul2(dH2, rAR_h2[pp]), rSigma[pp]);
-                            rDA[da_idx](idx)     += __half2float(__low2half(result));
-                            rDA[da_idx](idx + 1) += __half2float(__high2half(result));
+                            rDA[rb](idx)     += __half2float(__low2half(result));
+                            rDA[rb](idx + 1) += __half2float(__high2half(result));
                         }
                     }
 

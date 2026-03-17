@@ -422,7 +422,7 @@ void oft_backward_dB_launch(
                 + cosize(tile_to_shape(
                     composition(Swizzle<3,3,3>{},
                                 make_layout(make_shape(cute::Int<gs>{}, _8{}),
-                                            make_stride(cute::Int<gs>{}, cute::Int<1>{}))),
+                                            make_stride(cute::Int<1>{}, cute::Int<gs>{}))),
                     make_shape(cute::Int<gs>{}, cute::Int<BLK_M>{}, cute::Int<bP_dc>{}))))
                * sizeof(half_t) + 256;
 
