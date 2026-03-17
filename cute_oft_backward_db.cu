@@ -166,8 +166,8 @@ void dB_producer(
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
         }
 
-        // Signal data ready — sync with consumer
-        asm volatile("bar.sync %0, %1;\n"
+        // Signal data ready — non-blocking (producer overlap only)
+        asm volatile("bar.arrive %0, %1;\n"
             : : "r"(BAR_READY_BASE), "n"(n_total_threads));
     }
 }
