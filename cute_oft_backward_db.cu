@@ -111,28 +111,22 @@ void dB_producer(
         }
     };
 
-    int smem_pipe_write = bP_a - 1, smem_pipe_read = 0;
-    int ar_pipe_write = 0, m_tile_next = 0, m_tiles_remaining = n_m_tiles;
+    int ar_pipe_write = 0, m_tile_next = 0;
 
-    for (int p = 0; p < bP_a - 1 && m_tiles_remaining > 0; ++p) {
-        load_A_async(m_tile_next * BLK_M, p);
-        cp_async_fence(); --m_tiles_remaining; ++m_tile_next;
-    }
-
+    // No prefill — sequential debug mode
     for (int mt = 0; mt < n_m_tiles; ++mt) {
-        if (m_tiles_remaining > 0) {
-            load_A_async(m_tile_next * BLK_M, smem_pipe_write);
-            --m_tiles_remaining; ++m_tile_next;
-        }
-        cp_async_fence(); cp_async_wait<bP_a - 1>();
+        load_A_async(m_tile_next * BLK_M, 0);
+        ++m_tile_next;
+        cp_async_fence(); cp_async_wait<0>();
         asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
 
+        // Wait for consumer to signal buffer is free
         asm volatile("bar.sync %0, %1;\n"
-            : : "r"(ar_pipe_write + BAR_CONSUMED_BASE), "n"(n_total_threads));
+            : : "r"(BAR_CONSUMED_BASE), "n"(n_total_threads));
 
         for (int kb = 0; kb < n_blocks_k; ++kb) {
             // LDSM load A and R
-            copy(s2r_A{}, tXsA(_,_,_,kb,smem_pipe_read), tXrA);
+            copy(s2r_A{}, tXsA(_,_,_,kb,0), tXrA);
             copy(s2r_R{}, tXsR(_,_,_,kb), tXrR);
 
             // MMA: AR[WARP_M, rs] = A @ R^T
@@ -172,12 +166,9 @@ void dB_producer(
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
         }
 
-        asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
-        asm volatile("bar.arrive %0, %1;\n"
-            : : "r"(ar_pipe_write + BAR_READY_BASE), "n"(n_total_threads));
-        ++ar_pipe_write; if (ar_pipe_write == bP_ar) ar_pipe_write = 0;
-        smem_pipe_write = smem_pipe_read;
-        ++smem_pipe_read; if (smem_pipe_read == bP_a) smem_pipe_read = 0;
+        // Signal data ready — sync with consumer
+        asm volatile("bar.sync %0, %1;\n"
+            : : "r"(BAR_READY_BASE), "n"(n_total_threads));
     }
 }
 
@@ -264,39 +255,37 @@ void dB_consumer(
         copy(copy_dC, thr_copy_dC.partition_S(gdC), tCsdCt_cp(_,_,_,pipe));
     };
 
-    for (int bid = BAR_CONSUMED_BASE; bid < BAR_CONSUMED_BASE + bP_ar; ++bid)
-        asm volatile("bar.arrive %0, %1;\n" : : "r"(bid), "n"(n_total_threads));
+    // Initial arrive: signal producer that buffer is free
+    asm volatile("bar.arrive %0, %1;\n"
+        : : "r"(BAR_CONSUMED_BASE), "n"(n_total_threads));
 
-    int dc_pipe_write = bP_dc - 1, dc_pipe_read = 0;
-    int ar_pipe_read = 0, m_tile_next = 0, m_tiles_remaining = n_m_tiles;
-
-    for (int p = 0; p < bP_dc - 1 && m_tiles_remaining > 0; ++p) {
-        load_dCt_async(m_tile_next * BLK_M, p);
-        cp_async_fence(); --m_tiles_remaining; ++m_tile_next;
-    }
+    int m_tile_next = 0;
 
     for (int mt = 0; mt < n_m_tiles; ++mt) {
-        if (m_tiles_remaining > 0) {
-            load_dCt_async(m_tile_next * BLK_M, dc_pipe_write);
-            --m_tiles_remaining; ++m_tile_next;
-        }
-        cp_async_fence(); cp_async_wait<bP_dc - 1>();
+        // Load dCt — single slot, no pipeline
+        load_dCt_async(m_tile_next * BLK_M, 0);
+        ++m_tile_next;
+        cp_async_fence(); cp_async_wait<0>();
         asm volatile("bar.sync 15, %0;\n" : : "n"(n_consumer_threads));
 
+        // Wait for AR data from producer
         asm volatile("bar.sync %0, %1;\n"
-            : : "r"(ar_pipe_read + BAR_READY_BASE), "n"(n_total_threads));
+            : : "r"(BAR_READY_BASE), "n"(n_total_threads));
 
-        // LDSM load dCt and ARt (transposed view of sAR_pipe)
-        copy(s2r_dCt{}, tXsdCt(_, _, _, dc_pipe_read), tXrdCt);
-        copy(s2r_atom_b{}, tXsARt(_, _, _, ar_pipe_read), tXrARt);
+        // LDSM load dCt and ARt
+        copy(s2r_dCt{}, tXsdCt(_, _, _, 0), tXrdCt);
+        copy(s2r_atom_b{}, tXsARt(_, _, _, 0), tXrARt);
         gemm(mma, rDCt, rARt, rDB);
 
-        asm volatile("bar.arrive %0, %1;\n"
-            : : "r"(ar_pipe_read + BAR_CONSUMED_BASE), "n"(n_total_threads));
-
-        ++ar_pipe_read; if (ar_pipe_read == bP_ar) ar_pipe_read = 0;
-        dc_pipe_write = dc_pipe_read;
-        ++dc_pipe_read; if (dc_pipe_read == bP_dc) dc_pipe_read = 0;
+        if (mt < n_m_tiles - 1) {
+            // Signal consumed — sync with producer
+            asm volatile("bar.sync %0, %1;\n"
+                : : "r"(BAR_CONSUMED_BASE), "n"(n_total_threads));
+        } else {
+            // Last iteration — just arrive, producer won't sync again
+            asm volatile("bar.arrive %0, %1;\n"
+                : : "r"(BAR_CONSUMED_BASE), "n"(n_total_threads));
+        }
     }
 
     auto tMcDB = thr_mma.partition_C(make_identity_tensor(dB_shape));
