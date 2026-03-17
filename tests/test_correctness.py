@@ -124,7 +124,12 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--gs", type=int, default=256, help="group size")
     parser.add_argument("--rs", type=int, default=8, help="reconn size")
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="clear compiled kernel cache before testing (needed after .cu changes)")
     args = parser.parse_args()
+
+    if args.clear_cache:
+        cute_oft.clear_cache()
 
     gs, rs = args.gs, args.rs
 
