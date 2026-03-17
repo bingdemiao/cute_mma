@@ -44,13 +44,6 @@ std::vector<torch::Tensor> oft_backward_dA_dR(
     auto dA = torch::zeros({m, k}, A.options());
     auto dR = torch::zeros({n_groups * reconn_sz, k}, R.options());
 
-    // Allocate dR partial buffer via PyTorch to avoid cudaMalloc conflicts
-    // Conservatively allocate max possible size (n_buf_slots * n_groups * rs * k)
-    int64_t dR_elements = n_groups * reconn_sz * k;
-    int64_t max_buf_slots = 8;  // matches n_buf_slots_param max
-    auto dR_partial = torch::zeros({max_buf_slots * dR_elements},
-        A.options().dtype(torch::kFloat32));
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
     oft_backward_dA_dR_launch(
@@ -69,7 +62,6 @@ std::vector<torch::Tensor> oft_backward_dA_dR(
         static_cast<int>(dA.stride(0)),
         reinterpret_cast<half*>(dR.data_ptr<at::Half>()),
         static_cast<int>(dR.stride(0)),
-        dR_partial.data_ptr<float>(),
         stream
     );
 

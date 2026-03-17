@@ -545,7 +545,6 @@ void oft_backward_dA_dR_launch(
     half const* R,  int ldR,
     half* dA, int ldDA,
     half* dR, int ldDR,
-    float* dR_partial_buf,
     cudaStream_t stream)
 {
     constexpr int gs = CurrKernelParams::group_size;
@@ -565,6 +564,8 @@ void oft_backward_dA_dR_launch(
     if (n_buf_slots < 1) n_buf_slots = 1;
     int dR_elements = n_groups * rs * k;
 
+    float* dR_partial_buf = nullptr;
+    cudaMalloc(&dR_partial_buf, (int64_t)n_buf_slots * dR_elements * sizeof(float));
     cudaMemsetAsync(dR_partial_buf, 0, (int64_t)n_buf_slots * dR_elements * sizeof(float), stream);
 
     auto smem_n = get_smem_atom(cute::Int<BLK_N>{});
@@ -608,4 +609,6 @@ void oft_backward_dA_dR_launch(
             dR_partial_buf, dR, dR_elements, n_buf_slots);
     }
 
+    cudaStreamSynchronize(stream);
+    cudaFree(dR_partial_buf);
 }
