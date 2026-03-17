@@ -142,43 +142,34 @@ void dB_producer(
             clear(rAR);
             gemm(mma_ar, rA_frag, rR_frag, rAR);
 
-            // Transpose AR in registers and write to sAR_pipe:
+            if constexpr (GATED) {
+                // SiLU gating in registers: AR = A * SiLU(AR)
+                // A and C fragments have identical element-to-thread mapping.
+                constexpr int frag_sz = decltype(size(rAR))::value;
+                #pragma unroll
+                for (int i = 0; i < frag_sz; i += 2) {
+                    auto& ar2 = reinterpret_cast<__half2&>(rAR(i));
+                    auto& a2  = reinterpret_cast<const __half2&>(rA_frag(i));
+                    ar2 = __hmul2(a2, silu_h2(ar2));
+                }
+            }
+
+            // Transpose AR (or gated AR) and write to sAR_pipe:
             // blocken_C → inplace_transpose → construct_B → partition_B → auto-vectorized copy
             {
                 auto blocked = blocken_operand_C<mma_atom_ar>(rAR);
                 auto transposed = inplace_transpose(blocked);
                 auto rB = construct_operand_B<mma_atom_cons>(transposed);
 
-                // partition_B on smem sub-view → per-thread smem addresses matching rB shape
                 auto sAR_sub = local_tile(
                     sAR_pipe(_, _, ar_pipe_write),
                     make_tile(Int<rs>{}, Int<WARP_M>{}),
                     make_coord(kb, warp_idx));
                 auto thr_sB = r2s_thr_mma.partition_B(sAR_sub);
 
-                // CuTe auto-vectorizing copy (register → smem)
                 copy(rB, thr_sB);
             }
             asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
-
-            if constexpr (GATED) {
-                // SiLU gating: modify sAR_pipe in-place
-                // sAR_pipe(k_idx, m_idx, pipe) where k_idx = kb*rs+ri, m_idx = gmi
-                for (int idx = 2 * lane_idx; idx < WARP_M * rs; idx += 64) {
-                    int mi0 = idx / rs, ri0 = idx % rs;
-                    int mi1 = (idx + 1) / rs, ri1 = (idx + 1) % rs;
-                    int gmi0 = warp_idx * WARP_M + mi0;
-                    int gmi1 = warp_idx * WARP_M + mi1;
-                    __half2 ar2 = load_half2(sAR_pipe(kb * rs + ri0, gmi0, ar_pipe_write),
-                                             sAR_pipe(kb * rs + ri1, gmi1, ar_pipe_write));
-                    __half2 a2 = load_half2(sA(gmi0, kb * rs + ri0, smem_pipe_read),
-                                            sA(gmi1, kb * rs + ri1, smem_pipe_read));
-                    __half2 result = __hmul2(a2, silu_h2(ar2));
-                    store_half2(sAR_pipe(kb * rs + ri0, gmi0, ar_pipe_write),
-                                sAR_pipe(kb * rs + ri1, gmi1, ar_pipe_write), result);
-                }
-                asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
-            }
         }
 
         asm volatile("bar.sync 14, %0;\n" : : "n"(n_producer_threads));
