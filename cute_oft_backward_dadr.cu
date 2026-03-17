@@ -336,8 +336,8 @@ bwd_dadr_kernel(
             // === Phase 1: Write ALL reconn blocks to sDH_exch ===
             // Each warp writes to its own (M-range, K-range) — non-overlapping.
             copy(r2s_c_atom{}, tXrDH_c, tXsDH_c);
-            // TODO(pairwise_sync): use pairwise sync once non-swizzled sDH_exch is verified
-            __syncthreads();
+            // Pairwise sync: rs-width atom → no cross-pair address aliasing
+            asm volatile("bar.sync %0, 64;\n" : : "r"(pair_bar));
 
             // === Phase 2 (gated only): Modify sDH_exch for ALL reconn blocks ===
             // Each warp modifies its own M-range for ALL reconn blocks (needed for dR)
@@ -412,7 +412,7 @@ bwd_dadr_kernel(
                     }
                 }
                 // Pairwise sync: both warps' M-ranges are now modified
-                __syncthreads();
+                asm volatile("bar.sync %0, 64;\n" : : "r"(pair_bar));
             }
 
             // === Phase 3: dA for ALL reconn blocks, dR for OWNED blocks ===
