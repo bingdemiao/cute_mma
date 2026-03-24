@@ -156,18 +156,32 @@ class OFTLinear(nn.Module):
         n_groups = out_features // group_size
         gated = activation == "silu_gate"
 
+        # μP multipliers: absorb fan-in scaling so all raw params are O(1)
+        # and a single base learning rate works for both B and R.
+        # B has effective fan-in = K, R has effective fan-in = reconn_sz.
+        self._weight_multiplier = 1.0 / math.sqrt(in_features) if gated else 1.0
+        self._reconn_multiplier = 1.0 / math.sqrt(reconn_sz)
+
         # Weight B: (out_features, in_features)
-        # Frozen in standard OFT, trainable in gated mode
+        # Frozen in standard OFT, trainable in gated mode.
+        # In gated mode, stores O(1) raw parameter; effective B = multiplier * weight.
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features),
             requires_grad=gated,
         )
 
-        # Reconnection matrix R: (n_groups * reconn_sz, in_features)
-        # Always trainable
+        # Reconnection parameter: (n_groups * reconn_sz, in_features)
+        # In gated mode (pretraining): stores O(1) raw param, R = multiplier * reconn.
+        # In standard mode (finetuning): stores delta from identity, R = I + multiplier * reconn.
         self.reconn = nn.Parameter(
             torch.empty(n_groups * reconn_sz, in_features),
         )
+
+        # For finetuning (non-gated): store block-diagonal identity as buffer
+        if not gated:
+            n_blocks = in_features // reconn_sz
+            reconn_base = torch.eye(reconn_sz).repeat(1, n_blocks).repeat(n_groups, 1)
+            self.register_buffer("_reconn_base", reconn_base)
 
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
@@ -177,26 +191,28 @@ class OFTLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Initialize parameters.
+        """Initialize parameters with μP-correct scaling.
 
-        Weight B is initialized with Kaiming uniform (same as nn.Linear).
-        Reconnection R is initialized as block-diagonal identity matrices,
-        so the layer starts as a standard linear transform.
+        Gated mode (pretraining): Both weight and reconn are initialized as
+        O(1) random values. The ``1/sqrt(fan_in)`` multipliers are applied in
+        the forward pass, so a single base learning rate works for all params.
+
+        Standard mode (finetuning): Weight B gets Kaiming init (will typically
+        be overwritten by pretrained weights). Reconn is initialized to zero
+        (delta from identity), so R starts as the block-diagonal identity.
         """
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        gated = self.activation == "silu_gate"
 
-        # Initialize R as block-diagonal identity
-        n_groups = self.out_features // self.group_size
-        n_blocks = self.in_features // self.reconn_sz
-        with torch.no_grad():
-            self.reconn.zero_()
-            for g in range(n_groups):
-                for b in range(n_blocks):
-                    for i in range(self.reconn_sz):
-                        self.reconn[
-                            g * self.reconn_sz + i,
-                            b * self.reconn_sz + i,
-                        ] = 1.0
+        if gated:
+            # Pretraining: O(1) random init for both B_raw and R_raw.
+            # Effective B = (1/√K) * weight, R = (1/√r) * reconn.
+            nn.init.normal_(self.weight)
+            nn.init.normal_(self.reconn)
+        else:
+            # Finetuning: Kaiming B (frozen, will be overwritten),
+            # zero delta (R starts at identity).
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.reconn)
 
         if self.bias is not None:
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
@@ -222,7 +238,12 @@ class OFTLinear(nn.Module):
                 f"got {weight.shape}"
             )
         with torch.no_grad():
-            self.weight.copy_(weight)
+            if self._weight_multiplier != 1.0:
+                # In gated μP mode, weight stores the raw O(1) param;
+                # convert from actual weight space: raw = weight / multiplier.
+                self.weight.copy_(weight / self._weight_multiplier)
+            else:
+                self.weight.copy_(weight)
         if bias is not None:
             if self.bias is None:
                 raise ValueError("This layer has no bias, but bias was provided")
@@ -285,8 +306,19 @@ class OFTLinear(nn.Module):
         if A.dtype != torch.float16:
             A = A.half()
 
+        # Apply μP multipliers. Autograd chains the gradient scaling
+        # automatically: d(reconn) = multiplier * d(R_effective), etc.
+        if self._weight_multiplier != 1.0:
+            B = self._weight_multiplier * self.weight
+        else:
+            B = self.weight
+
+        R = self._reconn_multiplier * self.reconn
+        if hasattr(self, "_reconn_base"):
+            R = self._reconn_base + R
+
         C = _OFTFunction.apply(
-            A, self.weight, self.reconn,
+            A, B, R,
             self.group_size, self.reconn_sz,
             self.backend, self.activation,
             self.autotuning, self.force_rebenchmark,
