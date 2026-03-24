@@ -12,5 +12,8 @@ dependencies = [
     "einops",
 ]
 
+[project.optional-dependencies]
+mup = ["mup"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

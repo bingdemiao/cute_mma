@@ -37,7 +37,7 @@ from ._autotune import (
 )
 from ._compiler import CompilationError, clear_cache
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
-from ._module import OFTLinear
+from ._module import OFTLinear, mup_fix_oft_shapes
 from ._loader import get_or_compile
 from ._validate import (
     check_smem_limit,

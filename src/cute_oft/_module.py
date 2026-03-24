@@ -349,3 +349,30 @@ class OFTLinear(nn.Module):
         if self.autotuning:
             parts.append("autotuning=True")
         return ", ".join(parts)
+
+
+def mup_fix_oft_shapes(model: nn.Module) -> None:
+    """Mark OFTLinear parameters as finite for ``mup`` compatibility.
+
+    OFTLinear already applies μP-correct ``1/sqrt(fan_in)`` multipliers in
+    the forward pass, so ``mup``'s optimizer-level LR scaling must be
+    disabled for these parameters.  Call this **after**
+    ``mup.set_base_shapes()`` and **before** creating the optimizer::
+
+        mup.set_base_shapes(model, base_model)
+        mup_fix_oft_shapes(model)
+        optimizer = MuAdam(model.parameters(), lr=base_lr)
+
+    Args:
+        model: The model containing OFTLinear layers (already processed
+            by ``mup.set_base_shapes``).
+    """
+    from mup.infshape import InfDim, InfShape
+
+    for module in model.modules():
+        if isinstance(module, OFTLinear):
+            for param in module.parameters():
+                if hasattr(param, "infshape"):
+                    param.infshape = InfShape(
+                        [InfDim(None, d) for d in param.shape]
+                    )
