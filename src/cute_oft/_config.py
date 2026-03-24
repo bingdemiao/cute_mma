@@ -138,27 +138,20 @@ class BwdDBCompParams:
 
 @dataclasses.dataclass(frozen=True)
 class BwdDAdRCompParams:
-    """Performance parameters for the backward fused dA+dR kernel.
+    """Performance parameters for the producer-consumer backward dA+dR kernel.
 
-    All warps cooperate on both the GEMM and the group-boundary epilogue
-    (no producer-consumer split). The kernel tiles over (M, K) with z-curve
-    ordering and loops over the N dimension for each group.
-
-    GEMM: dH(bM, bK) += dC(bM, bK_inner) @ B(bK, bK_inner)^T
-    Epilogue: per-reconn-block dA accumulation + dR reduction via shuffle.
-
-    bK covers multiple reconn blocks (bK/reconn_sz), reducing dC read
-    amplification from K/reconn_sz to K/bK.
+    Producer warps (warp_layout_ar, 2D) compute the dH GEMM.
+    Consumer warps (warp_layout_arb, 1D along K) compute dA + dR.
     """
 
-    bM: int = 64           # M tile size (must be >= 16 * n_warps for MMA atom compatibility)
-    bK: int = 128          # K tile size (output cols, >= 128 for exchange-based epilogue)
-    bK_inner: int = 32     # Inner K tile for dH GEMM (tiles over gs dimension)
-    n_buf_slots: int = 8   # Number of dR buffer slots (controls atomic contention)
-    # All warps cooperate on GEMM + reconn epilogue (no producer-consumer split).
-    # Both layouts only contribute to total warp count, which must be even.
-    warp_layout_arb: tuple[int, ...] = (2, 2)  # contributes 4 warps
-    warp_layout_ar: tuple[int, ...] = (4,)     # contributes 4 warps
+    bM: int = 64           # M tile size
+    bK: int = 128          # K tile size (output cols)
+    bN: int = 32           # Inner N tile for dH GEMM (tiles over gs dimension)
+    bP_dc_b: int = 2       # Pipeline depth: dC + B async loads (producer)
+    bP_dh: int = 1         # Pipeline depth: sdH producer→consumer
+    n_buf_slots: int = 8   # Number of dR buffer slots
+    warp_layout_ar: tuple[int, ...] = (2, 2)   # Producer warps (2D: M × K)
+    warp_layout_arb: tuple[int, ...] = (4,)    # Consumer warps (1D along K)
 
     def to_header(self) -> str:
         """Generate the C++ struct definition."""
@@ -166,7 +159,10 @@ class BwdDAdRCompParams:
     struct BwdDAdRParams {{
         static const unsigned int bM = {self.bM};
         static const unsigned int bK = {self.bK};
-        static const unsigned int bK_inner = {self.bK_inner};
+        static const unsigned int bN = {self.bN};
+        static const unsigned int bK_inner = {self.bN};
+        static const unsigned int bP_dc_b = {self.bP_dc_b};
+        static const unsigned int bP_dh = {self.bP_dh};
         static const unsigned int n_buf_slots = {self.n_buf_slots};
         using warp_layout_arb = {_layout_type(self.warp_layout_arb)};
         using warp_layout_ar = {_layout_type(self.warp_layout_ar)};
@@ -177,26 +173,28 @@ class BwdDAdRCompParams:
         return hashlib.sha256(content.encode()).hexdigest()[:12]
 
     def to_dict(self) -> dict:
-        """Serialize to a JSON-compatible dictionary."""
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> BwdDAdRCompParams:
-        """Deserialize from a dictionary."""
         d = dict(d)
         for key in ("warp_layout_arb", "warp_layout_ar"):
             if key in d and isinstance(d[key], list):
                 d[key] = tuple(d[key])
-        # Remove legacy pipeline depth fields (no longer used by kernel)
-        for key in ("bP_dc_b", "bP_dh", "bP_r"):
+        if "bK_inner" in d and "bN" not in d:
+            d["bN"] = d.pop("bK_inner")
+        elif "bK_inner" in d:
+            d.pop("bK_inner")
+        for key in ("bP_r",):
             d.pop(key, None)
         return cls(**d)
 
     @classmethod
     def safe_defaults(cls) -> BwdDAdRCompParams:
-        """Conservative defaults that compile for all valid shapes."""
         return cls(
-            bM=64, bK=128, bK_inner=32,
+            bM=64, bK=128, bN=32,
+            bP_dc_b=2, bP_dh=1,
             n_buf_slots=8,
-            warp_layout_arb=(2, 2), warp_layout_ar=(4,),
+            warp_layout_ar=(2, 2), warp_layout_arb=(4,),
         )
+

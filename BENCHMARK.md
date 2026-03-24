@@ -44,3 +44,47 @@ Benchmarked on NVIDIA RTX 3080 Ti (SM86), M=N=K=8192, group_size=256, reconn_sz=
 | Forward (gated) | 13.9 | 15.5 | 0.90× (faster) |
 | Fwd+Bwd (non-gated) | 46.1 | 47.2 | 0.98× (faster) |
 | Fwd+Bwd (gated) | 89.1 | 47.2 | 1.89× |
+
+---
+
+## Backward dA+dR (Producer-Consumer Kernel, reconn_sz=16)
+
+**Setup**: M=N=K=8192, group_size=128, reconn_sz=16, float16, RTX 3080 Ti
+
+### FLOP Breakdown
+
+| Operation | Description | TFLOP |
+|-----------|-------------|-------|
+| dH GEMM | `dH = dC @ B` per group (reduces over N) | 1.10 |
+| dA (reconn MMA) | `dA_b += dH_b @ R_b` per reconn block | 0.14 |
+| AR recomputation | `AR_b = A_b @ R_b^T` (recomputed for dR) | 0.14 |
+| dR (M-reduction) | `dR_b = dH_b^T @ A_b` per reconn block | 0.14 |
+| **Total** | | **1.51** |
+
+### Performance
+
+Best autotuned config: `bM=64 bK=128 bN=16 bP_dc_b=2 bP_dh=1 n_buf_slots=8 warp_layout_ar=(2,2) warp_layout_arb=(2,)`
+
+| Backend | Time (ms) | TFLOPS | Speedup vs pytorch |
+|---------|-----------|--------|-------------------|
+| **cute (PC, autotuned)** | **40.82** | **37.0** | **82.3x** |
+| cublas | 148.65 | 10.2 | 22.6x |
+| pytorch | 3359.64 | 0.4 | 1.0x |
+
+### Efficiency Analysis
+
+| Metric | Value |
+|--------|-------|
+| Peak FP16 tensor core (spec) | 136 TFLOPS |
+| Achieved throughput | 37.0 TFLOPS |
+| **Efficiency** | **27.2%** |
+
+The 27% efficiency is expected: the dH GEMM (73% of FLOPs) is a non-standard GEMM with per-group reconn-block epilogues that limit occupancy. The producer-consumer architecture hides consumer gmem store latency (dR atomicAdd) behind the producer's next-group GEMM. The kernel is **3.6x faster than cuBLAS** for this structured operation.
+
+### Correctness (autotuned config)
+
+Verified against PyTorch reference:
+- dA mean relative error: 0.52%
+- dR mean relative error: 0.60%
+
+Within FP16 precision bounds for atomic reductions.

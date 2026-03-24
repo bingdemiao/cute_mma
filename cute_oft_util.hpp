@@ -3,6 +3,48 @@
 #include <cute/tensor.hpp>
 
 // =============================================================================
+// CuTe extensions — placed in namespace cute so ADL finds them
+// =============================================================================
+
+namespace cute {
+
+// -- SM80 f32→f16x2 conversion copy trait ------------------------------------
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+#  define CUTE_OFT_CVT_SM80_ENABLED
+#endif
+
+struct SM80_CVT_F32_F16
+{
+  using SRegisters = uint32_t[2];
+  using DRegisters = uint32_t[1];
+
+  CUTE_HOST_DEVICE static void
+  copy(uint32_t const& src1,
+       uint32_t const& src2,
+       uint32_t& dst)
+  {
+#if defined(CUTE_OFT_CVT_SM80_ENABLED)
+    asm volatile ("cvt.rn.f16x2.f32 {%0}, {%1}, {%2};\n"
+        : "=r"(dst)
+        :  "r"(src1), "r"(src2));
+#else
+    CUTE_INVALID_CONTROL_PATH("Trying to use cvt without SM80+.");
+#endif
+  }
+};
+
+// -- print overload for __half -----------------------------------------------
+
+CUTE_HOST_DEVICE
+void
+print(half a) {
+  printf("%f", static_cast<float>(a));
+}
+
+} // namespace cute
+
+// =============================================================================
 // Packed f16x2 sigmoid / SiLU primitives
 // sigmoid(x) = 0.5*(1+tanh(x*0.5))  — avoids reciprocal
 // SiLU(x) = x * sigmoid(x)
@@ -93,6 +135,7 @@ template <typename copy_as_t, typename ele_t,
 constexpr auto cp_layout(_BM bm, _BK bk, _N_Threads _total_threads) {
     using namespace cute;
     auto vec_width = Int<sizeof(copy_as_t)>{} / Int<sizeof(ele_t)>();
+    CUTE_STATIC_ASSERT_V(bk % vec_width == _0{}, "K dimension shall be divisible by the vector length");
     auto total_elements = bm * bk;
     auto needed_threads = total_elements / vec_width;
     CUTE_STATIC_ASSERT_V(total_elements % vec_width == _0{}, "total number of elements shall be divisible by the vector length");
@@ -110,6 +153,130 @@ constexpr auto cp_layout(_BM bm, _BK bk, _N_Threads _total_threads) {
                         make_layout(make_shape(threads_m_size, threads_k_size)));
 }
 
+// Select (permute) modes of a layout. Handles both plain Layout and ComposedLayout.
+// For ComposedLayout (swizzled), permutes the inner layout_b while preserving the swizzle.
+template <int... Is, class Shape, class Stride>
+CUTE_HOST_DEVICE constexpr
+auto select_layout(cute::Layout<Shape, Stride> const& layout) {
+    return cute::select<Is...>(layout);
+}
+
+template <int... Is, class A, class O, class B>
+CUTE_HOST_DEVICE constexpr
+auto select_layout(cute::ComposedLayout<A, O, B> const& layout) {
+    // Permute the inner layout (domain) while keeping the swizzle (layout_a) and offset intact
+    return cute::make_composed_layout(layout.layout_a(), layout.offset(),
+                                      cute::select<Is...>(layout.layout_b()));
+}
+
+// Select (permute) modes of a Tensor, analogous to cute::select on layouts.
+// Usage: select<1,0>(tensor)  — swaps modes 0 and 1 (transpose)
+//        select<2,0,1>(tensor) — arbitrary mode permutation
+// Works with both plain and swizzled (ComposedLayout) smem tensors.
+template <int... Is, class Engine, class Layout>
+CUTE_HOST_DEVICE
+auto select(cute::Tensor<Engine, Layout> const& tensor) {
+    return cute::make_tensor(tensor.data(), select_layout<Is...>(tensor.layout()));
+}
+
+// Swap two outer modes of a Tensor.
+// Usage: transpose<0,2>(tensor) — swaps modes 0 and 2
+namespace detail {
+template <int I, int J>
+struct swap_index {
+    static constexpr int apply(int k) { return k == I ? J : (k == J ? I : k); }
+};
+
+template <int I, int J, class Engine, class Layout, int... Ks>
+CUTE_HOST_DEVICE
+auto transpose_impl(cute::Tensor<Engine, Layout> const& tensor,
+                     std::integer_sequence<int, Ks...>) {
+    return select<swap_index<I, J>::apply(Ks)...>(tensor);
+}
+} // namespace detail
+
+template <int I, int J, class Engine, class Layout>
+CUTE_HOST_DEVICE
+auto transpose(cute::Tensor<Engine, Layout> const& tensor) {
+    constexpr int R = cute::rank(Layout{});
+    static_assert(I >= 0 && I < R, "Mode index I out of range");
+    static_assert(J >= 0 && J < R, "Mode index J out of range");
+    static_assert(I != J, "Mode indices must be different");
+    return detail::transpose_impl<I, J>(tensor, std::make_integer_sequence<int, R>{});
+}
+
+// Replace mode I of a plain Layout with a new sub-layout.
+template <int I, class Shape, class Stride, class NewShape, class NewStride>
+CUTE_HOST_DEVICE constexpr
+auto replace_mode(cute::Layout<Shape, Stride> const& layout,
+                  cute::Layout<NewShape, NewStride> const& new_mode) {
+    return cute::make_layout(
+        cute::replace<I>(layout.shape(),  new_mode.shape()),
+        cute::replace<I>(layout.stride(), new_mode.stride())
+    );
+}
+
+// Replace mode I of a ComposedLayout (swizzled) — modifies layout_b only.
+template <int I, class A, class O, class B, class NewShape, class NewStride>
+CUTE_HOST_DEVICE constexpr
+auto replace_mode(cute::ComposedLayout<A, O, B> const& layout,
+                  cute::Layout<NewShape, NewStride> const& new_mode) {
+    return cute::make_composed_layout(
+        layout.layout_a(), layout.offset(),
+        replace_mode<I>(layout.layout_b(), new_mode)
+    );
+}
+
+// Pad mode I of a tensor by appending a stride-0 repeat dimension.
+// Shape of mode I becomes (original_shape, PadFactor) with stride (original_stride, 0).
+// The logical size of mode I grows by PadFactor, but all new elements alias the originals.
+// When PadFactor == 1, returns the tensor unchanged (complete no-op).
+// Works with both plain and swizzled (ComposedLayout) smem tensors.
+
+// PadFactor == 1: no-op, return original tensor unchanged (preserves layout type)
+template <int I, int PadFactor, class Engine, class Layout>
+CUTE_HOST_DEVICE
+auto pad_mode_stride0(cute::Tensor<Engine, Layout> const& tensor)
+    -> std::enable_if_t<PadFactor == 1, cute::Tensor<Engine, Layout> const&> {
+    return tensor;
+}
+
+// PadFactor > 1, plain Layout: extract shape/stride directly
+template <int I, int PadFactor, class Engine, class Shape, class Stride>
+CUTE_HOST_DEVICE
+auto pad_mode_stride0(cute::Tensor<Engine, cute::Layout<Shape, Stride>> const& tensor)
+    -> std::enable_if_t<(PadFactor > 1), decltype(cute::make_tensor(tensor.data(),
+        replace_mode<I>(tensor.layout(), cute::make_layout(
+            cute::make_shape(cute::get<I>(tensor.layout().shape()), cute::Int<PadFactor>{}),
+            cute::make_stride(cute::get<I>(tensor.layout().stride()), cute::_0{})))))> {
+    using namespace cute;
+    auto old_shape  = get<I>(tensor.layout().shape());
+    auto old_stride = get<I>(tensor.layout().stride());
+    auto new_mode = make_layout(
+        make_shape(old_shape, Int<PadFactor>{}),
+        make_stride(old_stride, _0{})
+    );
+    return make_tensor(tensor.data(), replace_mode<I>(tensor.layout(), new_mode));
+}
+
+// PadFactor > 1, ComposedLayout (swizzled): extract shape/stride from layout_b
+template <int I, int PadFactor, class Engine, class A, class O, class B>
+CUTE_HOST_DEVICE
+auto pad_mode_stride0(cute::Tensor<Engine, cute::ComposedLayout<A, O, B>> const& tensor)
+    -> std::enable_if_t<(PadFactor > 1), decltype(cute::make_tensor(tensor.data(),
+        replace_mode<I>(tensor.layout(), cute::make_layout(
+            cute::make_shape(cute::get<I>(tensor.layout().layout_b().shape()), cute::Int<PadFactor>{}),
+            cute::make_stride(cute::get<I>(tensor.layout().layout_b().stride()), cute::_0{})))))> {
+    using namespace cute;
+    auto old_shape  = get<I>(tensor.layout().layout_b().shape());
+    auto old_stride = get<I>(tensor.layout().layout_b().stride());
+    auto new_mode = make_layout(
+        make_shape(old_shape, Int<PadFactor>{}),
+        make_stride(old_stride, _0{})
+    );
+    return make_tensor(tensor.data(), replace_mode<I>(tensor.layout(), new_mode));
+}
+
 template <bool swizzle = true, int _k_width>
 CUTE_HOST_DEVICE constexpr
 auto get_smem_atom(cute::Int<_k_width>) {
@@ -124,7 +291,11 @@ auto get_smem_atom(cute::Int<_k_width>) {
     CUTE_STATIC_ASSERT(k_width % 8 == 0);
     CUTE_STATIC_ASSERT_V(k_width == bit_floor(k_width)); // k_width must be a power of two
     constexpr auto n_blocks = k_width / _8{};
-    constexpr auto permutation_bits = log_2(static_cast<unsigned int>(_k_width)) - _3{};
+    // Cap swizzle at 3 permutation bits (Swizzle<3,3>, covering 64 elements per row).
+    // 8 segments × 4 banks each = 32 banks fully utilized. Beyond 64 elements,
+    // additional swizzle bits just repeat the same bank pattern.
+    constexpr unsigned raw_perm_bits = log_2(static_cast<unsigned int>(_k_width)) - 3u;
+    constexpr unsigned permutation_bits = raw_perm_bits > 3u ? 3u : raw_perm_bits;
     constexpr auto base_layout = make_layout(
         make_shape(_8{}, make_shape(_8{}, n_blocks)),
         make_stride(_8{}, make_stride(_1{}, _64{}))
@@ -135,15 +306,6 @@ auto get_smem_atom(cute::Int<_k_width>) {
         constexpr auto sw = Swizzle<permutation_bits, 6 - permutation_bits>{};
         return composition(sw, base_layout);
     }
-}
-
-// In-place 8x8 matrix transpose in registers via PTX movmatrix instruction.
-// Each thread in a warp holds one u32 (= 2 f16 values) of the 8x8 matrix.
-// After transpose, each thread's u32 holds the transposed elements.
-// Works in-place (d == a is valid, verified empirically).
-__device__ __forceinline__
-void movmatrix_trans_b16(unsigned int& reg) {
-    asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %0;" : "+r"(reg));
 }
 
 // In-place transpose of MMA fragment register tensor via movmatrix.
@@ -167,19 +329,12 @@ auto inplace_transpose(cute::Tensor<Engine, Layout>& tensor) {
     static_assert(size<0>(Layout{}) == _2{}, "Mode 0 must be 2 (one u32 = 2 f16)");
     static_assert(sizeof(typename Engine::value_type) == 2, "Value type must be 16-bit");
 
-    // Apply movmatrix to every u32
-    #pragma unroll
-    for (int i = 0; i < size<1>(Layout{}); ++i) {
-        #pragma unroll
-        for (int j = 0; j < size<2>(Layout{}); ++j) {
-            auto& reg = reinterpret_cast<unsigned int&>(tensor(0, i, j));
-            movmatrix_trans_b16(reg);
-        }
-    }
+    // Apply movmatrix to every u32 via CuTe copy atom
+    // Mode 0 (size 2) matches the atom's value width (1 u32 = 2 half_t)
+    copy(Copy_Atom<SM75_U32x1_MOVM_T, typename Engine::value_type>{}, tensor, tensor);
 
     // Return view with modes 1 and 2 swapped: (2, MMA_M, MMA_K) → (2, MMA_K, MMA_M)
-    auto final_layout = make_layout(get<0>(Layout{}), get<2>(Layout{}), get<1>(Layout{}));
-    return make_tensor(&tensor(0), final_layout);
+    return select<0, 2, 1>(tensor);
 }
 
 // Store a blockened register tensor (2, dim1_blocks, dim2_blocks) to a 2D smem tensor.

@@ -105,26 +105,25 @@ def compute_smem_bytes(
 def compute_smem_bytes_bwd_dadr(
     bM: int,
     bK: int,
-    bK_inner: int,
+    bN: int,
     group_size: int,
     reconn_sz: int,
+    bP_dc_b: int = 2,
+    bP_dh: int = 1,
 ) -> int:
-    """Compute shared memory usage for backward dA+dR kernel.
+    """Compute shared memory usage for backward dA+dR kernel (producer-consumer).
 
-    Mirrors the smem calculation in oft_backward_dA_dR_launch().
-    Layout: sdC(bM, bK_inner, 2) + sB(bK, bK_inner, 2)
-          + sA(bM, bK) + sR(rs, bK, 2) + sDH_exch(bM, bK)
-          + sDR_acc(rs, bK) [float]
+    Layout: sdC(bM, bN, bP_dc_b) + sB(bK, bN, bP_dc_b)
+          + sdH(bM, bK, bP_dh) + sA(bM, bK) + sR(rs, bK, 2)
     """
     rs = reconn_sz
-    size_dC = bM * bK_inner * 2     # double-buffered
-    size_B = bK * bK_inner * 2      # double-buffered
-    size_A = bM * bK                 # single buffer
-    size_R = rs * bK * 2             # double-buffered
-    size_dH_exch = bM * bK           # full dH exchange buffer
-    half_elems = size_dC + size_B + size_A + size_R + size_dH_exch
-    smem = half_elems * 2 + rs * bK * 4 + 256  # +float sDR_acc +alignment
-    return smem
+    size_dC = bM * bN * bP_dc_b
+    size_B = bK * bN * bP_dc_b
+    size_dH = bM * bK * bP_dh
+    size_A = bM * bK
+    size_R = rs * bK * 2
+    half_elems = size_dC + size_B + size_dH + size_A + size_R
+    return half_elems * 2 + 256
 
 
 def compute_smem_bytes_bwd_db(

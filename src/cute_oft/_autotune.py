@@ -91,49 +91,49 @@ def default_search_space_bwd_dadr(
     reconn_sz: int,
     device: int = 0,
 ) -> list[BwdDAdRCompParams]:
-    """Generate candidate BwdDAdRCompParams configurations.
+    """Generate candidate configs for the PC (producer-consumer) dAdR kernel.
 
-    The kernel uses all warps cooperatively (no producer-consumer split).
-    Both warp layouts only contribute to total warp count, which must be even
-    (kernel splits warps as n_warps_M × n_warps_K=2 for the GEMM).
+    The dH GEMM reduces over N (group dimension), so bN should be small
+    while bM and bK should be large.  Producer warps (2D) do the heavy GEMM;
+    consumer warps (1D along K) handle the lightweight dA/dR epilogue.
     """
-    # Warp presets: (warp_layout_arb, warp_layout_ar) → total warps
-    # Total must be even for the n_warps_K=2 GEMM layout.
+    # (consumer, producer) — producer gets more warps for the heavy GEMM
     warp_presets: list[tuple[tuple[int, ...], tuple[int, ...]]] = [
-        ((2, 2), (2,)),  # 6 warps total
-        ((2, 2), (4,)),  # 8 warps total
-        ((2,), (2,)),    # 4 warps total
+        ((2,), (2, 2)),    # 2 consumer + 4 producer = 6 warps
+        ((2,), (2, 4)),    # 2 consumer + 6 producer = 8 warps
+        ((4,), (2, 4)),    # 4 consumer + 8 producer = 12 warps
     ]
 
     candidates: list[BwdDAdRCompParams] = []
-    for bM in (64, 128):
-        for bK in (64, 128):
-            for bK_inner in (16, 32):
-                if group_size % bK_inner != 0:
+    for bM in (64, 128, 256):
+        for bK in (128, 256):
+            for bN in (16, 32):
+                if group_size % bN != 0:
                     continue
-                for n_buf_slots in (8,):
-                    for wl_arb, wl_ar in warp_presets:
-                        n_warps = _warp_count(wl_arb) + _warp_count(wl_ar)
-                        if n_warps % 2 != 0:
-                            continue
-                        n_warps_M = n_warps // 2
-                        if bM % n_warps_M != 0:
-                            continue
-                        params = BwdDAdRCompParams(
-                            bM=bM, bK=bK, bK_inner=bK_inner,
-                            n_buf_slots=n_buf_slots,
-                            warp_layout_arb=wl_arb,
-                            warp_layout_ar=wl_ar,
-                        )
-                        try:
-                            smem = compute_smem_bytes_bwd_dadr(
-                                bM, bK, bK_inner,
-                                group_size, reconn_sz,
-                            )
-                            check_smem_limit(smem, device)
-                        except (RuntimeError, ValueError):
-                            continue
-                        candidates.append(params)
+                for bP_dc_b in (2,):
+                    for bP_dh in (1,):
+                        for n_buf_slots in (4, 8):
+                            for wl_arb, wl_ar in warp_presets:
+                                n_cons = _warp_count(wl_arb)
+                                warp_k = bK // n_cons
+                                if warp_k < reconn_sz or warp_k % reconn_sz != 0:
+                                    continue
+                                params = BwdDAdRCompParams(
+                                    bM=bM, bK=bK, bN=bN,
+                                    bP_dc_b=bP_dc_b, bP_dh=bP_dh,
+                                    n_buf_slots=n_buf_slots,
+                                    warp_layout_arb=wl_arb,
+                                    warp_layout_ar=wl_ar,
+                                )
+                                try:
+                                    smem = compute_smem_bytes_bwd_dadr(
+                                        bM, bK, bN, group_size, reconn_sz,
+                                        bP_dc_b=bP_dc_b, bP_dh=bP_dh,
+                                    )
+                                    check_smem_limit(smem, device)
+                                except (RuntimeError, ValueError):
+                                    continue
+                                candidates.append(params)
     return candidates
 
 
@@ -152,39 +152,56 @@ def default_search_space_bwd_db(
 ) -> list[BwdDBCompParams]:
     """Generate candidate BwdDBCompParams configurations."""
     # Warp presets: (warp_layout_ar, warp_layout_arb)
-    # dB: ar = AR producer, arb = heavy consumer (dC^T@AR)
+    # dB: ar = AR producer (1D), arb = heavy consumer (2D: warp_along_N, warp_along_K)
     warp_presets: list[tuple[tuple[int, ...], tuple[int, ...]]] = [
-        ((2,), (2, 2)),  # 2 AR, 4 ARB (current default)
-        ((2,), (2,)),    # lighter
-        ((4,), (2, 2)),  # more AR producers
+        ((2,), (1, 2)),  # 2 AR, 2 consumer (split K)
+        ((2,), (2, 2)),  # 2 AR, 4 consumer (split N and K)
+        ((2,), (2, 4)),  # 2 AR, 8 consumer
     ]
 
     candidates: list[BwdDBCompParams] = []
-    for bM in (32, 64):
-        for bK in (32, 64):
-            if bK % reconn_sz != 0:
-                continue
-            for bP_a in (2, 3):
-                for bP_ar in (2, 3):
-                    for bP_dc in (2, 3):
-                        for wl_ar, wl_arb in warp_presets:
-                            n_producer_warps = _warp_count(wl_ar)
-                            if bM % n_producer_warps != 0:
-                                continue
-                            params = BwdDBCompParams(
-                                bM=bM, bK=bK,
-                                bP_a=bP_a, bP_ar=bP_ar, bP_dc=bP_dc,
-                                warp_layout_ar=wl_ar, warp_layout_arb=wl_arb,
-                            )
-                            try:
-                                smem = compute_smem_bytes_bwd_db(
-                                    bM, bK, group_size, reconn_sz,
-                                    bP_a, bP_ar, bP_dc,
-                                )
-                                check_smem_limit(smem, device)
-                            except (RuntimeError, ValueError):
-                                continue
-                            candidates.append(params)
+    for bM in (16, 32):
+        for bN in (128, 256):  # bN = group_size for now; multi-group later
+            for bK in (128, 256):
+                if bK % reconn_sz != 0:
+                    continue
+                for c_width in (16,):
+                    if bM % c_width != 0:
+                        continue
+                    for bP_a in (2, 3):
+                        for bP_ar in (2,):
+                            for bP_dc in (2, 3):
+                                for wl_ar, wl_arb in warp_presets:
+                                    n_producer_warps = _warp_count(wl_ar)
+                                    n_consumer_warps = _warp_count(wl_arb)
+                                    warp_along_n = wl_arb[0] if len(wl_arb) >= 2 else 1
+                                    warp_along_k = wl_arb[1] if len(wl_arb) >= 2 else wl_arb[0]
+                                    # Validate tile divisibility
+                                    if bM % n_producer_warps != 0:
+                                        continue
+                                    if bN % warp_along_n != 0:
+                                        continue
+                                    if bK % warp_along_k != 0:
+                                        continue
+                                    warp_tile_n = bN // warp_along_n
+                                    if warp_tile_n > group_size:
+                                        continue
+                                    if warp_tile_n < 8:
+                                        continue
+                                    params = BwdDBCompParams(
+                                        bM=bM, bN=bN, bK=bK, c_width=c_width,
+                                        bP_a=bP_a, bP_ar=bP_ar, bP_dc=bP_dc,
+                                        warp_layout_ar=wl_ar, warp_layout_arb=wl_arb,
+                                    )
+                                    try:
+                                        smem = compute_smem_bytes_bwd_db(
+                                            bM, bK, group_size, reconn_sz,
+                                            bP_a, bP_ar, bP_dc,
+                                        )
+                                        check_smem_limit(smem, device)
+                                    except (RuntimeError, ValueError):
+                                        continue
+                                    candidates.append(params)
     return candidates
 
 
@@ -876,7 +893,7 @@ def _config_summary(config) -> str:
         )
     elif isinstance(config, BwdDAdRCompParams):
         return (
-            f"bM={config.bM} bK={config.bK} bKi={config.bK_inner} "
+            f"bM={config.bM} bK={config.bK} bN={config.bN} "
             f"bufs={config.n_buf_slots}"
         )
     elif isinstance(config, BwdDBCompParams):
