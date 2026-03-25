@@ -11,64 +11,104 @@ import torch.nn as nn
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 
 
-class _OFTFunction(torch.autograd.Function):
-    """Custom autograd function wiring cute_oft forward/backward."""
+# ---------------------------------------------------------------------------
+# Custom ops: opaque to torch.compile, with fake-tensor + autograd support
+# ---------------------------------------------------------------------------
 
-    @staticmethod
-    def forward(
-        ctx,
-        A: torch.Tensor,
-        B: torch.Tensor,
-        R: torch.Tensor,
-        group_size: int,
-        reconn_sz: int,
-        backend: str,
-        activation: str | None,
-        autotuning: bool,
-        force_rebenchmark: bool,
-        comp_params,
-        bwd_dadr_params,
-        bwd_db_params,
-    ) -> torch.Tensor:
-        from . import forward as oft_forward
+@torch.library.custom_op("cute_oft::forward", mutates_args=())
+def _oft_forward_op(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    R: torch.Tensor,
+    group_size: int,
+    reconn_sz: int,
+    backend: str,
+    activation: str,
+    autotuning: bool,
+    force_rebenchmark: bool,
+) -> torch.Tensor:
+    from . import forward as oft_forward
 
-        ctx.save_for_backward(A, B, R)
-        ctx.group_size = group_size
-        ctx.reconn_sz = reconn_sz
-        ctx.backend = backend
-        ctx.activation = activation
-        ctx.autotuning = autotuning
-        ctx.force_rebenchmark = force_rebenchmark
-        ctx.comp_params = comp_params
-        ctx.bwd_dadr_params = bwd_dadr_params
-        ctx.bwd_db_params = bwd_db_params
+    return oft_forward(
+        A, B, R, group_size, reconn_sz,
+        backend=backend,
+        activation=activation or None,
+        autotuning=autotuning,
+        force_rebenchmark=force_rebenchmark,
+    )
 
-        return oft_forward(
-            A, B, R, group_size, reconn_sz,
-            backend=backend, comp_params=comp_params,
-            activation=activation, autotuning=autotuning,
-            force_rebenchmark=force_rebenchmark,
-        )
 
-    @staticmethod
-    def backward(ctx, dC: torch.Tensor):
-        from . import backward as oft_backward
+@_oft_forward_op.register_fake
+def _(A, B, R, group_size, reconn_sz, backend, activation, autotuning,
+      force_rebenchmark):
+    return A.new_empty(A.shape[0], B.shape[0])
 
-        A, B, R = ctx.saved_tensors
 
-        dA, dR, dB = oft_backward(
-            dC, A, B, R,
-            ctx.group_size, ctx.reconn_sz,
-            backend=ctx.backend,
-            activation=ctx.activation,
-            autotuning=ctx.autotuning,
-            force_rebenchmark=ctx.force_rebenchmark,
-            bwd_dadr_params=ctx.bwd_dadr_params,
-            bwd_db_params=ctx.bwd_db_params,
-        )
+@torch.library.custom_op("cute_oft::backward", mutates_args=())
+def _oft_backward_op(
+    dC: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    R: torch.Tensor,
+    group_size: int,
+    reconn_sz: int,
+    backend: str,
+    activation: str,
+    autotuning: bool,
+    force_rebenchmark: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from . import backward as oft_backward
 
-        # Return grads for: A, B, R, and None for the non-tensor args
-        return dA, dB, dR, None, None, None, None, None, None, None, None, None
+    dA, dR, dB = oft_backward(
+        dC.contiguous(), A.contiguous(), B.contiguous(), R.contiguous(),
+        group_size, reconn_sz,
+        backend=backend,
+        activation=activation or None,
+        autotuning=autotuning,
+        force_rebenchmark=force_rebenchmark,
+    )
+
+    if dB is None:
+        dB = torch.zeros_like(B)
+    if dR is None:
+        dR = torch.zeros_like(R)
+
+    return dA, dR, dB
+
+
+@_oft_backward_op.register_fake
+def _(dC, A, B, R, group_size, reconn_sz, backend, activation, autotuning,
+      force_rebenchmark):
+    return A.new_empty(A.shape), R.new_empty(R.shape), B.new_empty(B.shape)
+
+
+def _oft_setup_context(ctx, inputs, output):
+    A, B, R, group_size, reconn_sz, backend, activation, autotuning, \
+        force_rebenchmark = inputs
+    ctx.save_for_backward(A, B, R)
+    ctx.group_size = group_size
+    ctx.reconn_sz = reconn_sz
+    ctx.backend = backend
+    ctx.activation = activation
+    ctx.autotuning = autotuning
+    ctx.force_rebenchmark = force_rebenchmark
+
+
+def _oft_backward(ctx, dC):
+    A, B, R = ctx.saved_tensors
+
+    dA, dR, dB = _oft_backward_op(
+        dC, A, B, R,
+        ctx.group_size, ctx.reconn_sz,
+        ctx.backend, ctx.activation,
+        ctx.autotuning, ctx.force_rebenchmark,
+    )
+
+    # Grads for: A, B, R, then None for the 6 non-tensor args
+    return dA, dB, dR, None, None, None, None, None, None
+
+
+_oft_forward_op.register_autograd(_oft_backward, setup_context=_oft_setup_context)
 
 
 class OFTLinear(nn.Module):
@@ -81,6 +121,11 @@ class OFTLinear(nn.Module):
     is frozen — this is the classic OFT fine-tuning setup. In gated mode
     (``activation="silu_gate"``), both R and B are trainable, enabling the
     layer to act as a width expansion with ``n_groups`` independent pathways.
+
+    Compatible with ``torch.compile``. The OFT kernel call is registered as
+    a custom op, so the compiler treats it as opaque and traces through the
+    surrounding standard torch operations (μP multipliers, reshape, bias)
+    normally.
 
     Args:
         in_features: Input dimension (K).
@@ -302,12 +347,8 @@ class OFTLinear(nn.Module):
         orig_shape = input.shape
         A = input.reshape(-1, self.in_features)
 
-        # Ensure half precision for CUDA kernels
-        if A.dtype != torch.float16:
-            A = A.half()
-
-        # Apply μP multipliers. Autograd chains the gradient scaling
-        # automatically: d(reconn) = multiplier * d(R_effective), etc.
+        # Apply μP multipliers. These are standard torch ops that the
+        # compiler can trace and fuse with surrounding operations.
         if self._weight_multiplier != 1.0:
             B = self._weight_multiplier * self.weight
         else:
@@ -317,12 +358,13 @@ class OFTLinear(nn.Module):
         if hasattr(self, "_reconn_base"):
             R = self._reconn_base + R
 
-        C = _OFTFunction.apply(
+        # The custom op call is opaque to torch.compile — no graph breaks.
+        # activation="" is used as sentinel for None (custom_op requires str).
+        C = _oft_forward_op(
             A, B, R,
             self.group_size, self.reconn_sz,
-            self.backend, self.activation,
+            self.backend, self.activation or "",
             self.autotuning, self.force_rebenchmark,
-            self.comp_params, self.bwd_dadr_params, self.bwd_db_params,
         )
 
         # Restore leading dimensions
