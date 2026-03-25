@@ -39,16 +39,23 @@ def validate_tensor_params(
 ) -> None:
     """Validate tensor shapes and properties for a specific forward call."""
     # Device checks
+    _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
     for name, t in [("A", A), ("B", B), ("R", R)]:
         if not t.is_cuda:
             raise ValueError(f"{name} must be a CUDA tensor, got device={t.device}")
-        if t.dtype != torch.float16:
-            raise ValueError(f"{name} must be float16, got dtype={t.dtype}")
+        if t.dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(
+                f"{name} must be float16 or bfloat16, got dtype={t.dtype}"
+            )
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous (row-major)")
         if t.dim() != 2:
             raise ValueError(f"{name} must be 2D, got {t.dim()}D")
 
+    if not (A.dtype == B.dtype == R.dtype):
+        raise ValueError(
+            f"All tensors must have the same dtype, got A={A.dtype}, B={B.dtype}, R={R.dtype}"
+        )
     if not (A.device == B.device == R.device):
         raise ValueError("All tensors must be on the same CUDA device")
 

@@ -86,9 +86,9 @@ def forward(
     """Compute C = A @ diag(R) @ B^T with OFT structure.
 
     Args:
-        A: Input tensor of shape (M, K), float16, CUDA.
-        B: Weight tensor of shape (N, K), float16, CUDA.
-        R: Reconnection matrix of shape (n_groups * reconn_sz, K), float16, CUDA.
+        A: Input tensor of shape (M, K), float16 or bfloat16, CUDA.
+        B: Weight tensor of shape (N, K), same dtype as A, CUDA.
+        R: Reconnection matrix of shape (n_groups * reconn_sz, K), same dtype as A, CUDA.
         group_size: Number of output channels per group. Must be a multiple of 8.
         reconn_sz: Reconnection block size. Must be a multiple of 8.
         backend: Computation backend ("cute", "cublas", "pytorch").
@@ -100,7 +100,7 @@ def forward(
         autotuning_search_space: Custom search space for autotuning (uses default if None).
 
     Returns:
-        Output tensor of shape (M, N), float16, CUDA.
+        Output tensor of shape (M, N), same dtype as inputs, CUDA.
     """
     if backend not in BACKENDS:
         raise ValueError(
@@ -188,6 +188,8 @@ def backward(
     bwd_dadr_params: BwdDAdRCompParams | None = None,
     bwd_db_params: BwdDBCompParams | None = None,
     force_rebenchmark: bool = False,
+    dR_dtype: torch.dtype | None = None,
+    dB_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Compute gradients for OFT backward pass.
 
@@ -198,10 +200,10 @@ def backward(
     computed and returned as None, since B is frozen.
 
     Args:
-        dC: Gradient of loss w.r.t. output C, shape (M, N), float16, CUDA.
-        A: Input tensor of shape (M, K), float16, CUDA.
-        B: Weight tensor of shape (N, K), float16, CUDA.
-        R: Reconnection matrix of shape (n_groups * reconn_sz, K), float16, CUDA.
+        dC: Gradient of loss w.r.t. output C, shape (M, N), float16/bfloat16, CUDA.
+        A: Input tensor of shape (M, K), same dtype as dC.
+        B: Weight tensor of shape (N, K), same dtype as dC.
+        R: Reconnection matrix of shape (n_groups * reconn_sz, K), same dtype as dC.
         group_size: Number of output channels per group.
         reconn_sz: Reconnection block size.
         backend: Computation backend. "pytorch", "cublas", or "cute".
@@ -212,6 +214,10 @@ def backward(
         autotuning_search_space_db: Custom search space for dB kernel autotuning.
         bwd_dadr_params: Explicit BwdDAdRCompParams override.
         bwd_db_params: Explicit BwdDBCompParams override.
+        dR_dtype: Optional dtype for dR gradient (default: R.dtype).
+            Useful for mixed-precision training (e.g. torch.float32).
+        dB_dtype: Optional dtype for dB gradient (default: B.dtype).
+            Useful for mixed-precision training (e.g. torch.float32).
 
     Returns:
         (dA, dR, dB) — gradients w.r.t. A, R, B respectively.
@@ -233,10 +239,10 @@ def backward(
 
     if backend == "cublas":
         module = get_or_compile(group_size, reconn_sz, backend)
-        grads = module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated)
+        grads = module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated, dR_dtype)
         dA, dR = grads[0], grads[1]
         if gated:
-            dB_out = module.backward_dB(dC, A, R, group_size, reconn_sz, gated)
+            dB_out = module.backward_dB(dC, A, R, group_size, reconn_sz, gated, dB_dtype)
         else:
             dB_out = None
         return dA, dR, dB_out

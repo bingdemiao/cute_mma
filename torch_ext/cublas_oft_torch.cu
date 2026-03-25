@@ -1,9 +1,14 @@
 #include <torch/types.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cublas_v2.h>
 #include <stdexcept>
 #include <string>
+
+// ---------------------------------------------------------------------------
+// Error checking
+// ---------------------------------------------------------------------------
 
 #define GEMM_CHECK_CUBLAS(call)                                                                   \
     do {                                                                                          \
@@ -13,339 +18,454 @@
         }                                                                                         \
     } while (0)
 
-// Element-wise kernel: out[i] = A[i] * silu(AR[i])
-// where silu(x) = x / (1 + exp(-x))
-__global__ void silu_gate_kernel(const half* A, half* AR, int64_t numel) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < numel) {
-        float a = __half2float(A[idx]);
-        float ar = __half2float(AR[idx]);
-        float silu_ar = ar / (1.0f + __expf(-ar));
-        AR[idx] = __float2half(a * silu_ar);
+// ---------------------------------------------------------------------------
+// Type helpers
+// ---------------------------------------------------------------------------
+
+static cudaDataType_t torch_to_cublas_dtype(at::ScalarType dtype) {
+    switch (dtype) {
+        case at::kHalf:     return CUDA_R_16F;
+        case at::kBFloat16: return CUDA_R_16BF;
+        case at::kFloat:    return CUDA_R_32F;
+        default:
+            TORCH_CHECK(false, "Unsupported dtype for cuBLAS: ", dtype);
+            return CUDA_R_16F; // unreachable
     }
 }
 
-// AR mode: C = (A @ R^T) @ B^T, computed per group
-// With gated=true: C = (A * SiLU(A @ R^T)) @ B^T
-static torch::Tensor cublas_oft_ar(
-    const half* A_ptr, const half* B_ptr, const half* R_ptr, half* C_ptr,
+template<typename T> __device__ __forceinline__ float to_float(T v);
+template<> __device__ __forceinline__ float to_float(half v) { return __half2float(v); }
+template<> __device__ __forceinline__ float to_float(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+template<typename T> __device__ __forceinline__ T from_float(float v);
+template<> __device__ __forceinline__ half from_float(float v) { return __float2half(v); }
+template<> __device__ __forceinline__ __nv_bfloat16 from_float(float v) { return __float2bfloat16(v); }
+
+// ---------------------------------------------------------------------------
+// cuBLAS GemmEx wrappers (f32 compute, f32 alpha/beta)
+// ---------------------------------------------------------------------------
+
+static void gemm_ex(
+    cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int64_t m, int64_t n, int64_t k,
+    const void* A, cudaDataType_t Atype, int64_t lda,
+    const void* B, cudaDataType_t Btype, int64_t ldb,
+    void* C, cudaDataType_t Ctype, int64_t ldc,
+    float alpha = 1.0f, float beta = 0.0f)
+{
+    GEMM_CHECK_CUBLAS(cublasGemmEx(
+        handle, transa, transb,
+        (int)m, (int)n, (int)k,
+        &alpha,
+        A, Atype, (int)lda,
+        B, Btype, (int)ldb,
+        &beta,
+        C, Ctype, (int)ldc,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+static void gemm_strided_batched_ex(
+    cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int64_t m, int64_t n, int64_t k,
+    const void* A, cudaDataType_t Atype, int64_t lda, int64_t strideA,
+    const void* B, cudaDataType_t Btype, int64_t ldb, int64_t strideB,
+    void* C, cudaDataType_t Ctype, int64_t ldc, int64_t strideC,
+    int64_t batchCount,
+    float alpha = 1.0f, float beta = 0.0f)
+{
+    GEMM_CHECK_CUBLAS(cublasGemmStridedBatchedEx(
+        handle, transa, transb,
+        (int)m, (int)n, (int)k,
+        &alpha,
+        A, Atype, (int)lda, (long long)strideA,
+        B, Btype, (int)ldb, (long long)strideB,
+        &beta,
+        C, Ctype, (int)ldc, (long long)strideC,
+        (int)batchCount,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+// ---------------------------------------------------------------------------
+// Templated element-wise kernels
+// ---------------------------------------------------------------------------
+
+// AR = A * SiLU(AR)
+template<typename T>
+__global__ void silu_gate_kernel(const T* A, T* AR, int64_t numel) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numel) {
+        float a = to_float(A[idx]);
+        float ar = to_float(AR[idx]);
+        float silu_ar = ar / (1.0f + __expf(-ar));
+        AR[idx] = from_float<T>(a * silu_ar);
+    }
+}
+
+// dst[i] += src[i]
+template<typename T>
+__global__ void add_kernel(T* dst, const T* src, int64_t numel) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numel) {
+        dst[idx] = from_float<T>(to_float(dst[idx]) + to_float(src[idx]));
+    }
+}
+
+// dS[i] = dH[i] * A[i] * silu_prime(S[i])
+template<typename T>
+__global__ void silu_gate_backward_ds_kernel(
+    const T* dH, const T* A, const T* S, T* dS, int64_t numel)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numel) {
+        float dh = to_float(dH[idx]);
+        float a = to_float(A[idx]);
+        float s = to_float(S[idx]);
+        float sigma = 1.0f / (1.0f + __expf(-s));
+        float silu_prime = sigma * (1.0f + s * (1.0f - sigma));
+        dS[idx] = from_float<T>(dh * a * silu_prime);
+    }
+}
+
+// dA_gate[i] = dH[i] * silu(S[i])
+template<typename T>
+__global__ void silu_gate_backward_da_kernel(
+    const T* dH, const T* S, T* dA_gate, int64_t numel)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numel) {
+        float dh = to_float(dH[idx]);
+        float s = to_float(S[idx]);
+        float silu_s = s / (1.0f + __expf(-s));
+        dA_gate[idx] = from_float<T>(dh * silu_s);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forward: AR mode  C = (A @ R^T) @ B^T  [gated: C = (A * SiLU(A @ R^T)) @ B^T]
+// ---------------------------------------------------------------------------
+
+template<typename scalar_t>
+static void cublas_oft_ar_impl(
+    const scalar_t* A_ptr, const scalar_t* B_ptr, const scalar_t* R_ptr, scalar_t* C_ptr,
     int64_t m, int64_t n, int64_t k,
     int64_t group_size, int64_t reconn_sz, int64_t n_groups,
-    cublasHandle_t handle,
+    cublasHandle_t handle, cudaDataType_t dt,
     torch::TensorOptions opts,
-    bool gated,
-    cudaStream_t stream)
+    bool gated, cudaStream_t stream)
 {
-    half alpha = __float2half(1.0f);
-    half beta = __float2half(0.0f);
-
     auto AR = torch::empty({m, k}, opts);
-    half* AR_ptr = reinterpret_cast<half*>(AR.data_ptr<at::Half>());
+    auto* AR_ptr = static_cast<scalar_t*>(AR.data_ptr());
 
     for (int64_t i = 0; i < n_groups; ++i) {
-        // Batched: AR_block = A_block @ R_block^T over K/reconn_sz blocks
-        GEMM_CHECK_CUBLAS(cublasHgemmStridedBatched(
+        // AR = A @ R_g^T  (batched over K/reconn_sz blocks)
+        gemm_strided_batched_ex(
             handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            reconn_sz, m, reconn_sz, &alpha,
-            R_ptr + i * reconn_sz * k, k,
-            reconn_sz,
-            A_ptr, k,
-            reconn_sz,
-            &beta,
-            AR_ptr, k,
-            reconn_sz,
-            k / reconn_sz
-        ));
+            reconn_sz, m, reconn_sz,
+            R_ptr + i * reconn_sz * k, dt, k, reconn_sz,
+            A_ptr,                     dt, k, reconn_sz,
+            AR_ptr,                    dt, k, reconn_sz,
+            k / reconn_sz);
 
-        // Apply gating: AR = A * SiLU(AR)
         if (gated) {
             int64_t numel = m * k;
             int threads = 256;
-            int blocks = (numel + threads - 1) / threads;
-            silu_gate_kernel<<<blocks, threads, 0, stream>>>(A_ptr, AR_ptr, numel);
+            int blocks = (int)((numel + threads - 1) / threads);
+            silu_gate_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+                A_ptr, AR_ptr, numel);
         }
 
-        // C_group = AR @ B_group^T
-        GEMM_CHECK_CUBLAS(cublasHgemm(
+        // C_g = AR @ B_g^T
+        gemm_ex(
             handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            group_size, m, k, &alpha,
-            B_ptr + i * group_size * k, k,
-            AR_ptr, k,
-            &beta,
-            C_ptr + i * group_size, n
-        ));
+            group_size, m, k,
+            B_ptr + i * group_size * k, dt, k,
+            AR_ptr,                     dt, k,
+            C_ptr + i * group_size,     dt, n);
     }
-
-    return {};  // unused, writes directly to C_ptr
 }
 
-// RW mode: C = A @ (R @ B)^T, computed by transforming B first
-static void cublas_oft_rw(
-    const half* A_ptr, const half* B_ptr, const half* R_ptr, half* C_ptr,
+// ---------------------------------------------------------------------------
+// Forward: RW mode  C = A @ (R @ B)^T
+// ---------------------------------------------------------------------------
+
+template<typename scalar_t>
+static void cublas_oft_rw_impl(
+    const scalar_t* A_ptr, const scalar_t* B_ptr, const scalar_t* R_ptr, scalar_t* C_ptr,
     int64_t m, int64_t n, int64_t k,
     int64_t group_size, int64_t reconn_sz, int64_t n_groups,
-    cublasHandle_t handle,
+    cublasHandle_t handle, cudaDataType_t dt,
     torch::TensorOptions opts)
 {
-    half alpha = __float2half(1.0f);
-    half beta = __float2half(0.0f);
-
-    // Transform B: B'[i*gs:(i+1)*gs, :] = R_i @ B[i*gs:(i+1)*gs, :]
-    // Done block-wise: B'_block = R_block @ B_block over K/reconn_sz blocks per group
     auto Bp = torch::empty({n, k}, opts);
-    half* Bp_ptr = reinterpret_cast<half*>(Bp.data_ptr<at::Half>());
+    auto* Bp_ptr = static_cast<scalar_t*>(Bp.data_ptr());
 
     for (int64_t i = 0; i < n_groups; ++i) {
-        GEMM_CHECK_CUBLAS(cublasHgemmStridedBatched(
+        gemm_strided_batched_ex(
             handle, CUBLAS_OP_N, CUBLAS_OP_N,
-            reconn_sz, group_size, reconn_sz, &alpha,
-            R_ptr + i * reconn_sz * k, k,
-            reconn_sz,
-            B_ptr + i * group_size * k, k,
-            reconn_sz,
-            &beta,
-            Bp_ptr + i * group_size * k, k,
-            reconn_sz,
-            k / reconn_sz
-        ));
+            reconn_sz, group_size, reconn_sz,
+            R_ptr + i * reconn_sz * k,  dt, k, reconn_sz,
+            B_ptr + i * group_size * k, dt, k, reconn_sz,
+            Bp_ptr + i * group_size * k, dt, k, reconn_sz,
+            k / reconn_sz);
     }
 
-    // C = A @ B'^T
-    GEMM_CHECK_CUBLAS(cublasHgemm(
+    // C = A @ Bp^T
+    gemm_ex(
         handle, CUBLAS_OP_T, CUBLAS_OP_N,
-        n, m, k, &alpha,
-        Bp_ptr, k,
-        A_ptr, k,
-        &beta,
-        C_ptr, n
-    ));
+        n, m, k,
+        Bp_ptr, dt, k,
+        A_ptr,  dt, k,
+        C_ptr,  dt, n);
 }
 
-// Element-wise kernel: dst[i] += src[i]
-__global__ void half_add_kernel(half* dst, const half* src, int64_t numel) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < numel) {
-        dst[idx] = __float2half(__half2float(dst[idx]) + __half2float(src[idx]));
-    }
-}
+// ---------------------------------------------------------------------------
+// Backward dA + dR
+// ---------------------------------------------------------------------------
 
-// Element-wise kernel for gated backward:
-// dS[i] = dH[i] * A[i] * silu_prime(S[i])
-// where silu_prime(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-__global__ void silu_gate_backward_ds_kernel(
-    const half* dH, const half* A, const half* S, half* dS, int64_t numel)
-{
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < numel) {
-        float dh = __half2float(dH[idx]);
-        float a = __half2float(A[idx]);
-        float s = __half2float(S[idx]);
-        float sigma = 1.0f / (1.0f + __expf(-s));
-        float silu_prime = sigma * (1.0f + s * (1.0f - sigma));
-        dS[idx] = __float2half(dh * a * silu_prime);
-    }
-}
-
-// Element-wise kernel for gated backward dA contribution:
-// dA_gate[i] = dH[i] * silu(S[i])
-// where silu(x) = x * sigmoid(x)
-__global__ void silu_gate_backward_da_kernel(
-    const half* dH, const half* S, half* dA_gate, int64_t numel)
-{
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < numel) {
-        float dh = __half2float(dH[idx]);
-        float s = __half2float(S[idx]);
-        float silu_s = s / (1.0f + __expf(-s));
-        dA_gate[idx] = __float2half(dh * silu_s);
-    }
-}
-
-// Backward pass: compute dA and dR
+template<typename scalar_t>
 static std::tuple<torch::Tensor, torch::Tensor> cublas_backward_dA_dR_impl(
-    const half* dC_ptr, const half* A_ptr, const half* B_ptr, const half* R_ptr,
+    const scalar_t* dC_ptr, const scalar_t* A_ptr,
+    const scalar_t* B_ptr, const scalar_t* R_ptr,
     int64_t m, int64_t n, int64_t k,
     int64_t group_size, int64_t reconn_sz, int64_t n_groups,
-    cublasHandle_t handle,
-    torch::TensorOptions opts,
-    bool gated,
-    cudaStream_t stream)
+    cublasHandle_t handle, cudaDataType_t compute_dt,
+    torch::TensorOptions compute_opts,
+    cudaDataType_t dR_dt, torch::TensorOptions dR_opts,
+    bool gated, cudaStream_t stream)
 {
-    half alpha = __float2half(1.0f);
-    half beta_zero = __float2half(0.0f);
-    half beta_one = __float2half(1.0f);
+    auto dA  = torch::zeros({m, k}, compute_opts);
+    auto dR  = torch::zeros({n_groups * reconn_sz, k}, dR_opts);
+    auto AR  = torch::empty({m, k}, compute_opts);
+    auto dAR = torch::empty({m, k}, compute_opts);
 
-    auto dA = torch::zeros({m, k}, opts);
-    auto dR = torch::zeros({n_groups * reconn_sz, k}, opts);
-    auto AR = torch::empty({m, k}, opts);
-
-    half* dA_ptr = reinterpret_cast<half*>(dA.data_ptr<at::Half>());
-    half* dR_ptr = reinterpret_cast<half*>(dR.data_ptr<at::Half>());
-    half* AR_ptr = reinterpret_cast<half*>(AR.data_ptr<at::Half>());
-
-    auto dAR = torch::empty({m, k}, opts);
-    half* dAR_ptr = reinterpret_cast<half*>(dAR.data_ptr<at::Half>());
+    auto* dA_ptr  = static_cast<scalar_t*>(dA.data_ptr());
+    void* dR_raw  = dR.data_ptr();
+    int64_t dR_es = dR.element_size();          // bytes per element
+    auto* AR_ptr  = static_cast<scalar_t*>(AR.data_ptr());
+    auto* dAR_ptr = static_cast<scalar_t*>(dAR.data_ptr());
 
     int threads = 256;
 
     for (int64_t g = 0; g < n_groups; ++g) {
-        const half* dC_g = dC_ptr + g * group_size;
-        const half* B_g = B_ptr + g * group_size * k;
-        const half* R_g = R_ptr + g * reconn_sz * k;
+        const scalar_t* dC_g = dC_ptr + g * group_size;
+        const scalar_t* B_g  = B_ptr  + g * group_size * k;
+        const scalar_t* R_g  = R_ptr  + g * reconn_sz * k;
+        void* dR_g = static_cast<char*>(dR_raw) + g * reconn_sz * k * dR_es;
 
         // Recompute AR_g = A @ R_g^T
-        GEMM_CHECK_CUBLAS(cublasHgemmStridedBatched(
+        gemm_strided_batched_ex(
             handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            reconn_sz, m, reconn_sz, &alpha,
-            R_g, k, reconn_sz,
-            A_ptr, k, reconn_sz,
-            &beta_zero,
-            AR_ptr, k, reconn_sz,
-            k / reconn_sz
-        ));
+            reconn_sz, m, reconn_sz,
+            R_g,    compute_dt, k, reconn_sz,
+            A_ptr,  compute_dt, k, reconn_sz,
+            AR_ptr, compute_dt, k, reconn_sz,
+            k / reconn_sz);
 
         if (gated) {
             // dH_g = dC_g @ B_g
-            GEMM_CHECK_CUBLAS(cublasHgemm(
-                handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                k, m, group_size, &alpha,
-                B_g, k,
-                dC_g, n,
-                &beta_zero,
-                dAR_ptr, k
-            ));
+            gemm_ex(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                k, m, group_size,
+                B_g,     compute_dt, k,
+                dC_g,    compute_dt, n,
+                dAR_ptr, compute_dt, k);
 
             {
                 int64_t numel = m * k;
-                int blocks = (numel + threads - 1) / threads;
-                // dA_gate = dH_g * SiLU(S_g), stored in temp
-                auto temp = torch::empty({m, k}, opts);
-                half* temp_ptr = reinterpret_cast<half*>(temp.data_ptr<at::Half>());
-                silu_gate_backward_da_kernel<<<blocks, threads, 0, stream>>>(
-                    dAR_ptr, AR_ptr, temp_ptr, numel);
-                half_add_kernel<<<blocks, threads, 0, stream>>>(dA_ptr, temp_ptr, numel);
+                int blocks = (int)((numel + threads - 1) / threads);
 
-                // dS_g = dH_g * A * silu_prime(S_g)
-                silu_gate_backward_ds_kernel<<<blocks, threads, 0, stream>>>(
+                auto temp = torch::empty({m, k}, compute_opts);
+                auto* temp_ptr = static_cast<scalar_t*>(temp.data_ptr());
+
+                silu_gate_backward_da_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+                    dAR_ptr, AR_ptr, temp_ptr, numel);
+                add_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+                    dA_ptr, temp_ptr, numel);
+
+                silu_gate_backward_ds_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
                     dAR_ptr, A_ptr, AR_ptr, dAR_ptr, numel);
             }
 
             // dA += dS_g @ R_g
-            GEMM_CHECK_CUBLAS(cublasHgemmStridedBatched(
+            gemm_strided_batched_ex(
                 handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                reconn_sz, m, reconn_sz, &alpha,
-                R_g, k, reconn_sz,
-                dAR_ptr, k, reconn_sz,
-                &beta_one,
-                dA_ptr, k, reconn_sz,
-                k / reconn_sz
-            ));
+                reconn_sz, m, reconn_sz,
+                R_g,    compute_dt, k, reconn_sz,
+                dAR_ptr, compute_dt, k, reconn_sz,
+                dA_ptr, compute_dt, k, reconn_sz,
+                k / reconn_sz,
+                1.0f, 1.0f);   // beta = 1 for accumulation
 
             // dR_g[b] = dS_g^T @ A
-            GEMM_CHECK_CUBLAS(cublasHgemmStridedBatched(
+            gemm_strided_batched_ex(
                 handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                reconn_sz, reconn_sz, m, &alpha,
-                A_ptr, k, reconn_sz,
-                dAR_ptr, k, reconn_sz,
-                &beta_zero,
-                dR_ptr + g * reconn_sz * k, k, reconn_sz,
-                k / reconn_sz
-            ));
+                reconn_sz, reconn_sz, m,
+                A_ptr,   compute_dt, k, reconn_sz,
+                dAR_ptr, compute_dt, k, reconn_sz,
+                dR_g,    dR_dt,      k, reconn_sz,
+                k / reconn_sz);
         } else {
             // dAR_g = dC_g @ B_g
-            GEMM_CHECK_CUBLAS(cublasHgemm(
-                handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                k, m, group_size, &alpha,
-                B_g, k,
-                dC_g, n,
-                &beta_zero,
-                dAR_ptr, k
-            ));
+            gemm_ex(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                k, m, group_size,
+                B_g,     compute_dt, k,
+                dC_g,    compute_dt, n,
+                dAR_ptr, compute_dt, k);
 
             // dA += dAR_g @ R_g
-            GEMM_CHECK_CUBLAS(cublasHgemmStridedBatched(
+            gemm_strided_batched_ex(
                 handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                reconn_sz, m, reconn_sz, &alpha,
-                R_g, k, reconn_sz,
-                dAR_ptr, k, reconn_sz,
-                &beta_one,
-                dA_ptr, k, reconn_sz,
-                k / reconn_sz
-            ));
+                reconn_sz, m, reconn_sz,
+                R_g,     compute_dt, k, reconn_sz,
+                dAR_ptr, compute_dt, k, reconn_sz,
+                dA_ptr,  compute_dt, k, reconn_sz,
+                k / reconn_sz,
+                1.0f, 1.0f);
 
             // dR_g[b] = dAR_g^T @ A
-            GEMM_CHECK_CUBLAS(cublasHgemmStridedBatched(
+            gemm_strided_batched_ex(
                 handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                reconn_sz, reconn_sz, m, &alpha,
-                A_ptr, k, reconn_sz,
-                dAR_ptr, k, reconn_sz,
-                &beta_zero,
-                dR_ptr + g * reconn_sz * k, k, reconn_sz,
-                k / reconn_sz
-            ));
+                reconn_sz, reconn_sz, m,
+                A_ptr,   compute_dt, k, reconn_sz,
+                dAR_ptr, compute_dt, k, reconn_sz,
+                dR_g,    dR_dt,      k, reconn_sz,
+                k / reconn_sz);
         }
     }
 
     return {dA, dR};
 }
 
-// Backward pass: compute dB
+// ---------------------------------------------------------------------------
+// Backward dB
+// ---------------------------------------------------------------------------
+
+template<typename scalar_t>
 static torch::Tensor cublas_backward_dB_impl(
-    const half* dC_ptr, const half* A_ptr, const half* R_ptr,
+    const scalar_t* dC_ptr, const scalar_t* A_ptr, const scalar_t* R_ptr,
     int64_t m, int64_t n, int64_t k,
     int64_t group_size, int64_t reconn_sz, int64_t n_groups,
-    cublasHandle_t handle,
-    torch::TensorOptions opts,
-    bool gated,
-    cudaStream_t stream)
+    cublasHandle_t handle, cudaDataType_t compute_dt,
+    torch::TensorOptions compute_opts,
+    cudaDataType_t dB_dt, torch::TensorOptions dB_opts,
+    bool gated, cudaStream_t stream)
 {
-    half alpha = __float2half(1.0f);
-    half beta_zero = __float2half(0.0f);
+    auto dB = torch::zeros({n, k}, dB_opts);
+    auto AR = torch::empty({m, k}, compute_opts);
 
-    auto dB = torch::zeros({n, k}, opts);
-    auto AR = torch::empty({m, k}, opts);
-
-    half* dB_ptr = reinterpret_cast<half*>(dB.data_ptr<at::Half>());
-    half* AR_ptr = reinterpret_cast<half*>(AR.data_ptr<at::Half>());
+    void* dB_raw  = dB.data_ptr();
+    int64_t dB_es = dB.element_size();
+    auto* AR_ptr  = static_cast<scalar_t*>(AR.data_ptr());
 
     int threads = 256;
 
     for (int64_t g = 0; g < n_groups; ++g) {
-        const half* dC_g = dC_ptr + g * group_size;
-        const half* R_g = R_ptr + g * reconn_sz * k;
+        const scalar_t* dC_g = dC_ptr + g * group_size;
+        const scalar_t* R_g  = R_ptr  + g * reconn_sz * k;
+        void* dB_g = static_cast<char*>(dB_raw) + g * group_size * k * dB_es;
 
         // Recompute AR_g = A @ R_g^T
-        GEMM_CHECK_CUBLAS(cublasHgemmStridedBatched(
+        gemm_strided_batched_ex(
             handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            reconn_sz, m, reconn_sz, &alpha,
-            R_g, k, reconn_sz,
-            A_ptr, k, reconn_sz,
-            &beta_zero,
-            AR_ptr, k, reconn_sz,
-            k / reconn_sz
-        ));
+            reconn_sz, m, reconn_sz,
+            R_g,    compute_dt, k, reconn_sz,
+            A_ptr,  compute_dt, k, reconn_sz,
+            AR_ptr, compute_dt, k, reconn_sz,
+            k / reconn_sz);
 
         if (gated) {
             int64_t numel = m * k;
-            int blocks = (numel + threads - 1) / threads;
-            // AR = A * SiLU(AR) in-place
-            silu_gate_kernel<<<blocks, threads, 0, stream>>>(A_ptr, AR_ptr, numel);
+            int blocks = (int)((numel + threads - 1) / threads);
+            silu_gate_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+                A_ptr, AR_ptr, numel);
         }
 
         // dB_g = dC_g^T @ AR_g
-        GEMM_CHECK_CUBLAS(cublasHgemm(
+        gemm_ex(
             handle, CUBLAS_OP_N, CUBLAS_OP_T,
-            k, group_size, m, &alpha,
-            AR_ptr, k,
-            dC_g, n,
-            &beta_zero,
-            dB_ptr + g * group_size * k, k
-        ));
+            k, group_size, m,
+            AR_ptr, compute_dt, k,
+            dC_g,   compute_dt, n,
+            dB_g,   dB_dt,      k);
     }
 
     return dB;
 }
 
+// ---------------------------------------------------------------------------
+// Input validation helpers
+// ---------------------------------------------------------------------------
+
+static at::ScalarType validate_forward_inputs(
+    torch::Tensor A, torch::Tensor B, torch::Tensor R,
+    int64_t group_size, int64_t reconn_sz)
+{
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(R.is_cuda(), "R must be a CUDA tensor");
+    TORCH_CHECK(A.device() == B.device() && A.device() == R.device(),
+                "All tensors must be on the same CUDA device");
+
+    auto dtype = A.scalar_type();
+    TORCH_CHECK(dtype == at::kHalf || dtype == at::kBFloat16,
+                "A must be float16 or bfloat16, got ", dtype);
+    TORCH_CHECK(B.scalar_type() == dtype && R.scalar_type() == dtype,
+                "All tensors must have the same dtype (", dtype,
+                "), but B is ", B.scalar_type(), " and R is ", R.scalar_type());
+
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous (row-major)");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous (row-major)");
+    TORCH_CHECK(R.is_contiguous(), "R must be contiguous (row-major)");
+
+    TORCH_CHECK(A.dim() == 2, "A must be 2D (M, K)");
+    TORCH_CHECK(B.dim() == 2, "B must be 2D (N, K)");
+    TORCH_CHECK(R.dim() == 2, "R must be 2D (n_groups * reconn_sz, K)");
+
+    int64_t k = A.size(1);
+    int64_t n = B.size(0);
+    TORCH_CHECK(B.size(1) == k, "K mismatch: A has K=", k, " but B has K=", B.size(1));
+    TORCH_CHECK(R.size(1) == k, "K mismatch: A has K=", k, " but R has K=", R.size(1));
+    TORCH_CHECK(n % group_size == 0,
+                "N (", n, ") must be divisible by group_size (", group_size, ")");
+    TORCH_CHECK(k % reconn_sz == 0,
+                "K (", k, ") must be divisible by reconn_sz (", reconn_sz, ")");
+    int64_t n_groups = n / group_size;
+    TORCH_CHECK(R.size(0) == n_groups * reconn_sz,
+                "R must have shape (n_groups * reconn_sz, K) = (", n_groups * reconn_sz,
+                ", ", k, "), but got (", R.size(0), ", ", R.size(1), ")");
+
+    return dtype;
+}
+
+static at::ScalarType validate_backward_inputs(
+    torch::Tensor dC, torch::Tensor A, torch::Tensor R)
+{
+    TORCH_CHECK(dC.is_cuda() && A.is_cuda() && R.is_cuda(),
+                "All tensors must be CUDA tensors");
+    auto dtype = dC.scalar_type();
+    TORCH_CHECK(dtype == at::kHalf || dtype == at::kBFloat16,
+                "dC must be float16 or bfloat16, got ", dtype);
+    TORCH_CHECK(A.scalar_type() == dtype && R.scalar_type() == dtype,
+                "All tensors must have the same dtype (", dtype, ")");
+    TORCH_CHECK(dC.is_contiguous() && A.is_contiguous() && R.is_contiguous(),
+                "All tensors must be contiguous");
+    return dtype;
+}
+
+static void validate_grad_dtype(c10::optional<at::ScalarType> grad_dtype, const char* name) {
+    if (grad_dtype.has_value()) {
+        auto dt = grad_dtype.value();
+        TORCH_CHECK(dt == at::kHalf || dt == at::kBFloat16 || dt == at::kFloat,
+                     name, " must be float16, bfloat16, or float32, got ", dt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
 
 torch::Tensor cublas_oft_forward(
     torch::Tensor A,
@@ -356,87 +476,46 @@ torch::Tensor cublas_oft_forward(
     bool rw_mode,
     bool gated)
 {
-    // Validate devices
-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
-    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
-    TORCH_CHECK(R.is_cuda(), "R must be a CUDA tensor");
-    TORCH_CHECK(A.device() == B.device() && A.device() == R.device(),
-                "All tensors must be on the same CUDA device");
-
-    // Validate dtypes
-    TORCH_CHECK(A.scalar_type() == torch::kHalf, "A must be float16");
-    TORCH_CHECK(B.scalar_type() == torch::kHalf, "B must be float16");
-    TORCH_CHECK(R.scalar_type() == torch::kHalf, "R must be float16");
-
-    // Validate contiguity
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous (row-major)");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous (row-major)");
-    TORCH_CHECK(R.is_contiguous(), "R must be contiguous (row-major)");
-
-    // Validate dimensions
-    TORCH_CHECK(A.dim() == 2, "A must be 2D (M, K)");
-    TORCH_CHECK(B.dim() == 2, "B must be 2D (N, K)");
-    TORCH_CHECK(R.dim() == 2, "R must be 2D (n_groups * reconn_sz, K)");
+    auto dtype = validate_forward_inputs(A, B, R, group_size, reconn_sz);
+    auto cuda_dt = torch_to_cublas_dtype(dtype);
 
     int64_t m = A.size(0);
     int64_t k = A.size(1);
     int64_t n = B.size(0);
-
-    TORCH_CHECK(B.size(1) == k, "K dimension mismatch: A has K=", k, " but B has K=", B.size(1));
-    TORCH_CHECK(R.size(1) == k, "K dimension mismatch: A has K=", k, " but R has K=", R.size(1));
-    TORCH_CHECK(n % group_size == 0,
-                "N (", n, ") must be divisible by group_size (", group_size, ")");
     int64_t n_groups = n / group_size;
-    TORCH_CHECK(R.size(0) == n_groups * reconn_sz,
-                "R must have shape (n_groups * reconn_sz, K) = (", n_groups * reconn_sz,
-                ", ", k, "), but got (", R.size(0), ", ", R.size(1), ")");
-    TORCH_CHECK(k % reconn_sz == 0,
-                "K (", k, ") must be divisible by reconn_sz (", reconn_sz, ")");
 
-    // Allocate output
+    TORCH_CHECK(!gated || !rw_mode,
+                "Gated activation is only supported in AR mode, not RW mode");
+
     auto C = torch::zeros({m, n}, A.options());
 
-    // Get current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
-
-    // Create cuBLAS handle on the current stream
     cublasHandle_t handle;
     GEMM_CHECK_CUBLAS(cublasCreate(&handle));
-    GEMM_CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
     GEMM_CHECK_CUBLAS(cublasSetStream(handle, stream));
 
-    const half* A_ptr = reinterpret_cast<const half*>(A.data_ptr<at::Half>());
-    const half* B_ptr = reinterpret_cast<const half*>(B.data_ptr<at::Half>());
-    const half* R_ptr = reinterpret_cast<const half*>(R.data_ptr<at::Half>());
-    half* C_ptr = reinterpret_cast<half*>(C.data_ptr<at::Half>());
-
-    TORCH_CHECK(!gated || !rw_mode, "Gated activation is only supported in AR mode, not RW mode");
-
-    if (rw_mode) {
-        cublas_oft_rw(A_ptr, B_ptr, R_ptr, C_ptr,
-                      m, n, k, group_size, reconn_sz, n_groups,
-                      handle, A.options());
+    if (dtype == at::kHalf) {
+        auto* A_p = static_cast<const half*>(A.data_ptr());
+        auto* B_p = static_cast<const half*>(B.data_ptr());
+        auto* R_p = static_cast<const half*>(R.data_ptr());
+        auto* C_p = static_cast<half*>(C.data_ptr());
+        if (rw_mode)
+            cublas_oft_rw_impl<half>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options());
+        else
+            cublas_oft_ar_impl<half>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options(), gated, stream);
     } else {
-        cublas_oft_ar(A_ptr, B_ptr, R_ptr, C_ptr,
-                      m, n, k, group_size, reconn_sz, n_groups,
-                      handle, A.options(), gated, stream);
+        auto* A_p = static_cast<const __nv_bfloat16*>(A.data_ptr());
+        auto* B_p = static_cast<const __nv_bfloat16*>(B.data_ptr());
+        auto* R_p = static_cast<const __nv_bfloat16*>(R.data_ptr());
+        auto* C_p = static_cast<__nv_bfloat16*>(C.data_ptr());
+        if (rw_mode)
+            cublas_oft_rw_impl<__nv_bfloat16>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options());
+        else
+            cublas_oft_ar_impl<__nv_bfloat16>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options(), gated, stream);
     }
 
     GEMM_CHECK_CUBLAS(cublasDestroy(handle));
     return C;
-}
-
-
-static void validate_cublas_backward_inputs(
-    torch::Tensor dC, torch::Tensor A, torch::Tensor R)
-{
-    TORCH_CHECK(dC.is_cuda() && A.is_cuda() && R.is_cuda(),
-                "All tensors must be CUDA tensors");
-    TORCH_CHECK(dC.scalar_type() == torch::kHalf && A.scalar_type() == torch::kHalf &&
-                R.scalar_type() == torch::kHalf,
-                "All tensors must be float16");
-    TORCH_CHECK(dC.is_contiguous() && A.is_contiguous() && R.is_contiguous(),
-                "All tensors must be contiguous");
 }
 
 std::vector<torch::Tensor> cublas_backward_dA_dR(
@@ -446,11 +525,18 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
     torch::Tensor R,
     int64_t group_size,
     int64_t reconn_sz,
-    bool gated)
+    bool gated,
+    c10::optional<at::ScalarType> dR_dtype)
 {
-    validate_cublas_backward_inputs(dC, A, R);
-    TORCH_CHECK(B.is_cuda() && B.scalar_type() == torch::kHalf && B.is_contiguous(),
-                "B must be a contiguous CUDA float16 tensor");
+    auto dtype = validate_backward_inputs(dC, A, R);
+    TORCH_CHECK(B.is_cuda() && B.scalar_type() == dtype && B.is_contiguous(),
+                "B must be a contiguous CUDA tensor with dtype ", dtype);
+    validate_grad_dtype(dR_dtype, "dR_dtype");
+
+    auto compute_dt = torch_to_cublas_dtype(dtype);
+    auto dR_scalar  = dR_dtype.value_or(R.scalar_type());
+    auto dR_dt      = torch_to_cublas_dtype(dR_scalar);
+    auto dR_opts    = A.options().dtype(dR_scalar);
 
     int64_t m = A.size(0);
     int64_t k = A.size(1);
@@ -460,18 +546,26 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
     cublasHandle_t handle;
     GEMM_CHECK_CUBLAS(cublasCreate(&handle));
-    GEMM_CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
     GEMM_CHECK_CUBLAS(cublasSetStream(handle, stream));
 
-    const half* dC_ptr = reinterpret_cast<const half*>(dC.data_ptr<at::Half>());
-    const half* A_ptr = reinterpret_cast<const half*>(A.data_ptr<at::Half>());
-    const half* B_ptr = reinterpret_cast<const half*>(B.data_ptr<at::Half>());
-    const half* R_ptr = reinterpret_cast<const half*>(R.data_ptr<at::Half>());
-
-    auto [dA, dR] = cublas_backward_dA_dR_impl(
-        dC_ptr, A_ptr, B_ptr, R_ptr,
-        m, n, k, group_size, reconn_sz, n_groups,
-        handle, A.options(), gated, stream);
+    torch::Tensor dA, dR;
+    if (dtype == at::kHalf) {
+        auto* dC_p = static_cast<const half*>(dC.data_ptr());
+        auto* A_p  = static_cast<const half*>(A.data_ptr());
+        auto* B_p  = static_cast<const half*>(B.data_ptr());
+        auto* R_p  = static_cast<const half*>(R.data_ptr());
+        std::tie(dA, dR) = cublas_backward_dA_dR_impl<half>(
+            dC_p, A_p, B_p, R_p, m, n, k, group_size, reconn_sz, n_groups,
+            handle, compute_dt, A.options(), dR_dt, dR_opts, gated, stream);
+    } else {
+        auto* dC_p = static_cast<const __nv_bfloat16*>(dC.data_ptr());
+        auto* A_p  = static_cast<const __nv_bfloat16*>(A.data_ptr());
+        auto* B_p  = static_cast<const __nv_bfloat16*>(B.data_ptr());
+        auto* R_p  = static_cast<const __nv_bfloat16*>(R.data_ptr());
+        std::tie(dA, dR) = cublas_backward_dA_dR_impl<__nv_bfloat16>(
+            dC_p, A_p, B_p, R_p, m, n, k, group_size, reconn_sz, n_groups,
+            handle, compute_dt, A.options(), dR_dt, dR_opts, gated, stream);
+    }
 
     GEMM_CHECK_CUBLAS(cublasDestroy(handle));
     return {dA, dR};
@@ -483,9 +577,16 @@ torch::Tensor cublas_backward_dB(
     torch::Tensor R,
     int64_t group_size,
     int64_t reconn_sz,
-    bool gated)
+    bool gated,
+    c10::optional<at::ScalarType> dB_dtype)
 {
-    validate_cublas_backward_inputs(dC, A, R);
+    auto dtype = validate_backward_inputs(dC, A, R);
+    validate_grad_dtype(dB_dtype, "dB_dtype");
+
+    auto compute_dt = torch_to_cublas_dtype(dtype);
+    auto dB_scalar  = dB_dtype.value_or(dtype);
+    auto dB_dt      = torch_to_cublas_dtype(dB_scalar);
+    auto dB_opts    = A.options().dtype(dB_scalar);
 
     int64_t m = A.size(0);
     int64_t k = A.size(1);
@@ -495,17 +596,24 @@ torch::Tensor cublas_backward_dB(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
     cublasHandle_t handle;
     GEMM_CHECK_CUBLAS(cublasCreate(&handle));
-    GEMM_CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
     GEMM_CHECK_CUBLAS(cublasSetStream(handle, stream));
 
-    const half* dC_ptr = reinterpret_cast<const half*>(dC.data_ptr<at::Half>());
-    const half* A_ptr = reinterpret_cast<const half*>(A.data_ptr<at::Half>());
-    const half* R_ptr = reinterpret_cast<const half*>(R.data_ptr<at::Half>());
-
-    auto dB = cublas_backward_dB_impl(
-        dC_ptr, A_ptr, R_ptr,
-        m, n, k, group_size, reconn_sz, n_groups,
-        handle, A.options(), gated, stream);
+    torch::Tensor dB;
+    if (dtype == at::kHalf) {
+        auto* dC_p = static_cast<const half*>(dC.data_ptr());
+        auto* A_p  = static_cast<const half*>(A.data_ptr());
+        auto* R_p  = static_cast<const half*>(R.data_ptr());
+        dB = cublas_backward_dB_impl<half>(
+            dC_p, A_p, R_p, m, n, k, group_size, reconn_sz, n_groups,
+            handle, compute_dt, A.options(), dB_dt, dB_opts, gated, stream);
+    } else {
+        auto* dC_p = static_cast<const __nv_bfloat16*>(dC.data_ptr());
+        auto* A_p  = static_cast<const __nv_bfloat16*>(A.data_ptr());
+        auto* R_p  = static_cast<const __nv_bfloat16*>(R.data_ptr());
+        dB = cublas_backward_dB_impl<__nv_bfloat16>(
+            dC_p, A_p, R_p, m, n, k, group_size, reconn_sz, n_groups,
+            handle, compute_dt, A.options(), dB_dt, dB_opts, gated, stream);
+    }
 
     GEMM_CHECK_CUBLAS(cublasDestroy(handle));
     return dB;
