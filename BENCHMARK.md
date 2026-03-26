@@ -4,12 +4,12 @@ Benchmarked on NVIDIA RTX 3080 Ti (SM86), M=N=K=8192, group_size=256, reconn_sz=
 
 ## Reference: Regular Linear Layer (cuBLAS GEMM)
 
-| Operation | Time (ms) |
-|-----------|-----------|
-| Forward (C = A @ W^T) | 15.5 |
-| Backward dA (dA = dC @ W) | 16.0 |
-| Backward dW (dW = dC^T @ A) | 15.7 |
-| **Total fwd+bwd** | **47.2** |
+| Operation | Time (ms) | TFLOP/s |
+|-----------|-----------|-----------|
+| Forward (C = A @ W^T) | 15.5 | 72.82 |
+| Backward dA (dA = dC @ W) | 16.0 | 68.72 |
+| Backward dW (dW = dC^T @ A) | 15.7 | 70.03 |
+| **Total fwd+bwd** | **47.2** | **69.88** |
 
 ## OFT Kernel Performance
 
