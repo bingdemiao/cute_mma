@@ -207,26 +207,36 @@ project({target} LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Auto-detect CUDA architecture from current GPU
-include(FindCUDA/select_compute_arch)
-CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
-string(STRIP "${{INSTALLED_GPU_CCS_1}}" INSTALLED_GPU_CCS_2)
-string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${{INSTALLED_GPU_CCS_2}}")
-string(REPLACE "." "" CUDA_ARCH_LIST "${{INSTALLED_GPU_CCS_3}}")
-set(CMAKE_CUDA_ARCHITECTURES ${{CUDA_ARCH_LIST}})
+# Find Python first (needed for arch detection and PyTorch)
+find_program(PYTHON_HINT NAMES python python3)
+if(PYTHON_HINT)
+    set(Python_EXECUTABLE "${{PYTHON_HINT}}" CACHE FILEPATH "Python interpreter")
+endif()
+find_package(Python REQUIRED COMPONENTS Interpreter Development)
+
+# Detect GPU architecture via PyTorch
+execute_process(
+    COMMAND ${{Python_EXECUTABLE}} -c "import torch; print(torch.cuda.get_device_capability()[0]*10+torch.cuda.get_device_capability()[1])"
+    OUTPUT_VARIABLE DETECTED_ARCH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE DETECT_RESULT
+)
+if(DETECT_RESULT EQUAL 0)
+    set(CMAKE_CUDA_ARCHITECTURES ${{DETECTED_ARCH}})
+else()
+    include(FindCUDA/select_compute_arch)
+    CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
+    string(STRIP "${{INSTALLED_GPU_CCS_1}}" INSTALLED_GPU_CCS_2)
+    string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${{INSTALLED_GPU_CCS_2}}")
+    string(REPLACE "." "" CUDA_ARCH_LIST "${{INSTALLED_GPU_CCS_3}}")
+    set(CMAKE_CUDA_ARCHITECTURES ${{CUDA_ARCH_LIST}})
+endif()
 
 set(CMAKE_CUDA_FLAGS "${{CMAKE_CUDA_FLAGS}} --expt-relaxed-constexpr --ptxas-options=-v")
 set(CMAKE_CUDA_FLAGS "${{CMAKE_CUDA_FLAGS}} -lineinfo --use_fast_math -O3")
 
 list(APPEND CMAKE_MODULE_PATH "{src / 'cmake'}")
 find_package(Cutlass REQUIRED)
-
-# Find Python and PyTorch
-find_program(PYTHON_HINT NAMES python python3)
-if(PYTHON_HINT)
-    set(Python_EXECUTABLE "${{PYTHON_HINT}}" CACHE FILEPATH "Python interpreter")
-endif()
-find_package(Python REQUIRED COMPONENTS Interpreter Development)
 
 execute_process(
     COMMAND ${{Python_EXECUTABLE}} -c "import torch; print(torch.utils.cmake_prefix_path)"
@@ -300,22 +310,32 @@ project({target} LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Auto-detect CUDA architecture from current GPU
-include(FindCUDA/select_compute_arch)
-CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
-string(STRIP "${{INSTALLED_GPU_CCS_1}}" INSTALLED_GPU_CCS_2)
-string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${{INSTALLED_GPU_CCS_2}}")
-string(REPLACE "." "" CUDA_ARCH_LIST "${{INSTALLED_GPU_CCS_3}}")
-set(CMAKE_CUDA_ARCHITECTURES ${{CUDA_ARCH_LIST}})
-
-set(CMAKE_CUDA_FLAGS "${{CMAKE_CUDA_FLAGS}} -O3")
-
-# Find Python and PyTorch
+# Find Python first (needed for arch detection)
 find_program(PYTHON_HINT NAMES python python3)
 if(PYTHON_HINT)
     set(Python_EXECUTABLE "${{PYTHON_HINT}}" CACHE FILEPATH "Python interpreter")
 endif()
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
+
+# Detect GPU architecture via PyTorch
+execute_process(
+    COMMAND ${{Python_EXECUTABLE}} -c "import torch; print(torch.cuda.get_device_capability()[0]*10+torch.cuda.get_device_capability()[1])"
+    OUTPUT_VARIABLE DETECTED_ARCH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE DETECT_RESULT
+)
+if(DETECT_RESULT EQUAL 0)
+    set(CMAKE_CUDA_ARCHITECTURES ${{DETECTED_ARCH}})
+else()
+    include(FindCUDA/select_compute_arch)
+    CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
+    string(STRIP "${{INSTALLED_GPU_CCS_1}}" INSTALLED_GPU_CCS_2)
+    string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${{INSTALLED_GPU_CCS_2}}")
+    string(REPLACE "." "" CUDA_ARCH_LIST "${{INSTALLED_GPU_CCS_3}}")
+    set(CMAKE_CUDA_ARCHITECTURES ${{CUDA_ARCH_LIST}})
+endif()
+
+set(CMAKE_CUDA_FLAGS "${{CMAKE_CUDA_FLAGS}} -O3")
 
 execute_process(
     COMMAND ${{Python_EXECUTABLE}} -c "import torch; print(torch.utils.cmake_prefix_path)"
@@ -375,6 +395,7 @@ set_target_properties({target} PROPERTIES
 )
 """
     (cache_dir / "CMakeLists.txt").write_text(content)
+
 
 
 def _parse_build_errors(output: str) -> str:

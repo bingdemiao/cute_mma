@@ -3,12 +3,43 @@
 from __future__ import annotations
 
 import math
+import random as _random
 from typing import Callable, Iterable, Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
+
+SHUFFLE_SEGMENT_SZ = 8  # 128-bit vectorized load = 8 x fp16
+
+_shuffle_module = None
+_shuffle_lock = __import__("threading").Lock()
+
+
+def _get_shuffle_module():
+    """JIT-compile and load the shuffle OFT CUDA kernel."""
+    global _shuffle_module
+    if _shuffle_module is not None:
+        return _shuffle_module
+    with _shuffle_lock:
+        if _shuffle_module is not None:
+            return _shuffle_module
+        from pathlib import Path
+        from torch.utils.cpp_extension import load
+        _dir = Path(__file__).parent.parent.parent / "torch_ext"
+        _shuffle_module = load(
+            name="shuffle_oft_cuda",
+            sources=[
+                str(_dir / "shuffle_oft_torch.cu"),
+                str(_dir / "shuffle_oft_bind.cpp"),
+            ],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_ldflags=["-lcublas"],
+            verbose=False,
+        )
+        return _shuffle_module
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +142,92 @@ def _oft_backward(ctx, dC):
 _oft_forward_op.register_autograd(_oft_backward, setup_context=_oft_setup_context)
 
 
+def _round_robin_matchings(n: int) -> list[list[tuple[int, int]]]:
+    """Generate all unique perfect matchings via round-robin tournament.
+
+    For n players (even), produces n-1 rounds where each round is a perfect
+    matching and no pair appears in more than one round.
+    """
+    assert n % 2 == 0 and n >= 2
+    matchings = []
+    players = list(range(n))
+    for _ in range(n - 1):
+        matching = [(players[0], players[-1])]
+        for i in range(1, n // 2):
+            matching.append((players[i], players[n - 1 - i]))
+        matchings.append(matching)
+        players = [players[0]] + [players[-1]] + players[1:-1]
+    return matchings
+
+
+def _build_seg_pairs(
+    in_features: int, out_features: int, group_size: int,
+    reconn_sz: int, shuffle_blk_k: int,
+) -> torch.Tensor:
+    """Build per-group segment pair indices for input shuffling.
+
+    Group 0 uses identity pairing. Other groups get per-chunk randomized
+    matchings from a round-robin schedule, ensuring maximum diversity
+    even when n_groups exceeds the number of available matchings.
+
+    Returns:
+        (n_groups, n_blocks, 2) int64 tensor of global segment indices.
+    """
+    seg_sz = SHUFFLE_SEGMENT_SZ
+    n_groups = out_features // group_size
+    n_chunks = in_features // shuffle_blk_k
+    n_segments_per_chunk = shuffle_blk_k // seg_sz
+    n_blocks = in_features // reconn_sz
+    blocks_per_chunk = shuffle_blk_k // reconn_sz
+
+    all_matchings = _round_robin_matchings(n_segments_per_chunk)
+    n_matchings = len(all_matchings)
+
+    # Deterministic affine code construction.
+    #
+    # Map each non-identity group g (1-indexed) to (a, b):
+    #   a = (g-1) // n_matchings,  b = (g-1) % n_matchings
+    #
+    # Assignment for group g at chunk c:
+    #   matching_idx = (a * c + b) % n_matchings
+    #
+    # Diversity guarantees:
+    #   - Same a, different b: 0 chunk collisions (constant offset)
+    #   - Different a: ≤ gcd(|a1-a2|, n_matchings) collisions per
+    #     period of n_matchings chunks
+    #   - Supports up to n_matchings^2 + 1 groups deterministically
+    if n_groups - 1 > n_matchings * n_matchings:
+        raise ValueError(
+            f"Too many groups ({n_groups}) for affine construction. "
+            f"Max supported: {n_matchings ** 2 + 1}"
+        )
+
+    seg_pairs = torch.zeros(n_groups, n_blocks, 2, dtype=torch.long)
+
+    for g in range(n_groups):
+        if g == 0:
+            # Identity: natural segment pairing
+            for c in range(n_chunks):
+                seg_offset = c * n_segments_per_chunk
+                for b_local in range(blocks_per_chunk):
+                    b_global = c * blocks_per_chunk + b_local
+                    seg_pairs[g, b_global, 0] = seg_offset + 2 * b_local
+                    seg_pairs[g, b_global, 1] = seg_offset + 2 * b_local + 1
+        else:
+            a = (g - 1) // n_matchings
+            b = (g - 1) % n_matchings
+            for c in range(n_chunks):
+                matching_idx = (a * c + b) % n_matchings
+                matching = all_matchings[matching_idx]
+                seg_offset = c * n_segments_per_chunk
+                for b_local, (sa, sb) in enumerate(matching):
+                    b_global = c * blocks_per_chunk + b_local
+                    seg_pairs[g, b_global, 0] = seg_offset + sa
+                    seg_pairs[g, b_global, 1] = seg_offset + sb
+
+    return seg_pairs
+
+
 class OFTLinear(nn.Module):
     """Drop-in replacement for ``nn.Linear`` using OFT structure.
 
@@ -167,6 +284,8 @@ class OFTLinear(nn.Module):
         bias: bool = True,
         activation: Literal["silu_gate"] | None = None,
         cayley_order: int | float = float("inf"),
+        input_shuffle: bool = False,
+        shuffle_blk_k: int = 128,
         backend: Literal["cute", "cublas", "pytorch"] = "cute",
         autotuning: bool = False,
         force_rebenchmark: bool = False,
@@ -186,6 +305,24 @@ class OFTLinear(nn.Module):
                 f"in_features ({in_features}) must be divisible by "
                 f"reconn_sz ({reconn_sz})"
             )
+        if input_shuffle:
+            if reconn_sz != 16:
+                raise ValueError("input_shuffle requires reconn_sz=16")
+            if shuffle_blk_k > 256:
+                raise ValueError(
+                    f"shuffle_blk_k ({shuffle_blk_k}) must be <= 256 "
+                    f"(dAdR kernel BLK_K constraint)"
+                )
+            if in_features % shuffle_blk_k != 0:
+                raise ValueError(
+                    f"in_features ({in_features}) must be divisible by "
+                    f"shuffle_blk_k ({shuffle_blk_k})"
+                )
+            if backend == "cute":
+                raise ValueError(
+                    "input_shuffle is not supported with the 'cute' backend. "
+                    "Use 'cublas' or 'pytorch' instead."
+                )
 
         self.in_features = in_features
         self.out_features = out_features
@@ -193,6 +330,8 @@ class OFTLinear(nn.Module):
         self.reconn_sz = reconn_sz
         self.activation = activation
         self.cayley_order = cayley_order
+        self.input_shuffle = input_shuffle
+        self.shuffle_blk_k = shuffle_blk_k
         self.backend = backend
         self.autotuning = autotuning
         self.force_rebenchmark = force_rebenchmark
@@ -242,6 +381,13 @@ class OFTLinear(nn.Module):
             self.bias = nn.Parameter(torch.empty(out_features))
         else:
             self.register_parameter("bias", None)
+
+        # Input shuffle: build per-group segment pair indices
+        if input_shuffle:
+            seg_pairs = _build_seg_pairs(
+                in_features, out_features, group_size, reconn_sz, shuffle_blk_k,
+            )
+            self.register_buffer("_seg_pairs", seg_pairs)
 
         self.reset_parameters()
 
@@ -442,14 +588,17 @@ class OFTLinear(nn.Module):
 
         R = self._build_R()
 
-        # The custom op call is opaque to torch.compile — no graph breaks.
-        # activation="" is used as sentinel for None (custom_op requires str).
-        C = _oft_forward_op(
-            A, B, R,
-            self.group_size, self.reconn_sz,
-            self.backend, self.activation or "",
-            self.autotuning, self.force_rebenchmark,
-        )
+        if self.input_shuffle:
+            C = self._forward_shuffle(A, B, R)
+        else:
+            # The custom op call is opaque to torch.compile — no graph breaks.
+            # activation="" is used as sentinel for None (custom_op requires str).
+            C = _oft_forward_op(
+                A, B, R,
+                self.group_size, self.reconn_sz,
+                self.backend, self.activation or "",
+                self.autotuning, self.force_rebenchmark,
+            )
 
         # Restore leading dimensions
         out_shape = orig_shape[:-1] + (self.out_features,)
@@ -457,6 +606,64 @@ class OFTLinear(nn.Module):
 
         if self.bias is not None:
             C = C + self.bias
+
+        return C
+
+    def _forward_shuffle(self, A: torch.Tensor, B: torch.Tensor,
+                         R: torch.Tensor) -> torch.Tensor:
+        """Forward with input shuffling — each group sees permuted segments.
+
+        When backend='cublas', uses the compiled shuffle CUDA kernel
+        (cuBLAS batched GEMM + gather/gating kernels).
+        When backend='pytorch', uses pure PyTorch ops.
+        """
+        if self.backend == "cublas" and A.is_cuda:
+            return self._forward_shuffle_cuda(A, B, R)
+        return self._forward_shuffle_pytorch(A, B, R)
+
+    def _forward_shuffle_cuda(self, A: torch.Tensor, B: torch.Tensor,
+                              R: torch.Tensor) -> torch.Tensor:
+        """Shuffle forward using JIT-compiled CUDA kernel."""
+        mod = _get_shuffle_module()
+        gated = self.activation == "silu_gate"
+        return mod.forward(A, B, R, self._seg_pairs,
+                           self.group_size, self.reconn_sz, gated)
+
+    def _forward_shuffle_pytorch(self, A: torch.Tensor, B: torch.Tensor,
+                                 R: torch.Tensor) -> torch.Tensor:
+        """Shuffle forward using pure PyTorch ops."""
+        M = A.shape[0]
+        N = self.out_features
+        n_groups = N // self.group_size
+        n_blocks = self.in_features // self.reconn_sz
+        r = self.reconn_sz
+        seg_sz = SHUFFLE_SEGMENT_SZ
+
+        R_blocks = R.reshape(n_groups, r, n_blocks, r).permute(0, 2, 1, 3)
+
+        n_total_segments = self.in_features // seg_sz
+        A_segs = A.reshape(M, n_total_segments, seg_sz).permute(1, 0, 2)
+
+        C = torch.zeros(M, N, dtype=A.dtype, device=A.device)
+        gated = self.activation == "silu_gate"
+
+        for g in range(n_groups):
+            seg_a = self._seg_pairs[g, :, 0]
+            seg_b = self._seg_pairs[g, :, 1]
+            A_batch = torch.cat([A_segs[seg_a], A_segs[seg_b]], dim=-1)
+
+            AR_batch = torch.bmm(A_batch, R_blocks[g].transpose(-1, -2))
+
+            A_perm = A_batch.permute(1, 0, 2).reshape(M, self.in_features)
+            AR_perm = AR_batch.permute(1, 0, 2).reshape(M, self.in_features)
+
+            if gated:
+                H_perm = A_perm * F.silu(AR_perm)
+            else:
+                H_perm = AR_perm
+
+            B_g = B[g * self.group_size : (g + 1) * self.group_size]
+            C[:, g * self.group_size : (g + 1) * self.group_size] = torch.mm(H_perm, B_g.T)
 
         return C
 
@@ -472,6 +679,8 @@ class OFTLinear(nn.Module):
             parts.append(f"activation={self.activation!r}")
         if self.activation is None:
             parts.append(f"cayley_order={self.cayley_order}")
+        if self.input_shuffle:
+            parts.append(f"input_shuffle=True, shuffle_blk_k={self.shuffle_blk_k}")
         if self.backend != "cute":
             parts.append(f"backend={self.backend!r}")
         if self.autotuning:
