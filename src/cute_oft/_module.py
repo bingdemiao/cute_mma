@@ -166,6 +166,7 @@ class OFTLinear(nn.Module):
         reconn_sz: int = 8,
         bias: bool = True,
         activation: Literal["silu_gate"] | None = None,
+        cayley_order: int | float = float("inf"),
         backend: Literal["cute", "cublas", "pytorch"] = "cute",
         autotuning: bool = False,
         force_rebenchmark: bool = False,
@@ -191,6 +192,7 @@ class OFTLinear(nn.Module):
         self.group_size = group_size
         self.reconn_sz = reconn_sz
         self.activation = activation
+        self.cayley_order = cayley_order
         self.backend = backend
         self.autotuning = autotuning
         self.force_rebenchmark = force_rebenchmark
@@ -201,11 +203,21 @@ class OFTLinear(nn.Module):
         n_groups = out_features // group_size
         gated = activation == "silu_gate"
 
-        # μP multipliers: absorb fan-in scaling so all raw params are O(1)
-        # and a single base learning rate works for both B and R.
-        # B has effective fan-in = K, R has effective fan-in = reconn_sz.
-        self._weight_multiplier = 1.0 / math.sqrt(in_features) if gated else 1.0
-        self._reconn_multiplier = 1.0 / math.sqrt(reconn_sz)
+        # μP multipliers.
+        #
+        # In gated mode, NO runtime multipliers are applied for either B or R.
+        # All scaling is absorbed into initialization so that parameters live
+        # at O(1/sqrt(fan_in)) — matching nn.Linear's convention. This makes
+        # OFTLinear fully compatible with muP's optimizer-level LR scaling
+        # (MuAdamW) and allows mixing with nn.Linear in the same model.
+        #
+        # B: init at N(0, alpha/sqrt(K)) where alpha ≈ 1.66 compensates for
+        #    gated SiLU variance reduction. Same muP behavior as nn.Linear.
+        # R: init at N(0, 1/sqrt(r)) where r = reconn_sz is the block fan-in.
+        #    mup_fix_oft_shapes() marks R's K-dim as finite so MuAdamW
+        #    doesn't over-scale its LR based on the full tensor width.
+        self._weight_multiplier = 1.0 if gated else 1.0
+        self._reconn_multiplier = 1.0 if gated else 1.0 / math.sqrt(reconn_sz)
 
         # Weight B: (out_features, in_features)
         # Frozen in standard OFT, trainable in gated mode.
@@ -215,18 +227,16 @@ class OFTLinear(nn.Module):
             requires_grad=gated,
         )
 
-        # Reconnection parameter: (n_groups * reconn_sz, in_features)
-        # In gated mode (pretraining): stores O(1) raw param, R = multiplier * reconn.
-        # In standard mode (finetuning): stores delta from identity, R = I + multiplier * reconn.
+        # Reconnection parameter.
+        # Gated mode (pretraining): reconn stores raw R directly.
+        # Finetuning mode: reconn stores M, a (reconn_sz x reconn_sz) matrix
+        #   per group per block. S = M - M^T is skew-symmetric, and R is
+        #   constructed as an orthogonal matrix from S:
+        #     cayley_order=inf:  R = (I + S)(I - S)^{-1}  (exact Cayley)
+        #     cayley_order=k:    R = I + 2 * sum_{i=1}^{k} S^i  (k-th order approx)
         self.reconn = nn.Parameter(
             torch.empty(n_groups * reconn_sz, in_features),
         )
-
-        # For finetuning (non-gated): store block-diagonal identity as buffer
-        if not gated:
-            n_blocks = in_features // reconn_sz
-            reconn_base = torch.eye(reconn_sz).repeat(1, n_blocks).repeat(n_groups, 1)
-            self.register_buffer("_reconn_base", reconn_base)
 
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
@@ -238,9 +248,12 @@ class OFTLinear(nn.Module):
     def reset_parameters(self) -> None:
         """Initialize parameters with μP-correct scaling.
 
-        Gated mode (pretraining): Both weight and reconn are initialized as
-        O(1) random values. The ``1/sqrt(fan_in)`` multipliers are applied in
-        the forward pass, so a single base learning rate works for all params.
+        Gated mode (pretraining): B is initialized with variance
+        alpha^2 / K (where alpha ≈ 1.66 compensates for the gated SiLU
+        variance reduction). This keeps B at O(1/sqrt(K)), matching
+        nn.Linear's parameter scale so that muP's LR scaling gives
+        identical per-step output change. R is O(1) with runtime
+        multiplier 1/sqrt(r).
 
         Standard mode (finetuning): Weight B gets Kaiming init (will typically
         be overwritten by pretrained weights). Reconn is initialized to zero
@@ -249,10 +262,22 @@ class OFTLinear(nn.Module):
         gated = self.activation == "silu_gate"
 
         if gated:
-            # Pretraining: O(1) random init for both B_raw and R_raw.
-            # Effective B = (1/√K) * weight, R = (1/√r) * reconn.
-            nn.init.normal_(self.weight)
-            nn.init.normal_(self.reconn)
+            _GATED_SILU_CORRECTION = 1.0 / 0.6024
+            # B: absorb alpha/sqrt(K) into init. No runtime multiplier.
+            nn.init.normal_(self.weight, std=_GATED_SILU_CORRECTION / math.sqrt(self.in_features))
+            # R: init as block-diagonal skew-symmetric.
+            # Form S = M - M^T from random M, so S is skew-symmetric.
+            # Var(S_ij) = 2*sigma^2 for off-diagonal, 0 on diagonal.
+            # We want Var(R_ij) = 1/r (fan-in per block), so sigma = 1/sqrt(2r).
+            n_groups = self.out_features // self.group_size
+            n_blocks = self.in_features // self.reconn_sz
+            r = self.reconn_sz
+            sigma = 1.0 / math.sqrt(2 * r)
+            M = torch.randn(n_groups, n_blocks, r, r, device=self.reconn.device,
+                            dtype=self.reconn.dtype) * sigma
+            S = M - M.transpose(-1, -2)
+            with torch.no_grad():
+                self.reconn.copy_(S.permute(0, 2, 1, 3).reshape(n_groups * r, self.in_features))
         else:
             # Finetuning: Kaiming B (frozen, will be overwritten),
             # zero delta (R starts at identity).
@@ -263,6 +288,69 @@ class OFTLinear(nn.Module):
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
+
+    def _build_R(self) -> torch.Tensor:
+        """Construct the reconnection matrix R from the stored parameter.
+
+        Gated mode: R = reconn (used directly, no orthogonal constraint).
+
+        Finetuning mode: reconn stores M. We form the skew-symmetric matrix
+        S = M - M^T per block, then build an orthogonal R:
+          - cayley_order=inf:  R = (I + S)(I - S)^{-1}   (exact Cayley transform)
+          - cayley_order=k:    R = I + 2 * sum_{i=1}^{k} S^i  (k-th order approx)
+
+        Returns:
+            R tensor of shape (n_groups * reconn_sz, in_features), same dtype/device.
+        """
+        if self.activation == "silu_gate":
+            return self.reconn
+
+        n_groups = self.out_features // self.group_size
+        n_blocks = self.in_features // self.reconn_sz
+        r = self.reconn_sz
+
+        # Reshape M to blocks: (n_groups, n_blocks, r, r)
+        M_blocks = self.reconn.reshape(n_groups, r, n_blocks, r).permute(0, 2, 1, 3)
+
+        # Skew-symmetric: S = M - M^T
+        S = M_blocks - M_blocks.transpose(-1, -2)
+
+        if self.cayley_order == float("inf"):
+            # Exact Cayley: R = (I + S)(I - S)^{-1}
+            I = torch.eye(r, device=S.device, dtype=S.dtype).expand_as(S)
+            R_blocks = torch.linalg.solve(I - S, I + S)
+        else:
+            # Approximate: R = I + 2 * sum_{i=1}^{order} S^i
+            I = torch.eye(r, device=S.device, dtype=S.dtype).expand_as(S)
+            R_blocks = I.clone()
+            S_power = S  # S^1
+            for _ in range(int(self.cayley_order)):
+                R_blocks = R_blocks + 2 * S_power
+                S_power = S_power @ S  # S^{i+1}
+
+        # Reshape back: (n_groups, n_blocks, r, r) -> (n_groups * r, n_blocks * r)
+        R = R_blocks.permute(0, 2, 1, 3).reshape(n_groups * r, self.in_features)
+        return R
+
+    def reconn_diag_sq_sum(self) -> torch.Tensor:
+        """Sum of squared diagonal elements of R blocks.
+
+        For a perfectly skew-symmetric R, all diagonal elements are zero,
+        so this returns 0. During training, nonzero values indicate R is
+        drifting from skew-symmetry. For the Cayley/approximation modes
+        (finetuning), R is orthogonal so diagonals should be close to 1
+        and this returns approximately n_groups * n_blocks * reconn_sz.
+
+        Returns:
+            Scalar tensor: sum of R_block[i,i]^2 across all blocks and groups.
+        """
+        R = self._build_R()
+        n_groups = self.out_features // self.group_size
+        n_blocks = self.in_features // self.reconn_sz
+        r = self.reconn_sz
+        R_blocks = R.reshape(n_groups, r, n_blocks, r).permute(0, 2, 1, 3)
+        diag = R_blocks.diagonal(dim1=-2, dim2=-1)  # (n_groups, n_blocks, r)
+        return (diag ** 2).sum()
 
     def load_pretrained_weight(
         self, weight: torch.Tensor, bias: torch.Tensor | None = None,
@@ -347,16 +435,12 @@ class OFTLinear(nn.Module):
         orig_shape = input.shape
         A = input.reshape(-1, self.in_features)
 
-        # Apply μP multipliers. These are standard torch ops that the
-        # compiler can trace and fuse with surrounding operations.
         if self._weight_multiplier != 1.0:
             B = self._weight_multiplier * self.weight
         else:
             B = self.weight
 
-        R = self._reconn_multiplier * self.reconn
-        if hasattr(self, "_reconn_base"):
-            R = self._reconn_base + R
+        R = self._build_R()
 
         # The custom op call is opaque to torch.compile — no graph breaks.
         # activation="" is used as sentinel for None (custom_op requires str).
@@ -386,6 +470,8 @@ class OFTLinear(nn.Module):
         ]
         if self.activation is not None:
             parts.append(f"activation={self.activation!r}")
+        if self.activation is None:
+            parts.append(f"cayley_order={self.cayley_order}")
         if self.backend != "cute":
             parts.append(f"backend={self.backend!r}")
         if self.autotuning:
@@ -394,16 +480,29 @@ class OFTLinear(nn.Module):
 
 
 def mup_fix_oft_shapes(model: nn.Module) -> None:
-    """Mark OFTLinear parameters as finite for ``mup`` compatibility.
+    """Fix OFTLinear infshapes for correct ``mup`` LR scaling.
 
-    OFTLinear already applies μP-correct ``1/sqrt(fan_in)`` multipliers in
-    the forward pass, so ``mup``'s optimizer-level LR scaling must be
-    disabled for these parameters.  Call this **after**
-    ``mup.set_base_shapes()`` and **before** creating the optimizer::
+    Must be called **after** ``mup.set_base_shapes()`` and **before**
+    creating the optimizer::
 
         mup.set_base_shapes(model, base_model)
         mup_fix_oft_shapes(model)
         optimizer = MuAdam(model.parameters(), lr=base_lr)
+
+    **Weight B** (``weight``): No adjustment needed. B has no runtime
+    multiplier (scaling is absorbed into init), so it behaves identically
+    to ``nn.Linear`` — ``MuAdamW`` scales its LR by ``1/width_mult``
+    where ``width_mult = K / base_K``, giving O(1/√K) output change
+    per Adam step.
+
+    **Reconnection R** (``reconn``): R is block-diagonal with fixed
+    ``(reconn_sz × reconn_sz)`` blocks. Its actual fan-in per block is
+    ``reconn_sz`` (constant), not ``K`` (which scales with width).
+    ``set_base_shapes`` incorrectly marks R's K-dimension as infinite
+    (since ``K != base_K``), causing ``MuAdamW`` to over-scale R's LR.
+    We fix this by marking R's K-dimension as finite, so ``ninf() == 1``
+    and ``MuAdamW`` leaves R's LR unscaled — matching the fact that
+    each block's learning dynamics don't depend on total width.
 
     Args:
         model: The model containing OFTLinear layers (already processed
@@ -413,8 +512,13 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
 
     for module in model.modules():
         if isinstance(module, OFTLinear):
-            for param in module.parameters():
-                if hasattr(param, "infshape"):
-                    param.infshape = InfShape(
-                        [InfDim(None, d) for d in param.shape]
-                    )
+            for name, param in module.named_parameters():
+                if not hasattr(param, "infshape"):
+                    continue
+                if name == "reconn":
+                    # R shape: (n_groups * reconn_sz, K)
+                    # Mark K dim (last) as finite — block fan_in = reconn_sz, not K
+                    dims = list(param.infshape)
+                    dims[-1] = InfDim(None, dims[-1].dim)
+                    param.infshape = InfShape(dims)
+                # weight (B) and bias: keep infshape from set_base_shapes
