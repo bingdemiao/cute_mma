@@ -157,35 +157,82 @@ static void cublas_oft_ar_impl(
     torch::TensorOptions opts,
     bool gated, cudaStream_t stream)
 {
-    auto AR = torch::empty({m, k}, opts);
-    auto* AR_ptr = static_cast<scalar_t*>(AR.data_ptr());
+    // Two-stream pipeline: producer (batched AR + gate) overlaps with
+    // consumer (dense C_g GEMM) across groups. Double-buffer AR.
+    constexpr int PIPE = 2;
+    torch::Tensor AR_t[PIPE];
+    scalar_t* AR_ptr[PIPE];
+    for (int p = 0; p < PIPE; ++p) {
+        AR_t[p] = torch::empty({m, k}, opts);
+        AR_ptr[p] = static_cast<scalar_t*>(AR_t[p].data_ptr());
+    }
 
-    for (int64_t i = 0; i < n_groups; ++i) {
-        // AR = A @ R_g^T  (batched over K/reconn_sz blocks)
+    cudaStream_t stream_p;
+    cudaEvent_t ready[PIPE];
+    cudaStreamCreate(&stream_p);
+    for (int p = 0; p < PIPE; ++p)
+        cudaEventCreate(&ready[p]);
+
+    cublasHandle_t handle_p;
+    GEMM_CHECK_CUBLAS(cublasCreate(&handle_p));
+    GEMM_CHECK_CUBLAS(cublasSetStream(handle_p, stream_p));
+    GEMM_CHECK_CUBLAS(cublasSetMathMode(handle_p, CUBLAS_DEFAULT_MATH));
+
+    int threads = 256;
+
+    auto produce = [&](int64_t g, int p) {
         gemm_strided_batched_ex(
-            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            handle_p, CUBLAS_OP_T, CUBLAS_OP_N,
             reconn_sz, m, reconn_sz,
-            R_ptr + i * reconn_sz * k, dt, k, reconn_sz,
+            R_ptr + g * reconn_sz * k, dt, k, reconn_sz,
             A_ptr,                     dt, k, reconn_sz,
-            AR_ptr,                    dt, k, reconn_sz,
+            AR_ptr[p],                 dt, k, reconn_sz,
             k / reconn_sz);
 
         if (gated) {
             int64_t numel = m * k;
-            int threads = 256;
             int blocks = (int)((numel + threads - 1) / threads);
-            silu_gate_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-                A_ptr, AR_ptr, numel);
+            silu_gate_kernel<scalar_t><<<blocks, threads, 0, stream_p>>>(
+                A_ptr, AR_ptr[p], numel);
         }
 
-        // C_g = AR @ B_g^T
+        cudaEventRecord(ready[p], stream_p);
+    };
+
+    auto consume = [&](int64_t g, int p) {
+        cudaStreamWaitEvent(stream, ready[p]);
+
         gemm_ex(
             handle, CUBLAS_OP_T, CUBLAS_OP_N,
             group_size, m, k,
-            B_ptr + i * group_size * k, dt, k,
-            AR_ptr,                     dt, k,
-            C_ptr + i * group_size,     dt, n);
+            B_ptr + g * group_size * k, dt, k,
+            AR_ptr[p],                  dt, k,
+            C_ptr + g * group_size,     dt, n);
+    };
+
+    for (int64_t g = 0; g < n_groups; ++g) {
+        int p = (int)(g % PIPE);
+
+        if (g >= PIPE) {
+            cudaEvent_t consumed;
+            cudaEventCreate(&consumed);
+            cudaEventRecord(consumed, stream);
+            cudaStreamWaitEvent(stream_p, consumed);
+            cudaEventDestroy(consumed);
+        }
+
+        produce(g, p);
+        if (g > 0)
+            consume(g - 1, (int)((g - 1) % PIPE));
     }
+    if (n_groups > 0)
+        consume(n_groups - 1, (int)((n_groups - 1) % PIPE));
+
+    cudaStreamSynchronize(stream_p);
+    GEMM_CHECK_CUBLAS(cublasDestroy(handle_p));
+    for (int p = 0; p < PIPE; ++p)
+        cudaEventDestroy(ready[p]);
+    cudaStreamDestroy(stream_p);
 }
 
 // ---------------------------------------------------------------------------
@@ -244,9 +291,20 @@ static std::tuple<torch::Tensor, torch::Tensor> cublas_backward_dA_dR_impl(
 
     auto* dA_ptr  = static_cast<scalar_t*>(dA.data_ptr());
     void* dR_raw  = dR.data_ptr();
-    int64_t dR_es = dR.element_size();          // bytes per element
+    int64_t dR_es = dR.element_size();
     auto* AR_ptr  = static_cast<scalar_t*>(AR.data_ptr());
     auto* dAR_ptr = static_cast<scalar_t*>(dAR.data_ptr());
+
+    // Parallel streams: overlap AR recompute with dH dense GEMM within each group
+    cudaStream_t stream_ar;
+    cudaEvent_t ar_ready;
+    cudaStreamCreate(&stream_ar);
+    cudaEventCreate(&ar_ready);
+
+    cublasHandle_t handle_ar;
+    GEMM_CHECK_CUBLAS(cublasCreate(&handle_ar));
+    GEMM_CHECK_CUBLAS(cublasSetStream(handle_ar, stream_ar));
+    GEMM_CHECK_CUBLAS(cublasSetMathMode(handle_ar, CUBLAS_DEFAULT_MATH));
 
     int threads = 256;
 
@@ -256,22 +314,26 @@ static std::tuple<torch::Tensor, torch::Tensor> cublas_backward_dA_dR_impl(
         const scalar_t* R_g  = R_ptr  + g * reconn_sz * k;
         void* dR_g = static_cast<char*>(dR_raw) + g * reconn_sz * k * dR_es;
 
-        // Recompute AR_g = A @ R_g^T
+        // Stream AR: recompute AR_g = A @ R_g^T
         gemm_strided_batched_ex(
-            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            handle_ar, CUBLAS_OP_T, CUBLAS_OP_N,
             reconn_sz, m, reconn_sz,
             R_g,    compute_dt, k, reconn_sz,
             A_ptr,  compute_dt, k, reconn_sz,
             AR_ptr, compute_dt, k, reconn_sz,
             k / reconn_sz);
+        cudaEventRecord(ar_ready, stream_ar);
 
         if (gated) {
-            // dH_g = dC_g @ B_g
+            // Stream main: dH_g = dC_g @ B_g (runs in parallel with AR recompute)
             gemm_ex(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 k, m, group_size,
                 B_g,     compute_dt, k,
                 dC_g,    compute_dt, n,
                 dAR_ptr, compute_dt, k);
+
+            // Wait for AR recompute before using AR_ptr
+            cudaStreamWaitEvent(stream, ar_ready);
 
             {
                 int64_t numel = m * k;
@@ -308,6 +370,10 @@ static std::tuple<torch::Tensor, torch::Tensor> cublas_backward_dA_dR_impl(
                 dR_g,    dR_dt,      k, reconn_sz,
                 k / reconn_sz);
         } else {
+            // Non-gated: no AR recompute needed, just dH = dC @ B
+            // Wait for AR stream (no-op if nothing was launched, but safe)
+            cudaStreamWaitEvent(stream, ar_ready);
+
             // dAR_g = dC_g @ B_g
             gemm_ex(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 k, m, group_size,
@@ -336,6 +402,11 @@ static std::tuple<torch::Tensor, torch::Tensor> cublas_backward_dA_dR_impl(
         }
     }
 
+    cudaStreamSynchronize(stream_ar);
+    GEMM_CHECK_CUBLAS(cublasDestroy(handle_ar));
+    cudaEventDestroy(ar_ready);
+    cudaStreamDestroy(stream_ar);
+
     return {dA, dR};
 }
 
@@ -354,43 +425,89 @@ static torch::Tensor cublas_backward_dB_impl(
     bool gated, cudaStream_t stream)
 {
     auto dB = torch::zeros({n, k}, dB_opts);
-    auto AR = torch::empty({m, k}, compute_opts);
-
     void* dB_raw  = dB.data_ptr();
     int64_t dB_es = dB.element_size();
-    auto* AR_ptr  = static_cast<scalar_t*>(AR.data_ptr());
+
+    // Double-buffer AR for pipelined recompute + dB GEMM
+    constexpr int PIPE = 2;
+    torch::Tensor AR_t[PIPE];
+    scalar_t* AR_ptr[PIPE];
+    for (int p = 0; p < PIPE; ++p) {
+        AR_t[p] = torch::empty({m, k}, compute_opts);
+        AR_ptr[p] = static_cast<scalar_t*>(AR_t[p].data_ptr());
+    }
+
+    cudaStream_t stream_p;
+    cudaEvent_t ready[PIPE];
+    cudaStreamCreate(&stream_p);
+    for (int p = 0; p < PIPE; ++p)
+        cudaEventCreate(&ready[p]);
+
+    cublasHandle_t handle_p;
+    GEMM_CHECK_CUBLAS(cublasCreate(&handle_p));
+    GEMM_CHECK_CUBLAS(cublasSetStream(handle_p, stream_p));
+    GEMM_CHECK_CUBLAS(cublasSetMathMode(handle_p, CUBLAS_DEFAULT_MATH));
 
     int threads = 256;
 
-    for (int64_t g = 0; g < n_groups; ++g) {
-        const scalar_t* dC_g = dC_ptr + g * group_size;
-        const scalar_t* R_g  = R_ptr  + g * reconn_sz * k;
-        void* dB_g = static_cast<char*>(dB_raw) + g * group_size * k * dB_es;
+    auto produce = [&](int64_t g, int p) {
+        const scalar_t* R_g = R_ptr + g * reconn_sz * k;
 
-        // Recompute AR_g = A @ R_g^T
         gemm_strided_batched_ex(
-            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            handle_p, CUBLAS_OP_T, CUBLAS_OP_N,
             reconn_sz, m, reconn_sz,
-            R_g,    compute_dt, k, reconn_sz,
-            A_ptr,  compute_dt, k, reconn_sz,
-            AR_ptr, compute_dt, k, reconn_sz,
+            R_g,       compute_dt, k, reconn_sz,
+            A_ptr,     compute_dt, k, reconn_sz,
+            AR_ptr[p], compute_dt, k, reconn_sz,
             k / reconn_sz);
 
         if (gated) {
             int64_t numel = m * k;
             int blocks = (int)((numel + threads - 1) / threads);
-            silu_gate_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-                A_ptr, AR_ptr, numel);
+            silu_gate_kernel<scalar_t><<<blocks, threads, 0, stream_p>>>(
+                A_ptr, AR_ptr[p], numel);
         }
 
-        // dB_g = dC_g^T @ AR_g
+        cudaEventRecord(ready[p], stream_p);
+    };
+
+    auto consume = [&](int64_t g, int p) {
+        cudaStreamWaitEvent(stream, ready[p]);
+
+        const scalar_t* dC_g = dC_ptr + g * group_size;
+        void* dB_g = static_cast<char*>(dB_raw) + g * group_size * k * dB_es;
+
         gemm_ex(
             handle, CUBLAS_OP_N, CUBLAS_OP_T,
             k, group_size, m,
-            AR_ptr, compute_dt, k,
-            dC_g,   compute_dt, n,
-            dB_g,   dB_dt,      k);
+            AR_ptr[p], compute_dt, k,
+            dC_g,      compute_dt, n,
+            dB_g,      dB_dt,      k);
+    };
+
+    for (int64_t g = 0; g < n_groups; ++g) {
+        int p = (int)(g % PIPE);
+
+        if (g >= PIPE) {
+            cudaEvent_t consumed;
+            cudaEventCreate(&consumed);
+            cudaEventRecord(consumed, stream);
+            cudaStreamWaitEvent(stream_p, consumed);
+            cudaEventDestroy(consumed);
+        }
+
+        produce(g, p);
+        if (g > 0)
+            consume(g - 1, (int)((g - 1) % PIPE));
     }
+    if (n_groups > 0)
+        consume(n_groups - 1, (int)((n_groups - 1) % PIPE));
+
+    cudaStreamSynchronize(stream_p);
+    GEMM_CHECK_CUBLAS(cublasDestroy(handle_p));
+    for (int p = 0; p < PIPE; ++p)
+        cudaEventDestroy(ready[p]);
+    cudaStreamDestroy(stream_p);
 
     return dB;
 }

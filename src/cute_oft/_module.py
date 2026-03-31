@@ -228,6 +228,36 @@ def _build_seg_pairs(
     return seg_pairs
 
 
+class _ShuffleOFTFunction(torch.autograd.Function):
+    """Autograd wrapper for the shuffle OFT CUDA kernel."""
+
+    @staticmethod
+    def forward(ctx, A, B, R, seg_pairs, group_size, reconn_sz, gated):
+        mod = _get_shuffle_module()
+        C = mod.forward(A, B, R, seg_pairs, group_size, reconn_sz, gated)
+        ctx.save_for_backward(A, B, R, seg_pairs)
+        ctx.group_size = group_size
+        ctx.reconn_sz = reconn_sz
+        ctx.gated = gated
+        return C
+
+    @staticmethod
+    def backward(ctx, dC):
+        A, B, R, seg_pairs = ctx.saved_tensors
+        mod = _get_shuffle_module()
+
+        dC = dC.contiguous()
+        dA, dR = mod.backward_dA_dR(
+            dC, A, B, R, seg_pairs,
+            ctx.group_size, ctx.reconn_sz, ctx.gated)
+        dB = mod.backward_dB(
+            dC, A, R, seg_pairs,
+            ctx.group_size, ctx.reconn_sz, ctx.gated)
+
+        # Grads for: A, B, R, seg_pairs, group_size, reconn_sz, gated
+        return dA, dB, dR, None, None, None, None
+
+
 class OFTLinear(nn.Module):
     """Drop-in replacement for ``nn.Linear`` using OFT structure.
 
@@ -507,6 +537,11 @@ class OFTLinear(nn.Module):
         layer. Useful for fine-tuning: load the pretrained weights, then train
         only R (standard OFT) or both R and B (gated OFT).
 
+        When ``input_shuffle=True`` and not gated (finetuning mode), each
+        group's B columns are permuted to match the shuffled AR layout.
+        This is a one-time cost at load time so the forward path needs no
+        runtime scatter or extra gather.
+
         Args:
             weight: Pretrained weight tensor of shape ``(out_features, in_features)``.
             bias: Optional pretrained bias tensor of shape ``(out_features,)``.
@@ -518,9 +553,17 @@ class OFTLinear(nn.Module):
             )
         with torch.no_grad():
             if self._weight_multiplier != 1.0:
-                # In gated μP mode, weight stores the raw O(1) param;
-                # convert from actual weight space: raw = weight / multiplier.
                 self.weight.copy_(weight / self._weight_multiplier)
+            elif self.input_shuffle and self.activation != "silu_gate":
+                # Non-gated finetuning with shuffle: permute B columns per group
+                # so that frozen B is compatible with the shuffled AR layout.
+                n_groups = self.out_features // self.group_size
+                w = weight.clone()
+                for g in range(n_groups):
+                    elem_perm = self._seg_pairs_to_elem_perm(g)
+                    w[g * self.group_size : (g + 1) * self.group_size] = \
+                        weight[g * self.group_size : (g + 1) * self.group_size][:, elem_perm]
+                self.weight.copy_(w)
             else:
                 self.weight.copy_(weight)
         if bias is not None:
@@ -609,25 +652,41 @@ class OFTLinear(nn.Module):
 
         return C
 
+    def _seg_pairs_to_elem_perm(self, g: int) -> torch.Tensor:
+        """Convert seg_pairs[g] to an element-level permutation of K columns.
+
+        seg_pairs[g, b] = (seg_a, seg_b) means R block b reads segments
+        seg_a and seg_b. The permuted layout puts them at positions
+        [b*reconn_sz .. (b+1)*reconn_sz). This returns the element indices
+        that map natural order to permuted order.
+        """
+        seg_sz = SHUFFLE_SEGMENT_SZ
+        n_blocks = self._seg_pairs.shape[1]
+        perm = torch.zeros(self.in_features, dtype=torch.long,
+                           device=self._seg_pairs.device)
+        for b in range(n_blocks):
+            sa = self._seg_pairs[g, b, 0]
+            sb = self._seg_pairs[g, b, 1]
+            dst = b * self.reconn_sz
+            offsets = torch.arange(seg_sz, device=self._seg_pairs.device)
+            perm[dst:dst + seg_sz] = sa * seg_sz + offsets
+            perm[dst + seg_sz:dst + 2 * seg_sz] = sb * seg_sz + offsets
+        return perm
+
     def _forward_shuffle(self, A: torch.Tensor, B: torch.Tensor,
                          R: torch.Tensor) -> torch.Tensor:
         """Forward with input shuffling — each group sees permuted segments.
 
-        When backend='cublas', uses the compiled shuffle CUDA kernel
-        (cuBLAS batched GEMM + gather/gating kernels).
-        When backend='pytorch', uses pure PyTorch ops.
+        When backend='cublas', uses the CUDA kernel with autograd support.
+        When backend='pytorch', uses pure PyTorch ops (reference/testing).
         """
         if self.backend == "cublas" and A.is_cuda:
-            return self._forward_shuffle_cuda(A, B, R)
+            return _ShuffleOFTFunction.apply(
+                A, B, R, self._seg_pairs,
+                self.group_size, self.reconn_sz,
+                self.activation == "silu_gate",
+            )
         return self._forward_shuffle_pytorch(A, B, R)
-
-    def _forward_shuffle_cuda(self, A: torch.Tensor, B: torch.Tensor,
-                              R: torch.Tensor) -> torch.Tensor:
-        """Shuffle forward using JIT-compiled CUDA kernel."""
-        mod = _get_shuffle_module()
-        gated = self.activation == "silu_gate"
-        return mod.forward(A, B, R, self._seg_pairs,
-                           self.group_size, self.reconn_sz, gated)
 
     def _forward_shuffle_pytorch(self, A: torch.Tensor, B: torch.Tensor,
                                  R: torch.Tensor) -> torch.Tensor:
