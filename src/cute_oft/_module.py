@@ -19,40 +19,52 @@ class _BwdNormFn(torch.autograd.Function):
     """Apply batch normalization to gradients in the backward pass only."""
 
     @staticmethod
-    def forward(ctx, x, bwd_bn, training):
+    def forward(ctx, x, bwd_bn, training, calibrated_flag):
         ctx.bwd_bn = bwd_bn
         ctx.training = training
+        ctx.calibrated_flag = calibrated_flag
         return x  # identity in forward
 
     @staticmethod
     def backward(ctx, grad_y):
         bwd_bn = ctx.bwd_bn
+        # Calibrate bwd_bn running stats from first gradient batch
+        if not ctx.calibrated_flag[0]:
+            with torch.no_grad():
+                mean = grad_y.mean(dim=0)
+                var = grad_y.var(dim=0, unbiased=False)
+                bwd_bn.running_mean.copy_(mean)
+                bwd_bn.running_var.copy_(var)
+            ctx.calibrated_flag[0] = True
         was_training = bwd_bn.training
         bwd_bn.train(ctx.training)
         with torch.no_grad():
             grad_normalized = bwd_bn(grad_y)
         bwd_bn.train(was_training)
-        return grad_normalized, None, None
+        return grad_normalized, None, None, None
 
 
 class BidirectionalBatchNorm(nn.Module):
     """BatchNorm that normalizes both forward activations and backward gradients.
 
-    Contains two internal BatchNorm1d layers:
+    Contains two internal BatchNorm1d layers (both ``affine=False``):
 
-    - ``fwd_bn``: Standard learnable BatchNorm applied in the forward pass.
-      Normalizes input to zero mean and unit variance, with learnable
-      affine parameters (gamma, beta).
+    - ``fwd_bn``: BatchNorm applied in the forward pass. Normalizes input
+      to zero mean and unit variance for correct OFT signal scale.
 
-    - ``bwd_bn``: Fixed-scale BatchNorm (affine=False) applied to gradients
-      in the backward pass via a custom autograd Function. Normalizes the
-      gradient flowing back to zero mean and unit variance using batch
-      statistics, counteracting the ~1.47x backward gain from the gated
-      SiLU activation's multiplicative structure.
+    - ``bwd_bn``: BatchNorm applied to gradients in the backward pass via
+      a custom autograd Function. Normalizes the gradient to unit variance,
+      counteracting the ~1.47x backward gain from the gated SiLU
+      activation's multiplicative structure.
 
-    The backward BN uses ``torch.no_grad()`` so it does not create
-    second-order gradients. Its running statistics are updated during
-    training for use in eval mode.
+    Both layers are non-learnable (``affine=False``) to preserve muP
+    scaling — per-element affine parameters have no fan-in summation,
+    so their updates wouldn't decay with width.
+
+    On the first forward/backward pass, running statistics are calibrated
+    directly from batch statistics (rather than slowly converging from
+    the default ``mean=0, var=1``). This avoids gradient blowup in fp16
+    during early iterations.
 
     Args:
         num_features: Number of features (channels) to normalize.
@@ -65,10 +77,24 @@ class BidirectionalBatchNorm(nn.Module):
         # have no fan-in, so their delta_y doesn't decay with width).
         self.fwd_bn = nn.BatchNorm1d(num_features, affine=False)
         self.bwd_bn = nn.BatchNorm1d(num_features, affine=False)
+        self._fwd_calibrated = False
+        # Mutable container so _BwdNormFn can set it from backward()
+        self._bwd_calibrated = [False]
+
+    def _calibrate(self, bn: nn.BatchNorm1d, x: torch.Tensor) -> None:
+        """Set running stats directly from batch statistics (first-batch init)."""
+        with torch.no_grad():
+            mean = x.mean(dim=0)
+            var = x.var(dim=0, unbiased=False)
+            bn.running_mean.copy_(mean)
+            bn.running_var.copy_(var)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and not self._fwd_calibrated:
+            self._calibrate(self.fwd_bn, x)
+            self._fwd_calibrated = True
         x = self.fwd_bn(x)
-        x = _BwdNormFn.apply(x, self.bwd_bn, self.training)
+        x = _BwdNormFn.apply(x, self.bwd_bn, self.training, self._bwd_calibrated)
         return x
 
 _shuffle_module = None
