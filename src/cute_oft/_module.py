@@ -60,7 +60,10 @@ class BidirectionalBatchNorm(nn.Module):
 
     def __init__(self, num_features: int):
         super().__init__()
-        self.fwd_bn = nn.BatchNorm1d(num_features)
+        # affine=False: OFT expects unit-variance input, so learnable gamma/beta
+        # would fight the normalization and break muP scaling (per-element scalars
+        # have no fan-in, so their delta_y doesn't decay with width).
+        self.fwd_bn = nn.BatchNorm1d(num_features, affine=False)
         self.bwd_bn = nn.BatchNorm1d(num_features, affine=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -861,3 +864,4 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
                         dims[-1] = InfDim(int(math.sqrt(base_K * K)), K)
                     param.infshape = InfShape(dims)
                 # weight (B) and bias: keep infshape from set_base_shapes
+                # input_norm: fwd_bn and bwd_bn are both affine=False (no learnable params)
