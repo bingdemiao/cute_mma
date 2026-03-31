@@ -29,12 +29,11 @@ class _BwdNormFn(torch.autograd.Function):
     def backward(ctx, grad_y):
         bwd_bn = ctx.bwd_bn
         # Calibrate bwd_bn running stats from first gradient batch
+        # (single scalar across all channels for robustness)
         if not ctx.calibrated_flag[0]:
             with torch.no_grad():
-                mean = grad_y.mean(dim=0)
-                var = grad_y.var(dim=0, unbiased=False)
-                bwd_bn.running_mean.copy_(mean)
-                bwd_bn.running_var.copy_(var)
+                bwd_bn.running_mean.fill_(grad_y.mean().item())
+                bwd_bn.running_var.fill_(grad_y.var().item())
             ctx.calibrated_flag[0] = True
         was_training = bwd_bn.training
         bwd_bn.train(ctx.training)
@@ -81,13 +80,18 @@ class BidirectionalBatchNorm(nn.Module):
         # Mutable container so _BwdNormFn can set it from backward()
         self._bwd_calibrated = [False]
 
-    def _calibrate(self, bn: nn.BatchNorm1d, x: torch.Tensor) -> None:
-        """Set running stats directly from batch statistics (first-batch init)."""
+    @staticmethod
+    def _calibrate(bn: nn.BatchNorm1d, x: torch.Tensor) -> None:
+        """Set running stats from global (all-channel) batch statistics.
+
+        Uses a single scalar mean/var across all channels rather than
+        per-channel estimates — more robust with small batch sizes since
+        the estimate comes from B*K samples instead of K separate B-sample
+        estimates. Subsequent BN updates will refine per-channel details.
+        """
         with torch.no_grad():
-            mean = x.mean(dim=0)
-            var = x.var(dim=0, unbiased=False)
-            bn.running_mean.copy_(mean)
-            bn.running_var.copy_(var)
+            bn.running_mean.fill_(x.mean().item())
+            bn.running_var.fill_(x.var().item())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training and not self._fwd_calibrated:
