@@ -251,6 +251,101 @@ cute_oft.clear_autotune_cache(keep_best_kernels=False)
 cute_oft.clear_cache()
 ```
 
+## Input shuffle
+
+When using multiple groups, each group's R blocks operate on the same partition of input features by default. **Input shuffle** assigns each group a different pairing of 8-element segments into R blocks, so different groups mix different feature pairs — increasing view diversity across groups.
+
+```python
+layer = cute_oft.OFTLinear(
+    768, 768,
+    group_size=64, reconn_sz=16,
+    activation="silu_gate",
+    backend="cublas",
+    input_shuffle=True,    # enable per-group segment shuffling
+    shuffle_blk_k=128,     # permutation locality (max 256, for dAdR kernel compat)
+)
+```
+
+### How it works
+
+With `reconn_sz=16` and `segment_sz=8`, each R block pairs exactly 2 segments. Pairings are generated using a **deterministic affine code** over round-robin tournament matchings:
+
+- Within each `shuffle_blk_k`-sized chunk, up to `n_segments - 1` unique perfect matchings are available (15 for `blk_k=128`)
+- Group `g`'s matching at chunk `c` is `(a * c + b) % n_matchings` where `a, b` are derived from `g`
+- Same-`a` groups have **zero** chunk collisions; supports up to `n_matchings² + 1` groups without repetition
+
+The segment pair assignments are stored as a buffer (`_seg_pairs`) and saved with model checkpoints.
+
+### Constraints
+
+| Constraint | Reason |
+|---|---|
+| `reconn_sz=16` | Each R block pairs exactly 2 segments of 8 elements |
+| `shuffle_blk_k ≤ 256` | Permutation must be local within dAdR backward kernel's BLK_K tile |
+| `backend ≠ "cute"` | CuTe fused kernel does not support shuffle (use `cublas` or `pytorch`) |
+
+### Shuffle in finetuning mode
+
+In non-gated (finetuning) mode, B is frozen and expects natural column order. When `input_shuffle=True`, `load_pretrained_weight()` automatically permutes each group's B columns to match the shuffled AR layout — a one-time cost at load time with zero runtime overhead.
+
+```python
+# Convert pretrained layer with shuffle for finetuning
+oft = cute_oft.OFTLinear.from_linear(
+    pretrained_linear,
+    group_size=64, reconn_sz=16,
+    input_shuffle=True,
+    cayley_order=1,
+)
+# B columns are permuted per group — forward path needs no scatter
+```
+
+### Performance
+
+The shuffle forward uses a two-stream pipeline:
+1. **Producer stream**: gather A segments + block-diagonal GEMM + SiLU gate
+2. **Consumer stream**: dense GEMM (`H_perm @ B^T`)
+
+Producer for group `g+1` overlaps with consumer for group `g`. The same pipelining is applied to backward passes and to the non-shuffle cublas backend.
+
+## Cayley orthogonal parameterization
+
+For finetuning, R is parameterized via the Cayley transform to guarantee orthogonality:
+
+```python
+layer = cute_oft.OFTLinear(
+    768, 768,
+    group_size=64, reconn_sz=16,
+    cayley_order=float("inf"),  # exact Cayley: R = (I+S)(I-S)^{-1}
+)
+
+# Or use k-th order approximation for speed:
+layer = cute_oft.OFTLinear(
+    768, 768,
+    group_size=64, reconn_sz=16,
+    cayley_order=2,  # R = I + 2S + 2S²  (linear cost in order)
+)
+```
+
+The trainable parameter M is stored in `reconn`; at forward time, `S = M - M^T` (skew-symmetric) is formed and R is constructed. `reconn_diag_sq_sum()` provides a diagnostic for monitoring R's health during training.
+
+## muP compatibility
+
+OFTLinear is designed to be fully compatible with the [muP](https://github.com/microsoft/mup) library (`MuAdamW`, `set_base_shapes`) and can be freely mixed with `nn.Linear` in the same model.
+
+- **Weight B**: No runtime multiplier. Scaling is absorbed into initialization (`std = alpha/sqrt(K)` where `alpha ≈ 1.66` compensates for gated SiLU variance reduction). muP treats B identically to `nn.Linear`.
+- **Reconnection R**: Initialized as skew-symmetric at `std = 1/sqrt(reconn_sz)`. `mup_fix_oft_shapes()` marks R's K-dimension as finite so `MuAdamW` doesn't over-scale its LR (R is block-diagonal with fixed `fan_in = reconn_sz`).
+
+```python
+from mup import MuAdamW, set_base_shapes
+from cute_oft._module import mup_fix_oft_shapes
+
+model = make_model(hidden_dim=1024)
+base = make_model(hidden_dim=64)
+set_base_shapes(model, base)
+mup_fix_oft_shapes(model)  # fix R's infshape
+optimizer = MuAdamW(model.parameters(), lr=0.01)
+```
+
 ## `OFTLinear` reference
 
 | Parameter | Default | Description |
@@ -261,12 +356,17 @@ cute_oft.clear_cache()
 | `reconn_sz` | `8` | Block size of orthogonal reconnection matrix |
 | `bias` | `True` | Learnable output bias |
 | `activation` | `None` | `None` (standard OFT) or `"silu_gate"` (gated/width expansion) |
+| `cayley_order` | `inf` | Cayley approximation order (`inf` = exact, `k` = k-th order) |
+| `input_shuffle` | `False` | Per-group segment shuffling for cross-block feature mixing |
+| `shuffle_blk_k` | `128` | Shuffle locality chunk size (max 256) |
 | `backend` | `"cute"` | `"cute"`, `"cublas"`, or `"pytorch"` |
 | `autotuning` | `False` | Enable automatic kernel autotuning |
 
 Methods:
 - `OFTLinear.from_linear(linear, ...)` — create from an existing `nn.Linear`, copying weights and bias
-- `load_pretrained_weight(weight, bias=None)` — load pretrained weight/bias tensors
+- `load_pretrained_weight(weight, bias=None)` — load pretrained weight/bias tensors (permutes B columns per group when `input_shuffle=True` in finetuning mode)
+- `reconn_diag_sq_sum()` — diagnostic: sum of squared diagonal elements of R blocks
+- `mup_fix_oft_shapes(model)` — fix OFTLinear infshapes for correct muP LR scaling
 
 ## Configuration classes
 
@@ -317,7 +417,8 @@ torch_ext/              C++/CUDA PyTorch extensions
   oft_fwd_torch.cu        Forward kernel torch binding
   oft_bwd_dadr_torch.cu   Backward dA+dR kernel torch binding
   oft_bwd_db_torch.cu     Backward dB kernel torch binding
-  cublas_oft_torch.cu     cuBLAS backend torch binding
+  cublas_oft_torch.cu     cuBLAS backend (pipelined two-stream)
+  shuffle_oft_torch.cu    Shuffle backend (gather + cuBLAS + scatter-add)
 *.cu, *.hpp             CUDA kernel source (CuTe cooperative kernels, utilities)
 cmake/                  CMake modules (CUTLASS detection)
 tests/                  pytest test suite
