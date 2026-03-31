@@ -14,6 +14,60 @@ from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 
 SHUFFLE_SEGMENT_SZ = 8  # 128-bit vectorized load = 8 x fp16
 
+
+class _BwdNormFn(torch.autograd.Function):
+    """Apply batch normalization to gradients in the backward pass only."""
+
+    @staticmethod
+    def forward(ctx, x, bwd_bn, training):
+        ctx.bwd_bn = bwd_bn
+        ctx.training = training
+        return x  # identity in forward
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        bwd_bn = ctx.bwd_bn
+        was_training = bwd_bn.training
+        bwd_bn.train(ctx.training)
+        with torch.no_grad():
+            grad_normalized = bwd_bn(grad_y)
+        bwd_bn.train(was_training)
+        return grad_normalized, None, None
+
+
+class BidirectionalBatchNorm(nn.Module):
+    """BatchNorm that normalizes both forward activations and backward gradients.
+
+    Contains two internal BatchNorm1d layers:
+
+    - ``fwd_bn``: Standard learnable BatchNorm applied in the forward pass.
+      Normalizes input to zero mean and unit variance, with learnable
+      affine parameters (gamma, beta).
+
+    - ``bwd_bn``: Fixed-scale BatchNorm (affine=False) applied to gradients
+      in the backward pass via a custom autograd Function. Normalizes the
+      gradient flowing back to zero mean and unit variance using batch
+      statistics, counteracting the ~1.47x backward gain from the gated
+      SiLU activation's multiplicative structure.
+
+    The backward BN uses ``torch.no_grad()`` so it does not create
+    second-order gradients. Its running statistics are updated during
+    training for use in eval mode.
+
+    Args:
+        num_features: Number of features (channels) to normalize.
+    """
+
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.fwd_bn = nn.BatchNorm1d(num_features)
+        self.bwd_bn = nn.BatchNorm1d(num_features, affine=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fwd_bn(x)
+        x = _BwdNormFn.apply(x, self.bwd_bn, self.training)
+        return x
+
 _shuffle_module = None
 _shuffle_lock = __import__("threading").Lock()
 
@@ -419,6 +473,11 @@ class OFTLinear(nn.Module):
             )
             self.register_buffer("_seg_pairs", seg_pairs)
 
+        # Bidirectional batch normalization: normalizes input in forward
+        # (for correct Layer 1/2 interaction) and normalizes gradients in
+        # backward (counteracting the ~1.47x gain from multiplicative gating).
+        self.input_norm = BidirectionalBatchNorm(in_features)
+
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -628,6 +687,9 @@ class OFTLinear(nn.Module):
         # Flatten leading dimensions to 2D
         orig_shape = input.shape
         A = input.reshape(-1, self.in_features)
+
+        # Bidirectional normalization: forward BN + backward gradient BN
+        A = self.input_norm(A)
 
         if self._weight_multiplier != 1.0:
             B = self._weight_multiplier * self.weight
