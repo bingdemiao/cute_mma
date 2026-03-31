@@ -763,14 +763,13 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
     where ``width_mult = K / base_K``, giving O(1/√K) output change
     per Adam step.
 
-    **Reconnection R** (``reconn``): R is block-diagonal with fixed
-    ``(reconn_sz × reconn_sz)`` blocks. Its actual fan-in per block is
-    ``reconn_sz`` (constant), not ``K`` (which scales with width).
-    ``set_base_shapes`` incorrectly marks R's K-dimension as infinite
-    (since ``K != base_K``), causing ``MuAdamW`` to over-scale R's LR.
-    We fix this by marking R's K-dimension as finite, so ``ninf() == 1``
-    and ``MuAdamW`` leaves R's LR unscaled — matching the fact that
-    each block's learning dynamics don't depend on total width.
+    **Reconnection R** (``reconn``): R's contribution to the output goes
+    through ``delta_AR @ B^T``, where B is O(1/√K). This extra damping
+    means R needs ``width_mult = √(K/base_K)`` (not ``K/base_K``) so that
+    ``lr_R = lr / √(K/base_K)`` gives O(1/√K) output change — matching B.
+
+    We achieve this by setting R's K-dimension ``base_dim = √(base_K * K)``
+    so that ``width_mult = K / √(base_K * K) = √(K / base_K)``.
 
     Args:
         model: The model containing OFTLinear layers (already processed
@@ -785,8 +784,13 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
                     continue
                 if name == "reconn":
                     # R shape: (n_groups * reconn_sz, K)
-                    # Mark K dim (last) as finite — block fan_in = reconn_sz, not K
+                    # Set K dim's base_dim = sqrt(base_K * K) so that
+                    # width_mult = K / sqrt(base_K * K) = sqrt(K / base_K)
                     dims = list(param.infshape)
-                    dims[-1] = InfDim(None, dims[-1].dim)
+                    K_dim = dims[-1]
+                    if K_dim.base_dim is not None:
+                        K = K_dim.dim
+                        base_K = K_dim.base_dim
+                        dims[-1] = InfDim(int(math.sqrt(base_K * K)), K)
                     param.infshape = InfShape(dims)
                 # weight (B) and bias: keep infshape from set_base_shapes
