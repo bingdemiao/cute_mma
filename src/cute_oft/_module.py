@@ -438,7 +438,11 @@ class OFTLinear(nn.Module):
         gated = self.activation == "silu_gate"
 
         if gated:
-            _GATED_SILU_CORRECTION = 1.0 / 0.6024
+            # Gain of a * SiLU(a @ r^T) with skew-symmetric R at std=1/sqrt(r).
+            # Measured empirically: 0.5638 for r=16 (NOT 0.6024 from the
+            # independent x*SiLU(y) approximation, which ignores within-block
+            # correlation between a and ar).
+            _GATED_SILU_CORRECTION = 1.0 / 0.5638
             # B: absorb alpha/sqrt(K) into init. No runtime multiplier.
             nn.init.normal_(self.weight, std=_GATED_SILU_CORRECTION / math.sqrt(self.in_features))
             # R: init as block-diagonal skew-symmetric.
@@ -455,13 +459,14 @@ class OFTLinear(nn.Module):
             with torch.no_grad():
                 self.reconn.copy_(S.permute(0, 2, 1, 3).reshape(n_groups * r, self.in_features))
         else:
-            # Finetuning: Kaiming B (frozen, will be overwritten),
-            # zero delta (R starts at identity).
-            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            # Finetuning: B at 1/sqrt(K) for variance-preserving forward
+            # (R starts at identity via Cayley with M=0).
+            # B will typically be overwritten by load_pretrained_weight().
+            nn.init.normal_(self.weight, std=1.0 / math.sqrt(self.in_features))
             nn.init.zeros_(self.reconn)
 
         if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            fan_in = self.in_features
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
