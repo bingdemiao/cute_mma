@@ -328,12 +328,24 @@ layer = cute_oft.OFTLinear(
 
 The trainable parameter M is stored in `reconn`; at forward time, `S = M - M^T` (skew-symmetric) is formed and R is constructed. `reconn_diag_sq_sum()` provides a diagnostic for monitoring R's health during training.
 
+## Bidirectional batch normalization
+
+OFTLinear includes a built-in `BidirectionalBatchNorm` applied to the input before the OFT computation. This serves two purposes:
+
+1. **Forward normalization**: A standard learnable `BatchNorm1d` normalizes the input to zero mean and unit variance, which is required for OFTLinear's internal Layer 1 (`A * SiLU(A @ R^T)`) and Layer 2 (`H @ B^T`) to interact with the correct signal scale.
+
+2. **Backward gradient normalization**: A second `BatchNorm1d` (fixed, non-learnable) normalizes the gradient flowing backward through the layer. The gated SiLU activation has a multiplicative structure (`h = a * SiLU(ar)`) that amplifies the backward gradient by ~1.47x (from two independent gradient paths summing). Without correction, this would cause gradient explosion in deep networks. The backward BN normalizes the gradient to unit variance, bringing the end-to-end backward gain to ~1.0.
+
+This is the same backward amplification problem that SwiGLU/GeGLU have in transformers, where it's typically handled by residual connections + LayerNorm. The built-in BiNorm makes OFTLinear self-contained — it doesn't rely on external normalization to maintain stable gradients.
+
+The backward BN operates under `torch.no_grad()` (no second-order gradients) and updates running statistics during training for use in eval mode. Adam-like optimizers are approximately scale-invariant, so the gradient rescaling has minimal impact on optimization dynamics.
+
 ## muP compatibility
 
 OFTLinear is designed to be fully compatible with the [muP](https://github.com/microsoft/mup) library (`MuAdamW`, `set_base_shapes`) and can be freely mixed with `nn.Linear` in the same model.
 
-- **Weight B**: No runtime multiplier. Scaling is absorbed into initialization (`std = alpha/sqrt(K)` where `alpha ≈ 1.66` compensates for gated SiLU variance reduction). muP treats B identically to `nn.Linear`.
-- **Reconnection R**: Initialized as skew-symmetric at `std = 1/sqrt(reconn_sz)`. `mup_fix_oft_shapes()` marks R's K-dimension as finite so `MuAdamW` doesn't over-scale its LR (R is block-diagonal with fixed `fan_in = reconn_sz`).
+- **Weight B**: No runtime multiplier. Scaling is absorbed into initialization (`std = alpha/sqrt(K)` where `alpha ≈ 1.77` compensates for gated SiLU variance reduction with skew-symmetric R). muP treats B identically to `nn.Linear`.
+- **Reconnection R**: Initialized as skew-symmetric at `std = 1/sqrt(reconn_sz)`. `mup_fix_oft_shapes()` sets R's K-dimension `base_dim = sqrt(base_K * K)` giving `width_mult = sqrt(K/base_K)`, because R's output propagates through B which adds extra `O(1/sqrt(K))` damping.
 
 ```python
 from mup import MuAdamW, set_base_shapes
