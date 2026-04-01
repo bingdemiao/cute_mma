@@ -20,7 +20,7 @@ struct CurrKernelParams {
 };
 
 template <class KernelParams>
-void oft_tn(int m, int n, int k,
+void prism_tn(int m, int n, int k,
         half const* A, int ldA,
         half const* B, int ldB,
         half const* R, int ldR,

@@ -35,7 +35,7 @@ def get_or_compile(
     """
     if backend == "cublas":
         # cuBLAS has a single module for all operations
-        key = "cublas_oft"
+        key = "cublas_prism"
         module_name = key
     else:
         # Build cache key from kernel_type + relevant params

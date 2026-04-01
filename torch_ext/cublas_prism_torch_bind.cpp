@@ -1,6 +1,6 @@
 #include <torch/extension.h>
 
-torch::Tensor cublas_oft_forward(
+torch::Tensor cublas_prism_forward(
     torch::Tensor A,
     torch::Tensor B,
     torch::Tensor R,
@@ -29,7 +29,7 @@ torch::Tensor cublas_backward_dB(
     c10::optional<at::ScalarType> dB_dtype);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &cublas_oft_forward,
+    m.def("forward", &cublas_prism_forward,
           "OFT forward pass (cuBLAS): C = A * R * B^T",
           py::arg("A"),
           py::arg("B"),

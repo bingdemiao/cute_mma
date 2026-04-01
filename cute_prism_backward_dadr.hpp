@@ -4,7 +4,7 @@
 // CuTe backward pass for OFT — dA + dR kernel launcher.
 
 // Kernel 1: dA + dR from dC, A, B, R (producer-consumer with MMA)
-void oft_backward_dA_dR_launch(
+void prism_backward_dA_dR_launch(
     int m, int n, int k,
     half const* dC, int ldDC,
     half const* A,  int ldA,

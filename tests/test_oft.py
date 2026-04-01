@@ -15,7 +15,7 @@ import os
 
 # Add the Python package to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-import cute_oft
+import cute_prism
 
 
 def oft_reference(A, B, R, group_size, reconn_sz, activation=None):
@@ -70,7 +70,7 @@ def test_oft(m, n, k, group_size=256, reconn_sz=8, backend="cute", mode="ar", er
     A, B, R = make_test_tensors(m, n, k, group_size, reconn_sz)
 
     C_ref = oft_reference(A, B, R, group_size, reconn_sz, activation=activation)
-    C_kernel = cute_oft.forward(A, B, R, group_size, reconn_sz, backend=backend, mode=mode, activation=activation)
+    C_kernel = cute_prism.forward(A, B, R, group_size, reconn_sz, backend=backend, mode=mode, activation=activation)
 
     # Check for NaN/Inf
     nan_count = C_kernel.isnan().sum().item()

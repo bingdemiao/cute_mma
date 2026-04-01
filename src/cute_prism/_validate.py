@@ -98,7 +98,7 @@ def compute_smem_bytes(
 ) -> int:
     """Compute shared memory usage in bytes.
 
-    Mirrors get_smem_size() in cute_oft_coop_pc.cu.
+    Mirrors get_smem_size() in cute_prism_coop_pc.cu.
     Gated mode does in-place gating on sAR using sA data, so no extra smem needed.
     """
     n_groups = max(bN // group_size, 1)

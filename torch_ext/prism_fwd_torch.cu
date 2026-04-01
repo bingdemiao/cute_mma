@@ -2,9 +2,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
 
-#include "cute_oft_coop_pc.hpp"
+#include "cute_prism_coop_pc.hpp"
 
-torch::Tensor oft_forward(
+torch::Tensor prism_forward(
     torch::Tensor A,
     torch::Tensor B,
     torch::Tensor R,
@@ -72,7 +72,7 @@ torch::Tensor oft_forward(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
     // Launch the kernel
-    oft_tn<CurrKernelParams>(
+    prism_tn<CurrKernelParams>(
         static_cast<int>(m),
         static_cast<int>(n),
         static_cast<int>(k),

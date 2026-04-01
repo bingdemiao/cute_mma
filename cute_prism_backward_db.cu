@@ -1,7 +1,7 @@
-#include "cute_oft_backward_db.hpp"
-#include "cute_oft_coop_pc.hpp"
+#include "cute_prism_backward_db.hpp"
+#include "cute_prism_coop_pc.hpp"
 #include <oft_config.hpp>
-#include "cute_oft_util.hpp"
+#include "cute_prism_util.hpp"
 #include "z_curve.hpp"
 
 using namespace cute;
@@ -391,7 +391,7 @@ dB_pc_kernel(
 }
 
 
-void oft_backward_dB_launch(
+void prism_backward_dB_launch(
     int m, int n, int k,
     half const* dC, int ldDC,
     half const* A,  int ldA,

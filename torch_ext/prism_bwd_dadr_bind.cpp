@@ -1,6 +1,6 @@
 #include <torch/extension.h>
 
-std::vector<torch::Tensor> oft_backward_dA_dR(
+std::vector<torch::Tensor> prism_backward_dA_dR(
     torch::Tensor dC,
     torch::Tensor A,
     torch::Tensor B,
@@ -9,7 +9,7 @@ std::vector<torch::Tensor> oft_backward_dA_dR(
     int64_t reconn_sz);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("backward_dA_dR", &oft_backward_dA_dR,
+    m.def("backward_dA_dR", &prism_backward_dA_dR,
           "OFT backward: compute dA, dR",
           py::arg("dC"),
           py::arg("A"),

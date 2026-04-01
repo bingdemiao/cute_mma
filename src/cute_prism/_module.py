@@ -48,10 +48,10 @@ def _get_shuffle_module():
         from torch.utils.cpp_extension import load
         _dir = Path(__file__).parent.parent.parent / "torch_ext"
         _shuffle_module = load(
-            name="shuffle_oft_cuda",
+            name="shuffle_prism_cuda",
             sources=[
-                str(_dir / "shuffle_oft_torch.cu"),
-                str(_dir / "shuffle_oft_bind.cpp"),
+                str(_dir / "shuffle_prism_torch.cu"),
+                str(_dir / "shuffle_prism_bind.cpp"),
             ],
             extra_cuda_cflags=["-O3", "--use_fast_math"],
             extra_ldflags=["-lcublas"],
@@ -64,8 +64,8 @@ def _get_shuffle_module():
 # Custom ops: opaque to torch.compile, with fake-tensor + autograd support
 # ---------------------------------------------------------------------------
 
-@torch.library.custom_op("cute_oft::forward", mutates_args=())
-def _oft_forward_op(
+@torch.library.custom_op("cute_prism::forward", mutates_args=())
+def _prism_forward_op(
     A: torch.Tensor,
     B: torch.Tensor,
     R: torch.Tensor,
@@ -76,9 +76,9 @@ def _oft_forward_op(
     autotuning: bool,
     force_rebenchmark: bool,
 ) -> torch.Tensor:
-    from . import forward as oft_forward
+    from . import forward as prism_forward
 
-    return oft_forward(
+    return prism_forward(
         A, B, R, group_size, reconn_sz,
         backend=backend,
         activation=activation or None,
@@ -87,14 +87,14 @@ def _oft_forward_op(
     )
 
 
-@_oft_forward_op.register_fake
+@_prism_forward_op.register_fake
 def _(A, B, R, group_size, reconn_sz, backend, activation, autotuning,
       force_rebenchmark):
     return A.new_empty(A.shape[0], B.shape[0])
 
 
-@torch.library.custom_op("cute_oft::backward", mutates_args=())
-def _oft_backward_op(
+@torch.library.custom_op("cute_prism::backward", mutates_args=())
+def _prism_backward_op(
     dC: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -106,9 +106,9 @@ def _oft_backward_op(
     autotuning: bool,
     force_rebenchmark: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from . import backward as oft_backward
+    from . import backward as prism_backward
 
-    dA, dR, dB = oft_backward(
+    dA, dR, dB = prism_backward(
         dC.contiguous(), A.contiguous(), B.contiguous(), R.contiguous(),
         group_size, reconn_sz,
         backend=backend,
@@ -125,13 +125,13 @@ def _oft_backward_op(
     return dA, dR, dB
 
 
-@_oft_backward_op.register_fake
+@_prism_backward_op.register_fake
 def _(dC, A, B, R, group_size, reconn_sz, backend, activation, autotuning,
       force_rebenchmark):
     return A.new_empty(A.shape), R.new_empty(R.shape), B.new_empty(B.shape)
 
 
-def _oft_setup_context(ctx, inputs, output):
+def _prism_setup_context(ctx, inputs, output):
     A, B, R, group_size, reconn_sz, backend, activation, autotuning, \
         force_rebenchmark = inputs
     ctx.save_for_backward(A, B, R)
@@ -143,10 +143,10 @@ def _oft_setup_context(ctx, inputs, output):
     ctx.force_rebenchmark = force_rebenchmark
 
 
-def _oft_backward(ctx, dC):
+def _prism_backward(ctx, dC):
     A, B, R = ctx.saved_tensors
 
-    dA, dR, dB = _oft_backward_op(
+    dA, dR, dB = _prism_backward_op(
         dC, A, B, R,
         ctx.group_size, ctx.reconn_sz,
         ctx.backend, ctx.activation,
@@ -157,7 +157,7 @@ def _oft_backward(ctx, dC):
     return dA, dB, dR, None, None, None, None, None, None
 
 
-_oft_forward_op.register_autograd(_oft_backward, setup_context=_oft_setup_context)
+_prism_forward_op.register_autograd(_prism_backward, setup_context=_prism_setup_context)
 
 
 def _round_robin_matchings(n: int) -> list[list[tuple[int, int]]]:
@@ -313,12 +313,12 @@ class PrismLinear(nn.Module):
     Examples::
 
         # Standard OFT fine-tuning (freeze pretrained weights, train R only)
-        layer = cute_oft.PrismLinear(256, 1024, group_size=256, reconn_sz=8)
+        layer = cute_prism.PrismLinear(256, 1024, group_size=256, reconn_sz=8)
         layer.load_pretrained_weight(pretrained_linear.weight)
         output = layer(input)
 
         # Gated OFT as width expansion (train both R and B)
-        layer = cute_oft.PrismLinear(256, 1024, group_size=256, reconn_sz=8,
+        layer = cute_prism.PrismLinear(256, 1024, group_size=256, reconn_sz=8,
                                    activation="silu_gate")
         output = layer(input)
     """
@@ -663,7 +663,7 @@ class PrismLinear(nn.Module):
         else:
             # The custom op call is opaque to torch.compile — no graph breaks.
             # activation="" is used as sentinel for None (custom_op requires str).
-            C = _oft_forward_op(
+            C = _prism_forward_op(
                 A, B, R,
                 self.group_size, self.reconn_sz,
                 self.backend, self.activation or "",

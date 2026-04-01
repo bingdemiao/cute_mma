@@ -1,7 +1,7 @@
 """JIT compilation of OFT CUDA kernels.
 
 Compiles per-variant .so files keyed by (backend, kernel_type, group_size, reconn_sz, comp_params),
-caching them on disk under ~/.cache/cute_oft/. Each kernel type (fwd, bwd_dadr, bwd_db)
+caching them on disk under ~/.cache/cute_prism/. Each kernel type (fwd, bwd_dadr, bwd_db)
 is compiled independently for faster incremental builds.
 """
 
@@ -20,7 +20,7 @@ from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 
 KernelType = Literal["fwd", "bwd_dadr", "bwd_db"]
 
-# Root of the cute_mma source tree (three levels up: _compiler.py -> cute_oft -> src -> repo root)
+# Root of the cute_mma source tree (three levels up: _compiler.py -> cute_prism -> src -> repo root)
 _SOURCE_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
@@ -34,15 +34,18 @@ class CompilationError(RuntimeError):
 
 
 def _cache_root() -> Path:
-    return Path(os.environ.get("CUTE_OFT_CACHE_DIR", Path.home() / ".cache" / "cute_oft"))
+    return Path(os.environ.get("CUTE_PRISM_CACHE_DIR",
+                    os.environ.get("CUTE_OFT_CACHE_DIR",
+                                   Path.home() / ".cache" / "cute_prism")))
 
 
 def _source_root() -> Path:
-    root = Path(os.environ.get("CUTE_OFT_SOURCE_DIR", _SOURCE_ROOT))
-    if not (root / "cute_oft_coop_pc.cu").exists():
+    root = Path(os.environ.get("CUTE_PRISM_SOURCE_DIR",
+                    os.environ.get("CUTE_OFT_SOURCE_DIR", _SOURCE_ROOT)))
+    if not (root / "cute_prism_coop_pc.cu").exists():
         raise RuntimeError(
             f"Cannot find cute_mma source tree at {root}. "
-            f"Set CUTE_OFT_SOURCE_DIR to the cute_mma root directory."
+            f"Set CUTE_PRISM_SOURCE_DIR to the cute_mma root directory."
         )
     return root
 
@@ -50,30 +53,30 @@ def _source_root() -> Path:
 def _source_files_for_kernel(src: Path, kernel_type: KernelType) -> list[Path]:
     """List source files for a specific kernel type."""
     common = [
-        src / "cute_oft_coop_pc.hpp",
-        src / "cute_oft_util.hpp",
+        src / "cute_prism_coop_pc.hpp",
+        src / "cute_prism_util.hpp",
         src / "z_curve.hpp",
         src / "common.hpp",
     ]
     if kernel_type == "fwd":
         return common + [
-            src / "cute_oft_coop_pc.cu",
-            src / "torch_ext" / "oft_fwd_torch.cu",
-            src / "torch_ext" / "oft_fwd_bind.cpp",
+            src / "cute_prism_coop_pc.cu",
+            src / "torch_ext" / "prism_fwd_torch.cu",
+            src / "torch_ext" / "prism_fwd_bind.cpp",
         ]
     elif kernel_type == "bwd_dadr":
         return common + [
-            src / "cute_oft_backward_dadr.cu",
-            src / "cute_oft_backward_dadr.hpp",
-            src / "torch_ext" / "oft_bwd_dadr_torch.cu",
-            src / "torch_ext" / "oft_bwd_dadr_bind.cpp",
+            src / "cute_prism_backward_dadr.cu",
+            src / "cute_prism_backward_dadr.hpp",
+            src / "torch_ext" / "prism_bwd_dadr_torch.cu",
+            src / "torch_ext" / "prism_bwd_dadr_bind.cpp",
         ]
     elif kernel_type == "bwd_db":
         return common + [
-            src / "cute_oft_backward_db.cu",
-            src / "cute_oft_backward_db.hpp",
-            src / "torch_ext" / "oft_bwd_db_torch.cu",
-            src / "torch_ext" / "oft_bwd_db_bind.cpp",
+            src / "cute_prism_backward_db.cu",
+            src / "cute_prism_backward_db.hpp",
+            src / "torch_ext" / "prism_bwd_db_torch.cu",
+            src / "torch_ext" / "prism_bwd_db_bind.cpp",
         ]
     else:
         raise ValueError(f"Unknown kernel_type: {kernel_type}")
@@ -83,8 +86,8 @@ def _source_files_cublas(src: Path) -> list[Path]:
     """List source files for the cuBLAS backend."""
     return [
         src / "common.hpp",
-        src / "torch_ext" / "cublas_oft_torch.cu",
-        src / "torch_ext" / "cublas_oft_torch_bind.cpp",
+        src / "torch_ext" / "cublas_prism_torch.cu",
+        src / "torch_ext" / "cublas_prism_torch_bind.cpp",
     ]
 
 
@@ -139,7 +142,7 @@ def _target_name(
     gated: bool = False,
 ) -> str:
     if backend == "cublas":
-        return "cublas_oft"
+        return "cublas_prism"
     gated_suffix = "_gated" if gated else ""
     return f"cute_{kernel_type}_g{group_size}_r{reconn_sz}{gated_suffix}"
 
@@ -182,23 +185,23 @@ def _generate_cmake_cute(
     if kernel_type == "fwd":
         sources = f"""\
 add_library({target} SHARED
-    {torch_ext / "oft_fwd_bind.cpp"}
-    {torch_ext / "oft_fwd_torch.cu"}
-    {src / "cute_oft_coop_pc.cu"}
+    {torch_ext / "prism_fwd_bind.cpp"}
+    {torch_ext / "prism_fwd_torch.cu"}
+    {src / "cute_prism_coop_pc.cu"}
 )"""
     elif kernel_type == "bwd_dadr":
         sources = f"""\
 add_library({target} SHARED
-    {torch_ext / "oft_bwd_dadr_bind.cpp"}
-    {torch_ext / "oft_bwd_dadr_torch.cu"}
-    {src / "cute_oft_backward_dadr.cu"}
+    {torch_ext / "prism_bwd_dadr_bind.cpp"}
+    {torch_ext / "prism_bwd_dadr_torch.cu"}
+    {src / "cute_prism_backward_dadr.cu"}
 )"""
     elif kernel_type == "bwd_db":
         sources = f"""\
 add_library({target} SHARED
-    {torch_ext / "oft_bwd_db_bind.cpp"}
-    {torch_ext / "oft_bwd_db_torch.cu"}
-    {src / "cute_oft_backward_db.cu"}
+    {torch_ext / "prism_bwd_db_bind.cpp"}
+    {torch_ext / "prism_bwd_db_torch.cu"}
+    {src / "cute_prism_backward_db.cu"}
 )"""
 
     content = f"""\
@@ -301,7 +304,7 @@ def _generate_cmake_cublas(
     cache_dir: Path,
     src: Path,
 ) -> None:
-    target = "cublas_oft"
+    target = "cublas_prism"
     torch_ext = src / "torch_ext"
 
     content = f"""\
@@ -356,8 +359,8 @@ execute_process(
 )
 
 add_library({target} SHARED
-    {torch_ext / "cublas_oft_torch_bind.cpp"}
-    {torch_ext / "cublas_oft_torch.cu"}
+    {torch_ext / "cublas_prism_torch_bind.cpp"}
+    {torch_ext / "cublas_prism_torch.cu"}
 )
 
 set_target_properties({target} PROPERTIES
@@ -482,12 +485,12 @@ def compile_kernel(
         # Configure
         # When running inside autotuning (parallel_build=True), use -j1 so each
         # worker spawns exactly one nvcc process — total concurrent nvcc processes
-        # equals CUTE_OFT_COMPILE_WORKERS.  For standalone compilation, use all
+        # equals CUTE_PRISM_COMPILE_WORKERS.  For standalone compilation, use all
         # available cores for maximum single-build speed.
         nproc = 1 if parallel_build else (os.cpu_count() or 4)
         python_exe = sys.executable
 
-        print(f"[cute_oft] Compiling {backend}/{kernel_type} kernel for group_size={group_size}, reconn_sz={reconn_sz}...")
+        print(f"[cute_prism] Compiling {backend}/{kernel_type} kernel for group_size={group_size}, reconn_sz={reconn_sz}...")
 
         configure_cmd = [
             "cmake",
@@ -542,7 +545,7 @@ def compile_kernel(
                 result.stdout + "\n" + result.stderr,
             )
 
-        print(f"[cute_oft] Compilation successful: {so_files[0].name}")
+        print(f"[cute_prism] Compilation successful: {so_files[0].name}")
         return so_files[0]
 
     finally:
@@ -580,4 +583,4 @@ def clear_cache() -> None:
     cache = _cache_root()
     if cache.exists():
         shutil.rmtree(cache)
-        print(f"[cute_oft] Cleared cache at {cache}")
+        print(f"[cute_prism] Cleared cache at {cache}")

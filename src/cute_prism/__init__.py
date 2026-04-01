@@ -1,25 +1,25 @@
-"""cute_oft — OFT (Orthogonal Fine-Tuning) CUDA kernels with multiple backends.
+"""cute_prism — OFT (Orthogonal Fine-Tuning) CUDA kernels with multiple backends.
 
 Usage::
 
-    import cute_oft
+    import cute_prism
 
     # Default backend is 'cute' (JIT-compiled CuTe kernel)
-    C = cute_oft.forward(A, B, R, group_size=256, reconn_sz=8)
+    C = cute_prism.forward(A, B, R, group_size=256, reconn_sz=8)
 
     # Use cuBLAS backend (supports AR and RW modes)
-    C = cute_oft.forward(A, B, R, group_size=256, reconn_sz=8, backend="cublas")
-    C = cute_oft.forward(A, B, R, group_size=256, reconn_sz=8, backend="cublas", mode="rw")
+    C = cute_prism.forward(A, B, R, group_size=256, reconn_sz=8, backend="cublas")
+    C = cute_prism.forward(A, B, R, group_size=256, reconn_sz=8, backend="cublas", mode="rw")
 
     # Use pure PyTorch backend (no compilation required)
-    C = cute_oft.forward(A, B, R, group_size=256, reconn_sz=8, backend="pytorch")
+    C = cute_prism.forward(A, B, R, group_size=256, reconn_sz=8, backend="pytorch")
 
     # Autotuning
-    C = cute_oft.forward(A, B, R, 256, 8, backend="cute", autotuning=True)
-    dA, dR, dB = cute_oft.backward(dC, A, B, R, 256, 8, backend="cute", autotuning=True)
+    C = cute_prism.forward(A, B, R, 256, 8, backend="cute", autotuning=True)
+    dA, dR, dB = cute_prism.backward(dC, A, B, R, 256, 8, backend="cute", autotuning=True)
 
     # Clear all cached compilations
-    cute_oft.clear_cache()
+    cute_prism.clear_cache()
 """
 
 from __future__ import annotations

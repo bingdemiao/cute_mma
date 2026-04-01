@@ -149,7 +149,7 @@ __global__ void silu_gate_backward_da_kernel(
 // ---------------------------------------------------------------------------
 
 template<typename scalar_t>
-static void cublas_oft_ar_impl(
+static void cublas_prism_ar_impl(
     const scalar_t* A_ptr, const scalar_t* B_ptr, const scalar_t* R_ptr, scalar_t* C_ptr,
     int64_t m, int64_t n, int64_t k,
     int64_t group_size, int64_t reconn_sz, int64_t n_groups,
@@ -240,7 +240,7 @@ static void cublas_oft_ar_impl(
 // ---------------------------------------------------------------------------
 
 template<typename scalar_t>
-static void cublas_oft_rw_impl(
+static void cublas_prism_rw_impl(
     const scalar_t* A_ptr, const scalar_t* B_ptr, const scalar_t* R_ptr, scalar_t* C_ptr,
     int64_t m, int64_t n, int64_t k,
     int64_t group_size, int64_t reconn_sz, int64_t n_groups,
@@ -584,7 +584,7 @@ static void validate_grad_dtype(c10::optional<at::ScalarType> grad_dtype, const 
 // Public entry points
 // ---------------------------------------------------------------------------
 
-torch::Tensor cublas_oft_forward(
+torch::Tensor cublas_prism_forward(
     torch::Tensor A,
     torch::Tensor B,
     torch::Tensor R,
@@ -617,18 +617,18 @@ torch::Tensor cublas_oft_forward(
         auto* R_p = static_cast<const half*>(R.data_ptr());
         auto* C_p = static_cast<half*>(C.data_ptr());
         if (rw_mode)
-            cublas_oft_rw_impl<half>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options());
+            cublas_prism_rw_impl<half>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options());
         else
-            cublas_oft_ar_impl<half>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options(), gated, stream);
+            cublas_prism_ar_impl<half>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options(), gated, stream);
     } else {
         auto* A_p = static_cast<const __nv_bfloat16*>(A.data_ptr());
         auto* B_p = static_cast<const __nv_bfloat16*>(B.data_ptr());
         auto* R_p = static_cast<const __nv_bfloat16*>(R.data_ptr());
         auto* C_p = static_cast<__nv_bfloat16*>(C.data_ptr());
         if (rw_mode)
-            cublas_oft_rw_impl<__nv_bfloat16>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options());
+            cublas_prism_rw_impl<__nv_bfloat16>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options());
         else
-            cublas_oft_ar_impl<__nv_bfloat16>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options(), gated, stream);
+            cublas_prism_ar_impl<__nv_bfloat16>(A_p, B_p, R_p, C_p, m, n, k, group_size, reconn_sz, n_groups, handle, cuda_dt, A.options(), gated, stream);
     }
 
     GEMM_CHECK_CUBLAS(cublasDestroy(handle));

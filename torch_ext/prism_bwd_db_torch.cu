@@ -2,8 +2,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
 
-#include "cute_oft_coop_pc.hpp"
-#include "cute_oft_backward_db.hpp"
+#include "cute_prism_coop_pc.hpp"
+#include "cute_prism_backward_db.hpp"
 
 static void validate_backward_inputs(
     torch::Tensor dC, torch::Tensor A, torch::Tensor R,
@@ -24,7 +24,7 @@ static void validate_backward_inputs(
                 "reconn_sz mismatch with compiled kernel");
 }
 
-torch::Tensor oft_backward_dB(
+torch::Tensor prism_backward_dB(
     torch::Tensor dC,
     torch::Tensor A,
     torch::Tensor R,
@@ -42,7 +42,7 @@ torch::Tensor oft_backward_dB(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
-    oft_backward_dB_launch(
+    prism_backward_dB_launch(
         static_cast<int>(m),
         static_cast<int>(n),
         static_cast<int>(k),

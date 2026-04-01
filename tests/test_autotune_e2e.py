@@ -4,7 +4,7 @@ Tests that autotuned kernels produce correct results, that backward autotuning
 works independently for dAdR and dB kernels, and that cache skip behavior works.
 
 Usage:
-    CUTE_OFT_COMPILE_WORKERS=2 uv run pytest tests/test_autotune_e2e.py -v
+    CUTE_PRISM_COMPILE_WORKERS=2 uv run pytest tests/test_autotune_e2e.py -v
 """
 
 import sys
@@ -15,8 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import torch
 import torch.nn.functional as F
 import pytest
-import cute_oft
-from cute_oft._autotune import (
+import cute_prism
+from cute_prism._autotune import (
     autotune,
     autotune_bwd_dadr,
     autotune_bwd_db,
@@ -34,7 +34,7 @@ from cute_oft._autotune import (
     _cache_path,
     _load_cache,
 )
-from cute_oft._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
+from cute_prism._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 
 
 def autograd_reference(A, B, R, group_size, reconn_sz, activation=None):
@@ -124,7 +124,7 @@ def test_autotune_forward_backward(m, n, k, group_size, reconn_sz, activation):
 
     A, B, R = make_test_tensors(m, n, k, group_size, reconn_sz)
 
-    C_tuned = cute_oft.forward(
+    C_tuned = cute_prism.forward(
         A, B, R, group_size, reconn_sz,
         backend="cute", comp_params=best, activation=activation,
     )
@@ -145,7 +145,7 @@ def test_autotune_forward_backward(m, n, k, group_size, reconn_sz, activation):
 
     # Check backward
     dC_h = dC.half()
-    dA, dR, dB = cute_oft.backward(
+    dA, dR, dB = cute_prism.backward(
         dC_h, A, B, R, group_size, reconn_sz,
         backend="cute", activation=activation, comp_params=best,
     )
@@ -183,13 +183,13 @@ def test_autotune_bwd_dadr():
     dC = torch.randn(m, n, dtype=torch.float16, device="cuda") * 0.1
 
     # Use autotuned params
-    dA, dR, _ = cute_oft.backward(
+    dA, dR, _ = cute_prism.backward(
         dC, A, B, R, group_size, reconn_sz,
         backend="cute", bwd_dadr_params=best,
     )
 
     # Reference
-    dA_ref, dR_ref, _ = cute_oft.backward(
+    dA_ref, dR_ref, _ = cute_prism.backward(
         dC, A, B, R, group_size, reconn_sz, backend="pytorch",
     )
 
@@ -220,14 +220,14 @@ def test_autotune_bwd_db():
     dC = torch.randn(m, n, dtype=torch.float16, device="cuda") * 0.1
 
     # Use autotuned params
-    dA, dR, dB = cute_oft.backward(
+    dA, dR, dB = cute_prism.backward(
         dC, A, B, R, group_size, reconn_sz,
         backend="cute", activation="silu_gate",
         bwd_db_params=best,
     )
 
     # Reference
-    dA_ref, dR_ref, dB_ref = cute_oft.backward(
+    dA_ref, dR_ref, dB_ref = cute_prism.backward(
         dC, A, B, R, group_size, reconn_sz,
         backend="pytorch", activation="silu_gate",
     )
@@ -382,13 +382,13 @@ def test_auto_mode_forward_backward():
 
     A, B, R = make_test_tensors(m, n, k, group_size, reconn_sz)
 
-    C = cute_oft.forward(
+    C = cute_prism.forward(
         A, B, R, group_size, reconn_sz,
         backend="cute", autotuning=True,
     )
 
     dC = torch.randn(m, n, dtype=torch.float16, device="cuda") * 0.1
-    dA, dR, dB = cute_oft.backward(
+    dA, dR, dB = cute_prism.backward(
         dC, A, B, R, group_size, reconn_sz,
         backend="cute", autotuning=True,
     )
@@ -399,8 +399,8 @@ def test_auto_mode_forward_backward():
     assert dB is None  # non-gated
 
     # Check against pytorch reference
-    C_ref = cute_oft.forward(A, B, R, group_size, reconn_sz, backend="pytorch")
-    dA_ref, dR_ref, _ = cute_oft.backward(
+    C_ref = cute_prism.forward(A, B, R, group_size, reconn_sz, backend="pytorch")
+    dA_ref, dR_ref, _ = cute_prism.backward(
         dC, A, B, R, group_size, reconn_sz, backend="pytorch",
     )
 
@@ -416,13 +416,13 @@ def test_auto_mode_gated():
 
     A, B, R = make_test_tensors(m, n, k, group_size, reconn_sz)
 
-    C = cute_oft.forward(
+    C = cute_prism.forward(
         A, B, R, group_size, reconn_sz,
         backend="cute", autotuning=True, activation="silu_gate",
     )
 
     dC = torch.randn(m, n, dtype=torch.float16, device="cuda") * 0.1
-    dA, dR, dB = cute_oft.backward(
+    dA, dR, dB = cute_prism.backward(
         dC, A, B, R, group_size, reconn_sz,
         backend="cute", autotuning=True, activation="silu_gate",
     )
@@ -433,11 +433,11 @@ def test_auto_mode_gated():
     assert dB is not None
     assert dB.shape == B.shape
 
-    C_ref = cute_oft.forward(
+    C_ref = cute_prism.forward(
         A, B, R, group_size, reconn_sz,
         backend="pytorch", activation="silu_gate",
     )
-    dA_ref, dR_ref, dB_ref = cute_oft.backward(
+    dA_ref, dR_ref, dB_ref = cute_prism.backward(
         dC, A, B, R, group_size, reconn_sz,
         backend="pytorch", activation="silu_gate",
     )

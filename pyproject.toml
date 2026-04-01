@@ -3,9 +3,9 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cute-oft"
+name = "cute-prism"
 version = "0.1.0"
-description = "JIT-compiled OFT (Orthogonal Fine-Tuning) CUDA kernels for PyTorch"
+description = "JIT-compiled PRISM (Orthogonal Fine-Tuning) CUDA kernels for PyTorch"
 requires-python = ">=3.10"
 dependencies = [
     "torch",

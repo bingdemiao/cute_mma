@@ -1,6 +1,6 @@
-#include "cute_oft_coop_pc.hpp"
+#include "cute_prism_coop_pc.hpp"
 #include <oft_config.hpp>
-#include "cute_oft_util.hpp"
+#include "cute_prism_util.hpp"
 #include "z_curve.hpp"
 
 template<class CTATiler, class GroupSize, class ReconnectSize, class ConsumptionWidth, class PipelineA_R, class PipelineAR, class PipelineB>
@@ -525,7 +525,7 @@ void oft_device(GridShape grid_shape, CtaTiler cta_tiler,
 
 // // Setup params for a TN GEMM, K-Major inputs
 template <class KernelParams>
-void oft_tn(int m, int n, int k,
+void prism_tn(int m, int n, int k,
         half const* A, int ldA,
         half const* B, int ldB,
         half const* R, int ldR,
@@ -602,7 +602,7 @@ void oft_tn(int m, int n, int k,
     );
 }
 
-template void oft_tn<CurrKernelParams>(int m, int n, int k,
+template void prism_tn<CurrKernelParams>(int m, int n, int k,
         half const* A, int ldA,
         half const* B, int ldB,
         half const* R, int ldR,

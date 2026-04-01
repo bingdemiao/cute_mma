@@ -223,7 +223,9 @@ def _problem_key(
 
 def _cache_path() -> Path:
     import os
-    root = Path(os.environ.get("CUTE_OFT_CACHE_DIR", Path.home() / ".cache" / "cute_oft"))
+    root = Path(os.environ.get("CUTE_PRISM_CACHE_DIR",
+                    os.environ.get("CUTE_OFT_CACHE_DIR",
+                                   Path.home() / ".cache" / "cute_prism")))
     return root / "autotune_results.json"
 
 
@@ -245,7 +247,9 @@ def _save_cache(cache: dict) -> None:
 
 def _compile_failed_path() -> Path:
     import os
-    root = Path(os.environ.get("CUTE_OFT_CACHE_DIR", Path.home() / ".cache" / "cute_oft"))
+    root = Path(os.environ.get("CUTE_PRISM_CACHE_DIR",
+                    os.environ.get("CUTE_OFT_CACHE_DIR",
+                                   Path.home() / ".cache" / "cute_prism")))
     return root / "compile_failed.json"
 
 
@@ -643,7 +647,7 @@ def _autotune_generic(
         params = params_cls.from_dict(cached_best["params"])
         if verbose:
             time_str = f"{cached_best['time_ms']:.3f} ms" if cached_best["time_ms"] is not None else "FAILED"
-            print(f"[cute_oft] Using cached autotune result for {kernel_type} "
+            print(f"[cute_prism] Using cached autotune result for {kernel_type} "
                   f"M={M}, N={N}, K={K}: {time_str}")
         return params
 
@@ -686,7 +690,7 @@ def _autotune_generic(
 
     if not configs_to_test and entry.get("best") is not None:
         if verbose:
-            print(f"[cute_oft] All {skipped_count} configs already tested for {kernel_type}, "
+            print(f"[cute_prism] All {skipped_count} configs already tested for {kernel_type}, "
                   f"using cached best.")
         return params_cls.from_dict(entry["best"]["params"])
 
@@ -697,16 +701,17 @@ def _autotune_generic(
 
     if verbose:
         total = len(configs_to_test) + skipped_count
-        print(f"[cute_oft] Autotuning {len(configs_to_test)} {kernel_type} configurations "
+        print(f"[cute_prism] Autotuning {len(configs_to_test)} {kernel_type} configurations "
               f"for M={M}, N={N}, K={K} ({skipped_count} cached, skipped)...")
         if len(devices) > 1:
-            print(f"[cute_oft]   Benchmarking on {len(devices)} GPUs: {devices}")
+            print(f"[cute_prism]   Benchmarking on {len(devices)} GPUs: {devices}")
 
     # -------------------------------------------------------------------
     # Producer-consumer pipeline
     # -------------------------------------------------------------------
     import os
-    max_compile_workers = int(os.environ.get("CUTE_OFT_COMPILE_WORKERS", 4))
+    max_compile_workers = int(os.environ.get("CUTE_PRISM_COMPILE_WORKERS",
+                                 os.environ.get("CUTE_OFT_COMPILE_WORKERS", 4)))
     n_compile_workers = min(len(configs_to_test), max_compile_workers)
     n_bench_workers = len(devices)
 
@@ -750,13 +755,13 @@ def _autotune_generic(
                     else:
                         total_compiled_ok += 1
                     if verbose and compile_done % max(1, total_compilable // 5) == 0:
-                        print(f"[cute_oft]   Compiled {compile_done}/{total_compilable} "
+                        print(f"[cute_prism]   Compiled {compile_done}/{total_compilable} "
                               f"({compile_fail} failed)")
 
         if verbose:
             with counter_lock:
                 ok = total_compiled_ok
-            print(f"[cute_oft] Compilation done: {ok} succeeded, "
+            print(f"[cute_prism] Compilation done: {ok} succeeded, "
                   f"{total_compilable - ok} failed")
 
         # Push one sentinel per benchmark worker
@@ -876,7 +881,7 @@ def _autotune_generic(
 
     if verbose:
         time_str = f"{best_entry['time_ms']:.3f} ms" if best_entry["time_ms"] is not None else "N/A"
-        print(f"[cute_oft] Best {kernel_type} config: {_config_summary(best_config)} — {time_str}")
+        print(f"[cute_prism] Best {kernel_type} config: {_config_summary(best_config)} — {time_str}")
 
     # Clean up tensors
     torch.cuda.empty_cache()

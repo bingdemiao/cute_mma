@@ -10,9 +10,9 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import torch
-import cute_oft
-from cute_oft._config import CompParams
-from cute_oft._autotune import default_search_space, autotune, _compile_one
+import cute_prism
+from cute_prism._config import CompParams
+from cute_prism._autotune import default_search_space, autotune, _compile_one
 
 
 def oft_reference(A, B, R, group_size, reconn_sz):
@@ -112,7 +112,7 @@ def test_autotune_returns_valid_config():
     B = torch.randn(N, K, dtype=torch.float16, device="cuda") / (K ** 0.5)
     R = torch.randn(n_groups * reconn_sz, K, dtype=torch.float16, device="cuda")
 
-    C_tuned = cute_oft.forward(A, B, R, group_size, reconn_sz, comp_params=best)
+    C_tuned = cute_prism.forward(A, B, R, group_size, reconn_sz, comp_params=best)
     C_ref = oft_reference(A, B, R, group_size, reconn_sz)
 
     rel_err = (C_tuned.float() - C_ref.float()).abs()
@@ -140,7 +140,7 @@ def test_forward_auto_mode():
     B = torch.randn(N, K, dtype=torch.float16, device="cuda")
     R = torch.randn(n_groups * reconn_sz, K, dtype=torch.float16, device="cuda")
 
-    C = cute_oft.forward(A, B, R, group_size, reconn_sz, comp_params="auto")
+    C = cute_prism.forward(A, B, R, group_size, reconn_sz, comp_params="auto")
     C_ref = oft_reference(A, B, R, group_size, reconn_sz)
 
     rel_err = (C.float() - C_ref.float()).abs()

@@ -42,7 +42,7 @@ void transform_weight(
   }
 }
 
-void cublas_oft(
+void cublas_prism(
   const thrust::device_vector<half> &d_A,
   const thrust::device_vector<half> &d_R,
   const thrust::device_vector<half> &d_B,

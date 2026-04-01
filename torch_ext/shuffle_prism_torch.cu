@@ -7,7 +7,7 @@
 #include <string>
 
 // ===========================================================================
-// Shuffle OFT forward kernel.
+// Shuffle PRISM forward kernel.
 //
 // Per group g:
 //   1. Gather: A_perm = gather_segments(A, seg_pairs[g])
@@ -108,7 +108,7 @@ __global__ void silu_gate_kernel(const T* A_perm, T* AR_perm, int64_t numel) {
 // ---------------------------------------------------------------------------
 
 template<typename scalar_t>
-static void shuffle_oft_forward_impl(
+static void shuffle_prism_forward_impl(
     const scalar_t* A_ptr,
     const scalar_t* B_ptr,
     const scalar_t* R_ptr,
@@ -712,7 +712,7 @@ static torch::Tensor shuffle_backward_dB_impl(
 // Python entry points
 // ---------------------------------------------------------------------------
 
-torch::Tensor shuffle_oft_forward(
+torch::Tensor shuffle_prism_forward(
     torch::Tensor A,
     torch::Tensor B,
     torch::Tensor R,
@@ -743,9 +743,9 @@ torch::Tensor shuffle_oft_forward(
     CHECK_CUBLAS(cublasSetStream(handle, stream));
     CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
 
-    AT_DISPATCH_SWITCH(A.scalar_type(), "shuffle_oft_forward",
+    AT_DISPATCH_SWITCH(A.scalar_type(), "shuffle_prism_forward",
         AT_DISPATCH_CASE(at::kHalf,
-            [&] { shuffle_oft_forward_impl<scalar_t>(
+            [&] { shuffle_prism_forward_impl<scalar_t>(
                 A.data_ptr<scalar_t>(), B.data_ptr<scalar_t>(),
                 R.data_ptr<scalar_t>(), C.data_ptr<scalar_t>(),
                 seg_pairs.data_ptr<int64_t>(),
@@ -753,7 +753,7 @@ torch::Tensor shuffle_oft_forward(
                 handle, dt, opts, gated, stream);
             })
         AT_DISPATCH_CASE(at::kBFloat16,
-            [&] { shuffle_oft_forward_impl<scalar_t>(
+            [&] { shuffle_prism_forward_impl<scalar_t>(
                 A.data_ptr<scalar_t>(), B.data_ptr<scalar_t>(),
                 R.data_ptr<scalar_t>(), C.data_ptr<scalar_t>(),
                 seg_pairs.data_ptr<int64_t>(),
@@ -766,7 +766,7 @@ torch::Tensor shuffle_oft_forward(
     return C;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> shuffle_oft_backward_dA_dR(
+std::tuple<torch::Tensor, torch::Tensor> shuffle_prism_backward_dA_dR(
     torch::Tensor dC, torch::Tensor A, torch::Tensor B, torch::Tensor R,
     torch::Tensor seg_pairs,
     int64_t group_size, int64_t reconn_sz, bool gated)
@@ -811,7 +811,7 @@ std::tuple<torch::Tensor, torch::Tensor> shuffle_oft_backward_dA_dR(
     return result;
 }
 
-torch::Tensor shuffle_oft_backward_dB(
+torch::Tensor shuffle_prism_backward_dB(
     torch::Tensor dC, torch::Tensor A, torch::Tensor R,
     torch::Tensor seg_pairs,
     int64_t group_size, int64_t reconn_sz, bool gated)

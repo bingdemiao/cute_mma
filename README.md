@@ -1,4 +1,4 @@
-# cute-oft
+# cute-prism
 
 High-performance Python library for **OFT (Orthogonal Fine-Tuning)** — a parameter-efficient fine-tuning technique for large language models. Provides JIT-compiled CUDA kernels that compute the OFT linear layer via a PyTorch interface, with automatic kernel autotuning and caching.
 
@@ -46,7 +46,7 @@ pip install -e .
 
 ```python
 import torch
-import cute_oft
+import cute_prism
 
 # Create test tensors (float16, CUDA)
 M, N, K = 1024, 1024, 256
@@ -58,11 +58,11 @@ B = torch.randn(N, K, dtype=torch.float16, device="cuda")
 R = torch.randn(n_groups * reconn_sz, K, dtype=torch.float16, device="cuda")
 
 # Forward pass — JIT-compiles the kernel on first call
-C = cute_oft.forward(A, B, R, group_size, reconn_sz)
+C = cute_prism.forward(A, B, R, group_size, reconn_sz)
 
 # Backward pass
 dC = torch.randn_like(C)
-dA, dR, dB = cute_oft.backward(dC, A, B, R, group_size, reconn_sz, backend="cute")
+dA, dR, dB = cute_prism.backward(dC, A, B, R, group_size, reconn_sz, backend="cute")
 ```
 
 ## `PrismLinear` module
@@ -74,11 +74,11 @@ dA, dR, dB = cute_oft.backward(dC, A, B, R, group_size, reconn_sz, backend="cute
 Replace existing linear layers with OFT layers, loading the pretrained weights. R is initialized as identity so the layer starts with the same behavior as the original, then only R is trained:
 
 ```python
-import cute_oft
+import cute_prism
 
 # Convert an existing nn.Linear layer
 pretrained_linear = model.some_layer  # nn.Linear(256, 1024)
-model.some_layer = cute_oft.PrismLinear.from_linear(
+model.some_layer = cute_prism.PrismLinear.from_linear(
     pretrained_linear,
     group_size=256, reconn_sz=8,
     autotuning=True,
@@ -97,7 +97,7 @@ for name, p in model.some_layer.named_parameters():
 Use `activation="silu_gate"` to enable gated OFT, which acts as a width expansion. Both R and B become trainable:
 
 ```python
-layer = cute_oft.PrismLinear(
+layer = cute_prism.PrismLinear(
     in_features=256, out_features=1024,
     group_size=256, reconn_sz=8,
     activation="silu_gate",
@@ -121,7 +121,7 @@ output.sum().backward()  # gradients flow to weight, reconn, and bias
 `PrismLinear` handles any number of leading batch dimensions, just like `nn.Linear`:
 
 ```python
-layer = cute_oft.PrismLinear(256, 1024, group_size=256, reconn_sz=8).cuda().half()
+layer = cute_prism.PrismLinear(256, 1024, group_size=256, reconn_sz=8).cuda().half()
 x = torch.randn(2, 4, 8, 256, dtype=torch.float16, device="cuda")
 output = layer(x)  # (2, 4, 8, 1024)
 ```
@@ -136,9 +136,9 @@ output = layer(x)  # (2, 4, 8, 1024)
 
 ```python
 # Switch backends
-C = cute_oft.forward(A, B, R, group_size, reconn_sz, backend="cublas")
-C = cute_oft.forward(A, B, R, group_size, reconn_sz, backend="cublas", mode="rw")
-C = cute_oft.forward(A, B, R, group_size, reconn_sz, backend="pytorch")
+C = cute_prism.forward(A, B, R, group_size, reconn_sz, backend="cublas")
+C = cute_prism.forward(A, B, R, group_size, reconn_sz, backend="cublas", mode="rw")
+C = cute_prism.forward(A, B, R, group_size, reconn_sz, backend="pytorch")
 ```
 
 ## Gated activation
@@ -147,10 +147,10 @@ The `silu_gate` activation replaces the linear reconnection with a gated non-lin
 
 ```python
 # Forward with gated activation
-C = cute_oft.forward(A, B, R, group_size, reconn_sz, activation="silu_gate")
+C = cute_prism.forward(A, B, R, group_size, reconn_sz, activation="silu_gate")
 
 # Backward — returns (dA, dR, dB) where dB is not None
-dA, dR, dB = cute_oft.backward(
+dA, dR, dB = cute_prism.backward(
     dC, A, B, R, group_size, reconn_sz,
     backend="cute", activation="silu_gate",
 )
@@ -166,19 +166,19 @@ Results are cached to disk, so subsequent calls with the same shape return insta
 
 ```python
 # Easiest: enable autotuning directly in forward/backward
-C = cute_oft.forward(A, B, R, group_size, reconn_sz, autotuning=True)
-dA, dR, dB = cute_oft.backward(
+C = cute_prism.forward(A, B, R, group_size, reconn_sz, autotuning=True)
+dA, dR, dB = cute_prism.backward(
     dC, A, B, R, group_size, reconn_sz,
     backend="cute", autotuning=True,
 )
 
 # Or autotune explicitly and reuse the result
-best_params = cute_oft.autotune(M, N, K, group_size, reconn_sz)
-C = cute_oft.forward(A, B, R, group_size, reconn_sz, comp_params=best_params)
+best_params = cute_prism.autotune(M, N, K, group_size, reconn_sz)
+C = cute_prism.forward(A, B, R, group_size, reconn_sz, comp_params=best_params)
 
 # Autotune backward kernels independently
-best_dadr = cute_oft.autotune_bwd_dadr(M, N, K, group_size, reconn_sz)
-best_db = cute_oft.autotune_bwd_db(M, N, K, group_size, reconn_sz, gated=True)
+best_dadr = cute_prism.autotune_bwd_dadr(M, N, K, group_size, reconn_sz)
+best_db = cute_prism.autotune_bwd_db(M, N, K, group_size, reconn_sz, gated=True)
 ```
 
 ### Multi-GPU benchmarking
@@ -186,7 +186,7 @@ best_db = cute_oft.autotune_bwd_db(M, N, K, group_size, reconn_sz, gated=True)
 Distribute benchmark work across multiple GPUs for faster autotuning:
 
 ```python
-best = cute_oft.autotune(M, N, K, group_size, reconn_sz, device=[0, 1, 2, 3])
+best = cute_prism.autotune(M, N, K, group_size, reconn_sz, device=[0, 1, 2, 3])
 ```
 
 ### Force re-benchmarking
@@ -194,10 +194,10 @@ best = cute_oft.autotune(M, N, K, group_size, reconn_sz, device=[0, 1, 2, 3])
 If you suspect previous timings are unreliable (e.g., due to thermal throttling or background load), force a re-benchmark:
 
 ```python
-best = cute_oft.autotune(M, N, K, group_size, reconn_sz, force_rebenchmark=True)
+best = cute_prism.autotune(M, N, K, group_size, reconn_sz, force_rebenchmark=True)
 
 # Also available through forward/backward
-C = cute_oft.forward(A, B, R, group_size, reconn_sz, autotuning=True, force_rebenchmark=True)
+C = cute_prism.forward(A, B, R, group_size, reconn_sz, autotuning=True, force_rebenchmark=True)
 ```
 
 ### Custom search spaces
@@ -205,7 +205,7 @@ C = cute_oft.forward(A, B, R, group_size, reconn_sz, autotuning=True, force_rebe
 Provide your own configurations with optional callbacks for adaptive strategies:
 
 ```python
-from cute_oft import CompParams
+from cute_prism import CompParams
 
 my_configs = [
     CompParams(bM=128, bN=128, bK=16),
@@ -218,37 +218,37 @@ def on_result(config, time_ms):
         print(f"{config.cache_key()}: {time_ms:.3f} ms")
 
 search_space = [(c, on_result) for c in my_configs]
-best = cute_oft.autotune(M, N, K, group_size, reconn_sz, search_space=search_space)
+best = cute_prism.autotune(M, N, K, group_size, reconn_sz, search_space=search_space)
 
 # Generators work too (for adaptive/early-stopping strategies)
 def adaptive_search():
     for c in my_configs:
         yield (c, on_result)
 
-best = cute_oft.autotune(M, N, K, group_size, reconn_sz, search_space=adaptive_search())
+best = cute_prism.autotune(M, N, K, group_size, reconn_sz, search_space=adaptive_search())
 ```
 
 ### Cache management
 
 ```python
 # Inspect cached autotune results
-cache = cute_oft.get_autotune_cache()
+cache = cute_prism.get_autotune_cache()
 # Returns: {(M, N, K, group_size, reconn_sz): {(kernel_type, gated): {cache_key: time_ms}}}
 
 # Clear a specific entry
-cute_oft.clear_autotune_cache(
+cute_prism.clear_autotune_cache(
     M=1024, N=1024, K=256, group_size=256, reconn_sz=8,
     device=0, kernel_type="fwd", gated=False,
 )
 
 # Full wipe (keeps compiled .so files referenced as "best")
-cute_oft.clear_autotune_cache()
+cute_prism.clear_autotune_cache()
 
 # Full wipe including all compiled kernels
-cute_oft.clear_autotune_cache(keep_best_kernels=False)
+cute_prism.clear_autotune_cache(keep_best_kernels=False)
 
 # Clear only compiled kernel builds (not autotune results)
-cute_oft.clear_cache()
+cute_prism.clear_cache()
 ```
 
 ## Input shuffle
@@ -256,7 +256,7 @@ cute_oft.clear_cache()
 When using multiple groups, each group's R blocks operate on the same partition of input features by default. **Input shuffle** assigns each group a different pairing of 8-element segments into R blocks, so different groups mix different feature pairs — increasing view diversity across groups.
 
 ```python
-layer = cute_oft.PrismLinear(
+layer = cute_prism.PrismLinear(
     768, 768,
     group_size=64, reconn_sz=16,
     activation="silu_gate",
@@ -290,7 +290,7 @@ In non-gated (finetuning) mode, B is frozen and expects natural column order. Wh
 
 ```python
 # Convert pretrained layer with shuffle for finetuning
-oft = cute_oft.PrismLinear.from_linear(
+oft = cute_prism.PrismLinear.from_linear(
     pretrained_linear,
     group_size=64, reconn_sz=16,
     input_shuffle=True,
@@ -312,14 +312,14 @@ Producer for group `g+1` overlaps with consumer for group `g`. The same pipelini
 For finetuning, R is parameterized via the Cayley transform to guarantee orthogonality:
 
 ```python
-layer = cute_oft.PrismLinear(
+layer = cute_prism.PrismLinear(
     768, 768,
     group_size=64, reconn_sz=16,
     cayley_order=float("inf"),  # exact Cayley: R = (I+S)(I-S)^{-1}
 )
 
 # Or use k-th order approximation for speed:
-layer = cute_oft.PrismLinear(
+layer = cute_prism.PrismLinear(
     768, 768,
     group_size=64, reconn_sz=16,
     cayley_order=2,  # R = I + 2S + 2S²  (linear cost in order)
@@ -363,7 +363,7 @@ PrismLinear is designed to be fully compatible with the [muP](https://github.com
 
 ```python
 from mup import MuAdamW, set_base_shapes
-from cute_oft._module import mup_fix_oft_shapes
+from cute_prism._module import mup_fix_oft_shapes
 
 model = make_model(hidden_dim=1024)
 base = make_model(hidden_dim=64)
@@ -414,9 +414,9 @@ All three classes provide:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CUTE_OFT_CACHE_DIR` | `~/.cache/cute_oft` | Directory for compiled kernels and autotune results |
-| `CUTE_OFT_SOURCE_DIR` | auto-detected | Kernel source root directory |
-| `CUTE_OFT_COMPILE_WORKERS` | `4` | Maximum parallel compilation workers |
+| `CUTE_PRISM_CACHE_DIR` | `~/.cache/cute_prism` | Directory for compiled kernels and autotune results |
+| `CUTE_PRISM_SOURCE_DIR` | auto-detected | Kernel source root directory |
+| `CUTE_PRISM_COMPILE_WORKERS` | `4` | Maximum parallel compilation workers |
 
 ## Testing
 
@@ -425,13 +425,13 @@ All three classes provide:
 uv run pytest tests/ -v
 
 # Run autotuning tests (set workers to avoid OOM)
-CUTE_OFT_COMPILE_WORKERS=2 uv run pytest tests/test_autotune_e2e.py -v
+CUTE_PRISM_COMPILE_WORKERS=2 uv run pytest tests/test_autotune_e2e.py -v
 ```
 
 ## Project structure
 
 ```
-src/cute_oft/           Python package
+src/cute_prism/           Python package
   __init__.py             Public API (forward, backward, autotune, ...)
   _autotune.py            Autotuning engine with producer-consumer pipeline
   _compiler.py            JIT compilation and caching
@@ -440,11 +440,11 @@ src/cute_oft/           Python package
   _validate.py            Tensor and shared memory validation
   _pytorch_backend.py     Pure PyTorch reference implementation
 torch_ext/              C++/CUDA PyTorch extensions
-  oft_fwd_torch.cu        Forward kernel torch binding
-  oft_bwd_dadr_torch.cu   Backward dA+dR kernel torch binding
-  oft_bwd_db_torch.cu     Backward dB kernel torch binding
-  cublas_oft_torch.cu     cuBLAS backend (pipelined two-stream)
-  shuffle_oft_torch.cu    Shuffle backend (gather + cuBLAS + scatter-add)
+  prism_fwd_torch.cu        Forward kernel torch binding
+  prism_bwd_dadr_torch.cu   Backward dA+dR kernel torch binding
+  prism_bwd_db_torch.cu     Backward dB kernel torch binding
+  cublas_prism_torch.cu     cuBLAS backend (pipelined two-stream)
+  shuffle_prism_torch.cu    Shuffle backend (gather + cuBLAS + scatter-add)
 *.cu, *.hpp             CUDA kernel source (CuTe cooperative kernels, utilities)
 cmake/                  CMake modules (CUTLASS detection)
 tests/                  pytest test suite

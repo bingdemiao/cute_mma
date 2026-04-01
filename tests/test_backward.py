@@ -14,7 +14,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import torch
 import torch.nn.functional as F
-import cute_oft
+import cute_prism
 
 
 def autograd_reference(A, B, R, group_size, reconn_sz, activation=None):
@@ -76,7 +76,7 @@ def test_backward(m, n, k, group_size=256, reconn_sz=8, backend="pytorch",
 
     # Our backward (float16 inputs)
     dC_h = dC.half()
-    dA, dR, dB = cute_oft.backward(
+    dA, dR, dB = cute_prism.backward(
         dC_h, A, B, R, group_size, reconn_sz,
         backend=backend, activation=activation,
     )

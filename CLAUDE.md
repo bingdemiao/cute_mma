@@ -1,4 +1,4 @@
-# cute-oft
+# cute-prism
 
 High-performance Python library for OFT (Orthogonal Fine-Tuning) — a parameter-efficient fine-tuning technique. Provides JIT-compiled CUDA kernels that compute `C = A @ diag(R) @ B^T` via a PyTorch interface.
 
@@ -15,7 +15,7 @@ High-performance Python library for OFT (Orthogonal Fine-Tuning) — a parameter
 
 ## Project structure
 
-- `src/cute_oft/` — Python package (public API in `__init__.py`)
+- `src/cute_prism/` — Python package (public API in `__init__.py`)
 - `torch_ext/` — C++/CUDA PyTorch extensions (CuTe and cuBLAS backends)
 - `*.cu`, `*.hpp` — CUDA kernel source files (CuTe cooperative kernel, utilities)
 - `tests/` — pytest test suite
@@ -36,40 +36,40 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
 
 ## Environment variables
 
-- `CUTE_OFT_CACHE_DIR` — override build/autotune cache location (default: `~/.cache/cute_oft`)
-- `CUTE_OFT_SOURCE_DIR` — override kernel source root (auto-detected)
-- `CUTE_OFT_COMPILE_WORKERS` — cap parallel compilation workers (default: 4)
+- `CUTE_PRISM_CACHE_DIR` — override build/autotune cache location (default: `~/.cache/cute_prism`)
+- `CUTE_PRISM_SOURCE_DIR` — override kernel source root (auto-detected)
+- `CUTE_PRISM_COMPILE_WORKERS` — cap parallel compilation workers (default: 4)
 
 ## Public API
 
-- `cute_oft.forward(A, B, R, group_size, reconn_sz, backend, mode, comp_params, activation, autotuning, autotuning_search_space, force_rebenchmark)` — main entry point
+- `cute_prism.forward(A, B, R, group_size, reconn_sz, backend, mode, comp_params, activation, autotuning, autotuning_search_space, force_rebenchmark)` — main entry point
   - `activation=None`: standard OFT `C = (A @ R^T) @ B^T`
   - `activation="silu_gate"`: gated OFT `C = (A * SiLU(A @ R^T)) @ B^T` (AR mode only)
   - `autotuning=True`: check cache first, autotune if miss, use best config
   - `autotuning_search_space`: custom `Iterable[CompParams | (CompParams, callback)]`
-- `cute_oft.backward(dC, A, B, R, group_size, reconn_sz, backend, activation, autotuning, ...)` — backward pass
+- `cute_prism.backward(dC, A, B, R, group_size, reconn_sz, backend, activation, autotuning, ...)` — backward pass
   - Returns `(dA, dR, dB)` gradients, all K-major matching input shapes
   - Recomputes AR (or gated intermediate) from inputs instead of storing
   - `autotuning=True`: autotunes dAdR and dB kernels independently
   - `bwd_dadr_params` / `bwd_db_params`: explicit per-kernel params override
   - `autotuning_search_space_dadr` / `autotuning_search_space_db`: custom search spaces
   - Supported backends: `pytorch`, `cublas`, `cute`
-- `cute_oft.autotune(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal forward CompParams
+- `cute_prism.autotune(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal forward CompParams
   - `device=0` (single GPU) or `device=[0,1,2,3]` (multi-GPU benchmarking)
   - Compilation and benchmarking are pipelined: benchmarking starts as soon as the first config compiles
   - `force_rebenchmark=True`: re-benchmark all configs even if cached results exist (replaces old timings)
-- `cute_oft.autotune_bwd_dadr(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal BwdDAdRCompParams
-- `cute_oft.autotune_bwd_db(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal BwdDBCompParams
-- `cute_oft.clear_autotune_cache(M, N, K, group_size, reconn_sz, device, kernel_type, gated, keep_best_kernels)` — selectively clear autotune results
+- `cute_prism.autotune_bwd_dadr(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal BwdDAdRCompParams
+- `cute_prism.autotune_bwd_db(M, N, K, group_size, reconn_sz, device=0, ..., force_rebenchmark=False)` — find optimal BwdDBCompParams
+- `cute_prism.clear_autotune_cache(M, N, K, group_size, reconn_sz, device, kernel_type, gated, keep_best_kernels)` — selectively clear autotune results
   - All params provided: remove that specific entry from autotune_results.json (keeps compiled kernels)
   - No params: full wipe. `keep_best_kernels=True` (default) keeps best .so files; `False` deletes everything
-- `cute_oft.get_autotune_cache()` — inspect autotune results as nested dict `{(M,N,K,gs,rs): {(kernel_type,gated): {cache_key: time_ms}}}`
-- `cute_oft.clear_cache()` — remove cached kernel builds
-- `cute_oft.CompParams` — forward kernel configuration
-- `cute_oft.BwdDAdRCompParams` — backward dA+dR kernel configuration
-- `cute_oft.BwdDBCompParams` — backward dB kernel configuration
+- `cute_prism.get_autotune_cache()` — inspect autotune results as nested dict `{(M,N,K,gs,rs): {(kernel_type,gated): {cache_key: time_ms}}}`
+- `cute_prism.clear_cache()` — remove cached kernel builds
+- `cute_prism.CompParams` — forward kernel configuration
+- `cute_prism.BwdDAdRCompParams` — backward dA+dR kernel configuration
+- `cute_prism.BwdDBCompParams` — backward dB kernel configuration
 - All three `CompParams` classes have a `safe_defaults()` classmethod returning conservative configs that compile for all valid shapes
-- `cute_oft.OFTLinear` — `nn.Module` drop-in replacement for `nn.Linear` with OFT structure
+- `cute_prism.OFTLinear` — `nn.Module` drop-in replacement for `nn.Linear` with OFT structure
   - `OFTLinear.from_linear(linear, ...)` creates from an existing `nn.Linear`
   - Standard mode: weight frozen, reconn trainable. Gated mode (`activation="silu_gate"`): both trainable.
 
@@ -101,4 +101,4 @@ These are **mandatory** rules when writing or modifying CUDA kernels in this pro
 
 ## Misc
 - This file should be keep updated with the progress of the project.
-- When running the kernels using the cute backend with autotuning enabled, make sure to set `CUTE_OFT_COMPILE_WORKERS` environnment variable to 2. So that it will not trigger OOM error on my machine and kill my wsl
+- When running the kernels using the cute backend with autotuning enabled, make sure to set `CUTE_PRISM_COMPILE_WORKERS` environnment variable to 2. So that it will not trigger OOM error on my machine and kill my wsl

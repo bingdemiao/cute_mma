@@ -1,7 +1,7 @@
-#include "cute_oft_backward_dadr.hpp"
-#include "cute_oft_coop_pc.hpp"
+#include "cute_prism_backward_dadr.hpp"
+#include "cute_prism_coop_pc.hpp"
 #include <oft_config.hpp>
-#include "cute_oft_util.hpp"
+#include "cute_prism_util.hpp"
 #include "z_curve.hpp"
 
 using namespace cute;
@@ -553,7 +553,7 @@ __global__ void dR_reduce_kernel(
 // =============================================================================
 // Host launcher
 // =============================================================================
-void oft_backward_dA_dR_launch(
+void prism_backward_dA_dR_launch(
     int m, int n, int k,
     half const* dC, int ldDC,
     half const* A,  int ldA,

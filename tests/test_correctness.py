@@ -14,11 +14,11 @@ import argparse
 import sys
 import torch
 
-# Must set before importing cute_oft
+# Must set before importing cute_prism
 import os
-os.environ.setdefault("CUTE_OFT_COMPILE_WORKERS", "2")
+os.environ.setdefault("CUTE_PRISM_COMPILE_WORKERS", "2")
 
-import cute_oft
+import cute_prism
 
 
 def check_close(name, val, ref, rtol=0.005):
@@ -43,8 +43,8 @@ def test_forward(backend, gs, rs, sizes, n_seeds=5, verbose=False):
                 B = torch.randn(N, K, dtype=torch.float16, device="cuda")
                 R = torch.randn(N // gs * rs, K, dtype=torch.float16, device="cuda")
 
-                C = cute_oft.forward(A, B, R, gs, rs, backend=backend, activation=act)
-                C_ref = cute_oft.forward(A, B, R, gs, rs, backend="pytorch", activation=act)
+                C = cute_prism.forward(A, B, R, gs, rs, backend=backend, activation=act)
+                C_ref = cute_prism.forward(A, B, R, gs, rs, backend="pytorch", activation=act)
 
                 ok, rel = check_close("C", C, C_ref)
                 label = f"fwd {'gated' if act else 'plain':5s} M={M:4d} seed={seed}"
@@ -71,8 +71,8 @@ def test_backward_dadr(backend, gs, rs, sizes, n_seeds=5, verbose=False):
                 R = torch.randn(N // gs * rs, K, dtype=torch.float16, device="cuda")
                 dC = torch.randn(M, N, dtype=torch.float16, device="cuda")
 
-                dA, dR, _ = cute_oft.backward(dC, A, B, R, gs, rs, backend=backend, activation=act)
-                dA_ref, dR_ref, _ = cute_oft.backward(dC, A, B, R, gs, rs, backend="pytorch", activation=act)
+                dA, dR, _ = cute_prism.backward(dC, A, B, R, gs, rs, backend=backend, activation=act)
+                dA_ref, dR_ref, _ = cute_prism.backward(dC, A, B, R, gs, rs, backend="pytorch", activation=act)
 
                 ok_a, rel_a = check_close("dA", dA, dA_ref)
                 ok_r, rel_r = check_close("dR", dR, dR_ref)
@@ -100,8 +100,8 @@ def test_backward_db(backend, gs, rs, sizes, n_seeds=5, verbose=False):
             R = torch.randn(N // gs * rs, K, dtype=torch.float16, device="cuda")
             dC = torch.randn(M, N, dtype=torch.float16, device="cuda")
 
-            _, _, dB = cute_oft.backward(dC, A, B, R, gs, rs, backend=backend, activation="silu_gate")
-            _, _, dB_ref = cute_oft.backward(dC, A, B, R, gs, rs, backend="pytorch", activation="silu_gate")
+            _, _, dB = cute_prism.backward(dC, A, B, R, gs, rs, backend=backend, activation="silu_gate")
+            _, _, dB_ref = cute_prism.backward(dC, A, B, R, gs, rs, backend="pytorch", activation="silu_gate")
 
             ok, rel = check_close("dB", dB, dB_ref)
             label = f"db   gated M={M:4d} seed={seed}"
@@ -129,7 +129,7 @@ def main():
     args = parser.parse_args()
 
     if args.clear_cache:
-        cute_oft.clear_cache()
+        cute_prism.clear_cache()
 
     gs, rs = args.gs, args.rs
 
