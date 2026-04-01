@@ -657,7 +657,7 @@ class OFTLinear(nn.Module):
         A = input.reshape(-1, self.in_features)
 
         # GroupNorm pre-normalization (non-linear break between layers)
-        A = self.input_norm(A.float()).to(A.dtype)
+        A = self.input_norm(A)
 
         if self._weight_multiplier != 1.0:
             B = self._weight_multiplier * self.weight
