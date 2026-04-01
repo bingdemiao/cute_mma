@@ -345,11 +345,11 @@ Use `num_groups = in_features // group_size` to align groups with OFT's block-di
 model = nn.Sequential(
     nn.GroupNorm(in_features // group_size, in_features, affine=False),
     OFTLinear(in_features, hidden_dim, group_size=gs, activation="silu_gate"),
-    nn.GroupNorm(hidden_dim // group_size, hidden_dim, affine=False),
     nn.Dropout(),
+    nn.GroupNorm(hidden_dim // group_size, hidden_dim, affine=False),
     OFTLinear(hidden_dim, hidden_dim, group_size=gs, activation="silu_gate"),
-    nn.GroupNorm(hidden_dim // group_size, hidden_dim, affine=False),
     nn.Dropout(),
+    nn.GroupNorm(hidden_dim // group_size, hidden_dim, affine=False),
     nn.Linear(hidden_dim, num_classes),
 )
 ```
