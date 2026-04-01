@@ -1,4 +1,4 @@
-"""Pure PyTorch implementation of OFT forward and backward passes."""
+"""Pure PyTorch implementation of Prism forward and backward passes."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def pytorch_forward(
     rw_mode: bool = False,
     activation: str | None = None,
 ) -> torch.Tensor:
-    """Reference OFT forward using pure PyTorch operations.
+    """Reference Prism forward using pure PyTorch operations.
 
     AR mode: C = (A @ R^T) @ B^T, per group.
     AR mode with activation="silu_gate": C = (A * SiLU(A @ R^T)) @ B^T, per group.
@@ -68,7 +68,7 @@ def pytorch_backward(
     reconn_sz: int,
     activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Reference OFT backward using pure PyTorch operations.
+    """Reference Prism backward using pure PyTorch operations.
 
     Recomputes AR (or A*SiLU(AR)) from A and R rather than storing it.
 

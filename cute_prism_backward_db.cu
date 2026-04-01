@@ -1,6 +1,6 @@
 #include "cute_prism_backward_db.hpp"
 #include "cute_prism_coop_pc.hpp"
-#include <oft_config.hpp>
+#include <prism_config.hpp>
 #include "cute_prism_util.hpp"
 #include "z_curve.hpp"
 
@@ -426,7 +426,7 @@ void prism_backward_dB_launch(
                     make_shape(cute::Int<gs>{}, cute::Int<BLK_M>{}, cute::Int<bP_dc>{}))))
                * sizeof(half_t) + 256;
 
-#if OFT_GATED
+#if PRISM_GATED
     auto kernel = dB_pc_kernel<BLK_M, BLK_K, gs, rs, true>;
 #else
     auto kernel = dB_pc_kernel<BLK_M, BLK_K, gs, rs, false>;

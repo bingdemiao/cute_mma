@@ -1,4 +1,4 @@
-"""Dynamic loading and caching of compiled OFT kernel modules."""
+"""Dynamic loading and caching of compiled Prism kernel modules."""
 
 from __future__ import annotations
 

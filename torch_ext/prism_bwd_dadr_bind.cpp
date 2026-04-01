@@ -10,7 +10,7 @@ std::vector<torch::Tensor> prism_backward_dA_dR(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_dA_dR", &prism_backward_dA_dR,
-          "OFT backward: compute dA, dR",
+          "Prism backward: compute dA, dR",
           py::arg("dC"),
           py::arg("A"),
           py::arg("B"),

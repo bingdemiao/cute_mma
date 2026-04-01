@@ -30,7 +30,7 @@ torch::Tensor cublas_backward_dB(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &cublas_prism_forward,
-          "OFT forward pass (cuBLAS): C = A * R * B^T",
+          "Prism forward pass (cuBLAS): C = A * R * B^T",
           py::arg("A"),
           py::arg("B"),
           py::arg("R"),
@@ -39,7 +39,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("rw_mode") = false,
           py::arg("gated") = false);
     m.def("backward_dA_dR", &cublas_backward_dA_dR,
-          "OFT backward (cuBLAS): compute dA, dR",
+          "Prism backward (cuBLAS): compute dA, dR",
           py::arg("dC"),
           py::arg("A"),
           py::arg("B"),
@@ -49,7 +49,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("gated") = false,
           py::arg("dR_dtype") = py::none());
     m.def("backward_dB", &cublas_backward_dB,
-          "OFT backward (cuBLAS): compute dB",
+          "Prism backward (cuBLAS): compute dB",
           py::arg("dC"),
           py::arg("A"),
           py::arg("R"),

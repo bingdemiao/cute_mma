@@ -1,11 +1,11 @@
-"""Correctness test for the OFT PyTorch extension.
+"""Correctness test for the Prism PyTorch extension.
 
 Tests all backends (cute, cublas, pytorch) and modes (ar, rw) against a PyTorch reference.
 
 Usage:
-    python test_oft.py                     # Run all backends and modes
-    python test_oft.py --backend cute      # Only test cute backend
-    python test_oft.py --backend cublas --mode rw  # Only cublas RW mode
+    python test_prism.py                     # Run all backends and modes
+    python test_prism.py --backend cute      # Only test cute backend
+    python test_prism.py --backend cublas --mode rw  # Only cublas RW mode
 """
 
 import argparse
@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import cute_prism
 
 
-def oft_reference(A, B, R, group_size, reconn_sz, activation=None):
+def prism_reference(A, B, R, group_size, reconn_sz, activation=None):
     """Reference implementation (AR mode)."""
     M, K = A.shape
     N = B.shape[0]
@@ -65,11 +65,11 @@ def make_test_tensors(m, n, k, group_size, reconn_sz):
     return A, B, R
 
 
-def test_oft(m, n, k, group_size=256, reconn_sz=8, backend="cute", mode="ar", error_threshold=5e-3, activation=None):
+def test_prism(m, n, k, group_size=256, reconn_sz=8, backend="cute", mode="ar", error_threshold=5e-3, activation=None):
     """Test a backend against the reference."""
     A, B, R = make_test_tensors(m, n, k, group_size, reconn_sz)
 
-    C_ref = oft_reference(A, B, R, group_size, reconn_sz, activation=activation)
+    C_ref = prism_reference(A, B, R, group_size, reconn_sz, activation=activation)
     C_kernel = cute_prism.forward(A, B, R, group_size, reconn_sz, backend=backend, mode=mode, activation=activation)
 
     # Check for NaN/Inf
@@ -118,7 +118,7 @@ GATED_BACKENDS = ["pytorch", "cublas", "cute"]
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OFT kernel correctness tests")
+    parser = argparse.ArgumentParser(description="Prism kernel correctness tests")
     parser.add_argument("--backend", choices=list(ALL_CONFIGS.keys()),
                         help="Test only this backend (default: all)")
     parser.add_argument("--mode", choices=["ar", "rw"],
@@ -144,12 +144,12 @@ if __name__ == "__main__":
         for mode in modes:
             print(f"\n--- Backend: {backend}, Mode: {mode} ---\n")
 
-            all_passed &= test_oft(256, 256, 32, backend=backend, mode=mode)
-            all_passed &= test_oft(1024, 1024, 256, backend=backend, mode=mode)
-            all_passed &= test_oft(4096, 4096, 1024, backend=backend, mode=mode)
+            all_passed &= test_prism(256, 256, 32, backend=backend, mode=mode)
+            all_passed &= test_prism(1024, 1024, 256, backend=backend, mode=mode)
+            all_passed &= test_prism(4096, 4096, 1024, backend=backend, mode=mode)
 
             # Test with different hyperparameters
-            all_passed &= test_oft(1024, 1024, 256, group_size=128, reconn_sz=16, backend=backend, mode=mode)
+            all_passed &= test_prism(1024, 1024, 256, group_size=128, reconn_sz=16, backend=backend, mode=mode)
 
     # Test gated activation (silu_gate) — AR mode only
     gated_backends = [args.backend] if args.backend else GATED_BACKENDS
@@ -158,12 +158,12 @@ if __name__ == "__main__":
             if args.activation == "silu_gate" or args.activation is None:
                 print(f"\n--- Backend: {backend}, Mode: ar, Activation: silu_gate ---\n")
 
-                all_passed &= test_oft(256, 256, 32, backend=backend, activation="silu_gate")
-                all_passed &= test_oft(1024, 1024, 256, backend=backend, activation="silu_gate")
-                all_passed &= test_oft(4096, 4096, 1024, backend=backend, activation="silu_gate")
+                all_passed &= test_prism(256, 256, 32, backend=backend, activation="silu_gate")
+                all_passed &= test_prism(1024, 1024, 256, backend=backend, activation="silu_gate")
+                all_passed &= test_prism(4096, 4096, 1024, backend=backend, activation="silu_gate")
 
                 # Test with different hyperparameters
-                all_passed &= test_oft(1024, 1024, 256, group_size=128, reconn_sz=16,
+                all_passed &= test_prism(1024, 1024, 256, group_size=128, reconn_sz=16,
                                        backend=backend, activation="silu_gate")
 
     print()

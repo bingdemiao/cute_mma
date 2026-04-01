@@ -1,4 +1,4 @@
-"""Correctness test for the OFT backward pass.
+"""Correctness test for the Prism backward pass.
 
 Tests backward gradients against PyTorch autograd reference.
 
@@ -118,7 +118,7 @@ def test_backward(m, n, k, group_size=256, reconn_sz=8, backend="pytorch",
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OFT backward correctness tests")
+    parser = argparse.ArgumentParser(description="Prism backward correctness tests")
     parser.add_argument("--backend", default="pytorch",
                         help="Backend to test (default: pytorch)")
     parser.add_argument("--activation", choices=["silu_gate"],

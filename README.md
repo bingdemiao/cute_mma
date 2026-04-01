@@ -1,10 +1,10 @@
 # cute-prism
 
-High-performance Python library for **OFT (Orthogonal Fine-Tuning)** — a parameter-efficient fine-tuning technique for large language models. Provides JIT-compiled CUDA kernels that compute the OFT linear layer via a PyTorch interface, with automatic kernel autotuning and caching.
+High-performance Python library for the **Prism linear layer** — a block-diagonal reconnection layer with orthogonal structure. Provides JIT-compiled CUDA kernels that compute the Prism linear operation via a PyTorch interface, with automatic kernel autotuning and caching.
 
-## What is OFT?
+## What is Prism?
 
-OFT applies a block-diagonal orthogonal transformation to activations before the weight multiply, enabling efficient fine-tuning with far fewer trainable parameters than full fine-tuning. The core operation is:
+Prism applies a block-diagonal orthogonal transformation to activations before the weight multiply, enabling efficient fine-tuning with far fewer trainable parameters than full fine-tuning. The core operation is:
 
 ```
 C = (A @ R^T) @ B^T
@@ -25,7 +25,7 @@ This replaces the linear reconnection with a gated non-linearity, enabling riche
 - **Three backends**: `cute` (JIT-compiled CuTe tensor core kernels, default), `cublas` (cuBLAS GEMM), `pytorch` (pure PyTorch reference)
 - **Forward and backward**: Full differentiable support with separate, independently tunable kernels for forward, backward dA+dR, and backward dB passes
 - **Automatic autotuning**: Pipelined compilation + benchmarking discovers the fastest kernel configuration for each problem shape, with results cached to disk
-- **Gated activation**: Optional `silu_gate` mode for gated OFT (`A * SiLU(A @ R^T)`)
+- **Gated activation**: Optional `silu_gate` mode for gated Prism (`A * SiLU(A @ R^T)`)
 - **Two computation modes**: `ar` (activation reconnection) and `rw` (reweighting, cublas/pytorch only)
 - **Safe fallback**: If a kernel configuration fails to compile, the library automatically retries with conservative defaults
 - **Compile-failure caching**: Configurations that fail to compile are recorded globally and skipped in future autotuning runs, even for different input shapes
@@ -67,11 +67,11 @@ dA, dR, dB = cute_prism.backward(dC, A, B, R, group_size, reconn_sz, backend="cu
 
 ## `PrismLinear` module
 
-`PrismLinear` is a drop-in replacement for `torch.nn.Linear` that uses OFT structure under the hood. It manages the weight (B), reconnection matrix (R), and optional bias, and integrates with PyTorch's autograd.
+`PrismLinear` is a drop-in replacement for `torch.nn.Linear` that uses Prism structure under the hood. It manages the weight (B), reconnection matrix (R), and optional bias, and integrates with PyTorch's autograd.
 
 ### Fine-tuning a pretrained model
 
-Replace existing linear layers with OFT layers, loading the pretrained weights. R is initialized as identity so the layer starts with the same behavior as the original, then only R is trained:
+Replace existing linear layers with Prism layers, loading the pretrained weights. R is initialized as identity so the layer starts with the same behavior as the original, then only R is trained:
 
 ```python
 import cute_prism
@@ -92,9 +92,9 @@ for name, p in model.some_layer.named_parameters():
     # bias   True
 ```
 
-### Width expansion with gated OFT
+### Width expansion with gated mode
 
-Use `activation="silu_gate"` to enable gated OFT, which acts as a width expansion. Both R and B become trainable:
+Use `activation="silu_gate"` to enable gated mode, which acts as a width expansion. Both R and B become trainable:
 
 ```python
 layer = cute_prism.PrismLinear(
@@ -156,7 +156,7 @@ dA, dR, dB = cute_prism.backward(
 )
 ```
 
-Without `silu_gate` (standard OFT), B is frozen and `dB` is returned as `None`.
+Without `silu_gate` (standard mode), B is frozen and `dB` is returned as `None`.
 
 ## Autotuning
 
@@ -290,7 +290,7 @@ In non-gated (finetuning) mode, B is frozen and expects natural column order. Wh
 
 ```python
 # Convert pretrained layer with shuffle for finetuning
-oft = cute_prism.PrismLinear.from_linear(
+prism = cute_prism.PrismLinear.from_linear(
     pretrained_linear,
     group_size=64, reconn_sz=16,
     input_shuffle=True,
@@ -336,7 +336,7 @@ When stacking PrismLinear layers, place an `nn.GroupNorm` (with `affine=False`) 
 
 2. **Non-linear break**: The spherical projection in GroupNorm is a genuine non-linearity ([Ni et al., 2024](https://arxiv.org/abs/2406.01255)) that prevents adjacent layers from collapsing into a single linear map. No external activation (ReLU, SiLU, etc.) is needed — and omitting them keeps the backward gradient zero-centered, which matters for the backward gain correction below.
 
-Use `num_groups = in_features // group_size` to align groups with OFT's block-diagonal structure.
+Use `num_groups = in_features // group_size` to align groups with Prism's block-diagonal structure.
 
 **Backward gain correction** (built-in): The gated SiLU's multiplicative structure (`h = a * SiLU(ar)`) amplifies backward gradients by ~1.437x. PrismLinear corrects this internally with a fixed scalar (`1/1.437`) on the output gradient — no user action needed.
 
@@ -359,16 +359,16 @@ model = nn.Sequential(
 PrismLinear is designed to be fully compatible with the [muP](https://github.com/microsoft/mup) library (`MuAdamW`, `set_base_shapes`) and can be freely mixed with `nn.Linear` in the same model.
 
 - **Weight B**: No runtime multiplier. Scaling is absorbed into initialization (`std = alpha/sqrt(K)` where `alpha ≈ 1.77` compensates for gated SiLU variance reduction with skew-symmetric R). muP treats B identically to `nn.Linear`.
-- **Reconnection R**: Initialized as skew-symmetric at `std = 1/sqrt(reconn_sz)`. `mup_fix_oft_shapes()` sets R's K-dimension `base_dim = sqrt(base_K * K)` giving `width_mult = sqrt(K/base_K)`, because R's output propagates through B which adds extra `O(1/sqrt(K))` damping.
+- **Reconnection R**: Initialized as skew-symmetric at `std = 1/sqrt(reconn_sz)`. `mup_fix_prism_shapes()` sets R's K-dimension `base_dim = sqrt(base_K * K)` giving `width_mult = sqrt(K/base_K)`, because R's output propagates through B which adds extra `O(1/sqrt(K))` damping.
 
 ```python
 from mup import MuAdamW, set_base_shapes
-from cute_prism._module import mup_fix_oft_shapes
+from cute_prism._module import mup_fix_prism_shapes
 
 model = make_model(hidden_dim=1024)
 base = make_model(hidden_dim=64)
 set_base_shapes(model, base)
-mup_fix_oft_shapes(model)  # fix R's infshape
+mup_fix_prism_shapes(model)  # fix R's infshape
 optimizer = MuAdamW(model.parameters(), lr=0.01)
 ```
 
@@ -381,7 +381,7 @@ optimizer = MuAdamW(model.parameters(), lr=0.01)
 | `group_size` | `256` | Output channels per reconnection group |
 | `reconn_sz` | `8` | Block size of orthogonal reconnection matrix |
 | `bias` | `True` | Learnable output bias |
-| `activation` | `None` | `None` (standard OFT) or `"silu_gate"` (gated/width expansion) |
+| `activation` | `None` | `None` (standard mode) or `"silu_gate"` (gated/width expansion) |
 | `cayley_order` | `inf` | Cayley approximation order (`inf` = exact, `k` = k-th order) |
 | `input_shuffle` | `False` | Per-group segment shuffling for cross-block feature mixing |
 | `shuffle_blk_k` | `128` | Shuffle locality chunk size (max 256) |
@@ -392,7 +392,7 @@ Methods:
 - `PrismLinear.from_linear(linear, ...)` — create from an existing `nn.Linear`, copying weights and bias
 - `load_pretrained_weight(weight, bias=None)` — load pretrained weight/bias tensors (permutes B columns per group when `input_shuffle=True` in finetuning mode)
 - `reconn_diag_sq_sum()` — diagnostic: sum of squared diagonal elements of R blocks
-- `mup_fix_oft_shapes(model)` — fix PrismLinear infshapes for correct muP LR scaling
+- `mup_fix_prism_shapes(model)` — fix PrismLinear infshapes for correct muP LR scaling
 
 ## Configuration classes
 

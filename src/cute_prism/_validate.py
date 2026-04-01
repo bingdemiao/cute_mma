@@ -1,4 +1,4 @@
-"""Parameter validation for OFT kernels.
+"""Parameter validation for Prism kernels.
 
 Validates user-provided parameters before compilation or kernel launch,
 providing clear error messages for invalid configurations.
@@ -144,7 +144,7 @@ def compute_smem_bytes_bwd_db(
 ) -> int:
     """Compute shared memory usage for backward dB kernel.
 
-    Mirrors the smem calculation in oft_backward_dB_launch().
+    Mirrors the smem calculation in prism_backward_dB_launch().
     sAR_pipe(bM, bK, bP_ar) replaces sAR_temp(bM, rs) + sARt(bK, bM, bP_ar).
     """
     gs, rs = group_size, reconn_sz

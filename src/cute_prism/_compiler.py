@@ -1,4 +1,4 @@
-"""JIT compilation of OFT CUDA kernels.
+"""JIT compilation of Prism CUDA kernels.
 
 Compiles per-variant .so files keyed by (backend, kernel_type, group_size, reconn_sz, comp_params),
 caching them on disk under ~/.cache/cute_prism/. Each kernel type (fwd, bwd_dadr, bwd_db)
@@ -35,13 +35,11 @@ class CompilationError(RuntimeError):
 
 def _cache_root() -> Path:
     return Path(os.environ.get("CUTE_PRISM_CACHE_DIR",
-                    os.environ.get("CUTE_OFT_CACHE_DIR",
-                                   Path.home() / ".cache" / "cute_prism")))
+                                   Path.home() / ".cache" / "cute_prism"))
 
 
 def _source_root() -> Path:
-    root = Path(os.environ.get("CUTE_PRISM_SOURCE_DIR",
-                    os.environ.get("CUTE_OFT_SOURCE_DIR", _SOURCE_ROOT)))
+    root = Path(os.environ.get("CUTE_PRISM_SOURCE_DIR", _SOURCE_ROOT))
     if not (root / "cute_prism_coop_pc.cu").exists():
         raise RuntimeError(
             f"Cannot find cute_mma source tree at {root}. "
@@ -153,7 +151,7 @@ def _compose_config_header(
     bwd_dadr_params: BwdDAdRCompParams | None = None,
     bwd_db_params: BwdDBCompParams | None = None,
 ) -> str:
-    """Compose oft_config.hpp containing CurrKernelParams plus relevant params struct."""
+    """Compose prism_config.hpp containing CurrKernelParams plus relevant params struct."""
     parts = ["#pragma once", "#include <cute/tensor.hpp>", "namespace cute {", ""]
 
     if kernel_type == "fwd":
@@ -275,9 +273,9 @@ target_include_directories({target} PRIVATE
 )
 
 target_compile_definitions({target} PRIVATE
-    OFT_GROUP_SIZE={group_size}
-    OFT_RECONN_SIZE={reconn_sz}
-    OFT_GATED={'1' if gated else '0'}
+    PRISM_GROUP_SIZE={group_size}
+    PRISM_RECONN_SIZE={reconn_sz}
+    PRISM_GATED={'1' if gated else '0'}
     TORCH_EXTENSION_NAME={target}
 )
 
@@ -477,7 +475,7 @@ def compile_kernel(
         # Generate config header and CMakeLists.txt
         if backend == "cute":
             header = _compose_config_header(kernel_type, comp_params, bwd_dadr_params, bwd_db_params)
-            (cache / "oft_config.hpp").write_text(header)
+            (cache / "prism_config.hpp").write_text(header)
             _generate_cmake_cute(cache, src, group_size, reconn_sz, kernel_type, gated)
         elif backend == "cublas":
             _generate_cmake_cublas(cache, src)

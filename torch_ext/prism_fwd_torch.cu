@@ -53,10 +53,10 @@ torch::Tensor prism_forward(
 
     // Validate against compiled constants
     TORCH_CHECK(group_size == CurrKernelParams::group_size,
-                "group_size (", group_size, ") must match compiled OFT_GROUP_SIZE (",
+                "group_size (", group_size, ") must match compiled PRISM_GROUP_SIZE (",
                 CurrKernelParams::group_size, "). Rebuild with -DGROUP_SIZE=", group_size);
     TORCH_CHECK(reconn_sz == CurrKernelParams::reconn_sz,
-                "reconn_sz (", reconn_sz, ") must match compiled OFT_RECONN_SIZE (",
+                "reconn_sz (", reconn_sz, ") must match compiled PRISM_RECONN_SIZE (",
                 CurrKernelParams::reconn_sz, "). Rebuild with -DRECONN_SIZE=", reconn_sz);
 
     // Allocate output

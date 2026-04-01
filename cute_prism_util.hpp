@@ -11,7 +11,7 @@ namespace cute {
 // -- SM80 f32→f16x2 conversion copy trait ------------------------------------
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
-#  define CUTE_OFT_CVT_SM80_ENABLED
+#  define CUTE_PRISM_CVT_SM80_ENABLED
 #endif
 
 struct SM80_CVT_F32_F16
@@ -24,7 +24,7 @@ struct SM80_CVT_F32_F16
        uint32_t const& src2,
        uint32_t& dst)
   {
-#if defined(CUTE_OFT_CVT_SM80_ENABLED)
+#if defined(CUTE_PRISM_CVT_SM80_ENABLED)
     asm volatile ("cvt.rn.f16x2.f32 {%0}, {%1}, {%2};\n"
         : "=r"(dst)
         :  "r"(src1), "r"(src2));

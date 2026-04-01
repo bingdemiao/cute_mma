@@ -1,6 +1,6 @@
 #include "cute_prism_backward_dadr.hpp"
 #include "cute_prism_coop_pc.hpp"
-#include <oft_config.hpp>
+#include <prism_config.hpp>
 #include "cute_prism_util.hpp"
 #include "z_curve.hpp"
 
@@ -609,7 +609,7 @@ void prism_backward_dA_dR_launch(
     dim3 grid(n_k_tiles * n_m_tiles);
     dim3 block(n_threads);
 
-#if OFT_GATED
+#if PRISM_GATED
     auto kernel = bwd_dadr_kernel<BLK_M, BLK_K, BLK_N, gs, rs, true>;
 #else
     auto kernel = bwd_dadr_kernel<BLK_M, BLK_K, BLK_N, gs, rs, false>;

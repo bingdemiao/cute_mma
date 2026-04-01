@@ -1,4 +1,4 @@
-# OFT Kernel Performance
+# Prism Kernel Performance
 
 Benchmarked on NVIDIA RTX 3080 Ti (SM86), M=N=K=8192, group_size=256, reconn_sz=8, float16.
 
@@ -11,7 +11,7 @@ Benchmarked on NVIDIA RTX 3080 Ti (SM86), M=N=K=8192, group_size=256, reconn_sz=
 | Backward dW (dW = dC^T @ A) | 15.7 | 70.03 |
 | **Total fwd+bwd** | **47.2** | **69.88** |
 
-## OFT Kernel Performance
+## Prism Kernel Performance
 
 | Operation | cute (ms) | cublas (ms) | pytorch (ms) |
 |-----------|-----------|-------------|--------------|

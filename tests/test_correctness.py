@@ -1,4 +1,4 @@
-"""Correctness tests for all OFT kernel variants.
+"""Correctness tests for all Prism kernel variants.
 
 Usage:
     uv run python tests/test_correctness.py                    # run all tests
@@ -116,7 +116,7 @@ def test_backward_db(backend, gs, rs, sizes, n_seeds=5, verbose=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OFT kernel correctness tests")
+    parser = argparse.ArgumentParser(description="Prism kernel correctness tests")
     parser.add_argument("--backend", default="cute", choices=["cute", "cublas"])
     parser.add_argument("--kernel", default="all", choices=["all", "fwd", "bwd_dadr", "bwd_db"])
     parser.add_argument("--quick", action="store_true", help="small sizes only")

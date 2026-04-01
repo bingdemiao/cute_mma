@@ -15,7 +15,7 @@ from cute_prism._config import CompParams
 from cute_prism._autotune import default_search_space, autotune, _compile_one
 
 
-def oft_reference(A, B, R, group_size, reconn_sz):
+def prism_reference(A, B, R, group_size, reconn_sz):
     """Reference implementation (AR mode)."""
     M, K = A.shape
     N = B.shape[0]
@@ -113,7 +113,7 @@ def test_autotune_returns_valid_config():
     R = torch.randn(n_groups * reconn_sz, K, dtype=torch.float16, device="cuda")
 
     C_tuned = cute_prism.forward(A, B, R, group_size, reconn_sz, comp_params=best)
-    C_ref = oft_reference(A, B, R, group_size, reconn_sz)
+    C_ref = prism_reference(A, B, R, group_size, reconn_sz)
 
     rel_err = (C_tuned.float() - C_ref.float()).abs()
     safe = C_ref.float().abs() > 1e-4
@@ -141,7 +141,7 @@ def test_forward_auto_mode():
     R = torch.randn(n_groups * reconn_sz, K, dtype=torch.float16, device="cuda")
 
     C = cute_prism.forward(A, B, R, group_size, reconn_sz, comp_params="auto")
-    C_ref = oft_reference(A, B, R, group_size, reconn_sz)
+    C_ref = prism_reference(A, B, R, group_size, reconn_sz)
 
     rel_err = (C.float() - C_ref.float()).abs()
     safe = C_ref.float().abs() > 1e-4

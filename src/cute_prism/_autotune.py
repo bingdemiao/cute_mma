@@ -1,4 +1,4 @@
-"""Autotuning for OFT kernel parameters.
+"""Autotuning for Prism kernel parameters.
 
 Searches over a space of tile sizes, pipeline depths, and warp layouts to find
 the fastest parameters for each kernel type (forward, backward dA+dR, backward dB).
@@ -224,8 +224,7 @@ def _problem_key(
 def _cache_path() -> Path:
     import os
     root = Path(os.environ.get("CUTE_PRISM_CACHE_DIR",
-                    os.environ.get("CUTE_OFT_CACHE_DIR",
-                                   Path.home() / ".cache" / "cute_prism")))
+                                   Path.home() / ".cache" / "cute_prism"))
     return root / "autotune_results.json"
 
 
@@ -248,8 +247,7 @@ def _save_cache(cache: dict) -> None:
 def _compile_failed_path() -> Path:
     import os
     root = Path(os.environ.get("CUTE_PRISM_CACHE_DIR",
-                    os.environ.get("CUTE_OFT_CACHE_DIR",
-                                   Path.home() / ".cache" / "cute_prism")))
+                                   Path.home() / ".cache" / "cute_prism"))
     return root / "compile_failed.json"
 
 
@@ -710,8 +708,7 @@ def _autotune_generic(
     # Producer-consumer pipeline
     # -------------------------------------------------------------------
     import os
-    max_compile_workers = int(os.environ.get("CUTE_PRISM_COMPILE_WORKERS",
-                                 os.environ.get("CUTE_OFT_COMPILE_WORKERS", 4)))
+    max_compile_workers = int(os.environ.get("CUTE_PRISM_COMPILE_WORKERS", 4))
     n_compile_workers = min(len(configs_to_test), max_compile_workers)
     n_bench_workers = len(devices)
 

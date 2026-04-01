@@ -9,7 +9,7 @@ torch::Tensor prism_forward(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &prism_forward,
-          "OFT forward pass: C = A * R * B^T",
+          "Prism forward pass: C = A * R * B^T",
           py::arg("A"),
           py::arg("B"),
           py::arg("R"),

@@ -1,4 +1,4 @@
-"""torch.nn.Module wrapper for OFT linear layers."""
+"""torch.nn.Module wrapper for Prism linear layers."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ _shuffle_lock = __import__("threading").Lock()
 
 
 def _get_shuffle_module():
-    """JIT-compile and load the shuffle OFT CUDA kernel."""
+    """JIT-compile and load the shuffle Prism CUDA kernel."""
     global _shuffle_module
     if _shuffle_module is not None:
         return _shuffle_module
@@ -246,8 +246,8 @@ def _build_seg_pairs(
     return seg_pairs
 
 
-class _ShuffleOFTFunction(torch.autograd.Function):
-    """Autograd wrapper for the shuffle OFT CUDA kernel."""
+class _ShufflePrismFunction(torch.autograd.Function):
+    """Autograd wrapper for the shuffle Prism CUDA kernel."""
 
     @staticmethod
     def forward(ctx, A, B, R, seg_pairs, group_size, reconn_sz, gated):
@@ -277,17 +277,17 @@ class _ShuffleOFTFunction(torch.autograd.Function):
 
 
 class PrismLinear(nn.Module):
-    """Drop-in replacement for ``nn.Linear`` using OFT structure.
+    """Drop-in replacement for ``nn.Linear`` using Prism structure.
 
-    Computes ``C = (A @ R^T) @ B^T`` per group (standard OFT), or
-    ``C = (A * SiLU(A @ R^T)) @ B^T`` per group (gated OFT / width expansion).
+    Computes ``C = (A @ R^T) @ B^T`` per group (standard mode), or
+    ``C = (A * SiLU(A @ R^T)) @ B^T`` per group (gated mode / width expansion).
 
     In standard mode (``activation=None``), only R is trainable and B (weight)
-    is frozen — this is the classic OFT fine-tuning setup. In gated mode
+    is frozen — this is the classic fine-tuning setup. In gated mode
     (``activation="silu_gate"``), both R and B are trainable, enabling the
     layer to act as a width expansion with ``n_groups`` independent pathways.
 
-    Compatible with ``torch.compile``. The OFT kernel call is registered as
+    Compatible with ``torch.compile``. The Prism kernel call is registered as
     a custom op, so the compiler treats it as opaque and traces through the
     surrounding standard torch operations (μP multipliers, reshape, bias)
     normally.
@@ -298,7 +298,7 @@ class PrismLinear(nn.Module):
         group_size: Number of output channels per reconnection group.
         reconn_sz: Block size of the orthogonal reconnection matrix R.
         bias: If True, adds a learnable bias to the output.
-        activation: ``None`` for standard OFT, ``"silu_gate"`` for gated OFT.
+        activation: ``None`` for standard mode, ``"silu_gate"`` for gated mode.
         backend: Computation backend (``"cute"``, ``"cublas"``, ``"pytorch"``).
         autotuning: Enable automatic kernel autotuning.
         force_rebenchmark: Force re-benchmarking when autotuning.
@@ -312,12 +312,12 @@ class PrismLinear(nn.Module):
 
     Examples::
 
-        # Standard OFT fine-tuning (freeze pretrained weights, train R only)
+        # Standard fine-tuning (freeze pretrained weights, train R only)
         layer = cute_prism.PrismLinear(256, 1024, group_size=256, reconn_sz=8)
         layer.load_pretrained_weight(pretrained_linear.weight)
         output = layer(input)
 
-        # Gated OFT as width expansion (train both R and B)
+        # Gated mode as width expansion (train both R and B)
         layer = cute_prism.PrismLinear(256, 1024, group_size=256, reconn_sz=8,
                                    activation="silu_gate")
         output = layer(input)
@@ -401,13 +401,13 @@ class PrismLinear(nn.Module):
         # B: init at N(0, alpha/sqrt(K)) where alpha ≈ 1.66 compensates for
         #    gated SiLU variance reduction. Same muP behavior as nn.Linear.
         # R: init at N(0, 1/sqrt(r)) where r = reconn_sz is the block fan-in.
-        #    mup_fix_oft_shapes() marks R's K-dim as finite so MuAdamW
+        #    mup_fix_prism_shapes() marks R's K-dim as finite so MuAdamW
         #    doesn't over-scale its LR based on the full tensor width.
         self._weight_multiplier = 1.0 if gated else 1.0
         self._reconn_multiplier = 1.0 if gated else 1.0 / math.sqrt(reconn_sz)
 
         # Weight B: (out_features, in_features)
-        # Frozen in standard OFT, trainable in gated mode.
+        # Frozen in standard mode, trainable in gated mode.
         # In gated mode, stores O(1) raw parameter; effective B = multiplier * weight.
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features),
@@ -562,7 +562,7 @@ class PrismLinear(nn.Module):
 
         This copies the weight (and optionally bias) from a pretrained linear
         layer. Useful for fine-tuning: load the pretrained weights, then train
-        only R (standard OFT) or both R and B (gated OFT).
+        only R (standard mode) or both R and B (gated mode).
 
         When ``input_shuffle=True`` and not gated (finetuning mode), each
         group's B columns are permuted to match the shuffled AR layout.
@@ -712,7 +712,7 @@ class PrismLinear(nn.Module):
         When backend='pytorch', uses pure PyTorch ops (reference/testing).
         """
         if self.backend == "cublas" and A.is_cuda:
-            return _ShuffleOFTFunction.apply(
+            return _ShufflePrismFunction.apply(
                 A, B, R, self._seg_pairs,
                 self.group_size, self.reconn_sz,
                 self.activation == "silu_gate",
@@ -778,14 +778,14 @@ class PrismLinear(nn.Module):
         return ", ".join(parts)
 
 
-def mup_fix_oft_shapes(model: nn.Module) -> None:
+def mup_fix_prism_shapes(model: nn.Module) -> None:
     """Fix PrismLinear infshapes for correct ``mup`` LR scaling.
 
     Must be called **after** ``mup.set_base_shapes()`` and **before**
     creating the optimizer::
 
         mup.set_base_shapes(model, base_model)
-        mup_fix_oft_shapes(model)
+        mup_fix_prism_shapes(model)
         optimizer = MuAdam(model.parameters(), lr=base_lr)
 
     **Weight B** (``weight``): No adjustment needed. B has no runtime
@@ -827,4 +827,3 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
                 # weight (B) and bias: keep infshape from set_base_shapes
 
 
-mup_fix_prism_shapes = mup_fix_oft_shapes  # preferred name

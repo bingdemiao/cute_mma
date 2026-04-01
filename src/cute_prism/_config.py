@@ -1,4 +1,4 @@
-"""Computation parameter configuration for OFT kernels.
+"""Computation parameter configuration for Prism kernels.
 
 Manages the performance-related parameters (tile sizes, pipeline depths, warp
 layouts) that are baked into each compiled kernel variant. Currently uses
@@ -14,9 +14,9 @@ import hashlib
 
 @dataclasses.dataclass(frozen=True)
 class CompParams:
-    """Performance parameters for the OFT kernel.
+    """Performance parameters for the Prism kernel.
 
-    These correspond to CurrCompParams in oft_config.hpp.
+    These correspond to CurrCompParams in prism_config.hpp.
     """
 
     bM: int = 128

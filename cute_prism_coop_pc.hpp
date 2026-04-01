@@ -1,22 +1,22 @@
 #pragma once
 #include <cute/tensor.hpp>
 
-#ifndef OFT_GROUP_SIZE
-#define OFT_GROUP_SIZE 256
+#ifndef PRISM_GROUP_SIZE
+#define PRISM_GROUP_SIZE 256
 #endif
 
-#ifndef OFT_RECONN_SIZE
-#define OFT_RECONN_SIZE 8
+#ifndef PRISM_RECONN_SIZE
+#define PRISM_RECONN_SIZE 8
 #endif
 
-#ifndef OFT_GATED
-#define OFT_GATED 0
+#ifndef PRISM_GATED
+#define PRISM_GATED 0
 #endif
 
 struct CurrKernelParams {
-    static constexpr unsigned int group_size = OFT_GROUP_SIZE;
-    static constexpr unsigned int reconn_sz = OFT_RECONN_SIZE;
-    static constexpr bool gated = OFT_GATED;
+    static constexpr unsigned int group_size = PRISM_GROUP_SIZE;
+    static constexpr unsigned int reconn_sz = PRISM_RECONN_SIZE;
+    static constexpr bool gated = PRISM_GATED;
 };
 
 template <class KernelParams>

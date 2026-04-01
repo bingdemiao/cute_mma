@@ -1,5 +1,5 @@
 #include "cute_prism_coop_pc.hpp"
-#include <oft_config.hpp>
+#include <prism_config.hpp>
 #include "cute_prism_util.hpp"
 #include "z_curve.hpp"
 
@@ -21,7 +21,7 @@ template <class TensorGA, class TensorSA, class TiledCopyA,
           class TensorSAR,
           class WarpLayoutStage1, class WarpLayoutStage2>
 __device__ static inline
-void oft_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
+void prism_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
             TensorGR const &gR, TensorSR &sR, TiledCopyR copy_r, ReconnectSize reconn_sz, ConsumptionBlocks c_blocks,
             TensorSAR &sAR, int thread_idx,
             WarpLayoutStage1 warps_stage1, WarpLayoutStage2 warps_stage2)
@@ -195,7 +195,7 @@ void oft_ar(TensorGA const &gA, TensorSA &sA, TiledCopyA copy_a,
                                 :
                                 : "r"(ar_pipe_write + K_PIPE2_MAX), "n"(n_threads_total)); // wait for the previous data to be consumed
 
-#if OFT_GATED
+#if PRISM_GATED
             // Apply SiLU gating in registers: AR = A * SiLU(AR)
             // A and C fragments have identical (M, K=N) element-to-thread mapping,
             // so corresponding elements share the same (m, k=n) position.
@@ -230,7 +230,7 @@ template <class TensorGB, class TensorSB, class TiledCopyB,
           class TensorGC,
           class WarpLayoutStage1, class WarpLayoutStage2>
 __device__ static inline
-void oft_arb(TensorGB const &gB, TensorSB &sB, TiledCopyB copy_b,
+void prism_arb(TensorGB const &gB, TensorSB &sB, TiledCopyB copy_b,
              TensorSAR const &sAR, GroupSize group_sz, ConsumptionWidth c_width,
              TensorGC &gC, int thread_idx,
              WarpLayoutStage1 warps_stage1, WarpLayoutStage2 warp_layout_stage2)
@@ -407,7 +407,7 @@ template <class GridShape, class CtaTiler,
           class CLayout, class WarpLayoutStage1, class WarpLayoutStage2,
           class PipelineA_R, class PipelineAR, class PipelineB>
 __global__ static __launch_bounds__(decltype((size(WarpLayoutStage1{}) + size(WarpLayoutStage2{})) * cute::_32{})::value)
-void oft_device(GridShape grid_shape, CtaTiler cta_tiler,
+void prism_device(GridShape grid_shape, CtaTiler cta_tiler,
                 half const *A, ALayout layout_a, TiledCopyA copy_a,
                 half const *R, RLayout layout_r, TiledCopyR copy_r, GroupSize group_sz, ReconnectSize reconn_sz, ConsumptionWidth c_width,
                 half const *B, BLayout layout_b, TiledCopyB copy_b,
@@ -506,7 +506,7 @@ void oft_device(GridShape grid_shape, CtaTiler cta_tiler,
     int stage2_threads = size(warp_layout_stage2) * 32;
     if (thread_idx < stage2_threads) {
         // Call the ARB kernel
-        oft_arb(
+        prism_arb(
             gB, sB, copy_b,
             sAR, group_sz, c_width,
             gC, thread_idx,
@@ -514,7 +514,7 @@ void oft_device(GridShape grid_shape, CtaTiler cta_tiler,
         );
     } else {
         // Call the AR kernel
-        oft_ar(
+        prism_ar(
             gA, sA, copy_a,
             gR, sR, copy_r, reconn_sz, n_consume_blocks,
             sAR, thread_idx - stage2_threads,
@@ -592,7 +592,7 @@ void prism_tn(int m, int n, int k,
     printf("dimGrid: (%d, %d), dimBlock: (%d, %d)\n",
             dimGrid.x, dimGrid.y, dimBlock.x, dimBlock.y);
     #endif
-    oft_device<<<dimGrid, dimBlock, smem_size, stream>>>(
+    prism_device<<<dimGrid, dimBlock, smem_size, stream>>>(
         grid_shape, cta_tiler,
         A, A_layout, copyA,
         R, R_layout, copyR, group_size, reconn_sz, c_width,

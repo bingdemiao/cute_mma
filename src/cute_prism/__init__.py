@@ -1,4 +1,4 @@
-"""cute_prism — OFT (Orthogonal Fine-Tuning) CUDA kernels with multiple backends.
+"""cute_prism — Prism linear layer with multiple backends.
 
 Usage::
 
@@ -37,9 +37,7 @@ from ._autotune import (
 )
 from ._compiler import CompilationError, clear_cache
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
-from ._module import PrismLinear, mup_fix_oft_shapes, mup_fix_prism_shapes
-# Backward compatibility alias
-OFTLinear = PrismLinear
+from ._module import PrismLinear, mup_fix_prism_shapes
 from ._loader import get_or_compile
 from ._validate import (
     check_smem_limit,
@@ -64,7 +62,6 @@ __all__ = [
     "BwdDBCompParams",
     "CompilationError",
     "PrismLinear",
-    "OFTLinear",  # backward compatibility alias
     "mup_fix_prism_shapes",
 ]
 
@@ -87,7 +84,7 @@ def forward(
     autotuning_search_space: Iterable[CompParams | tuple[CompParams, Callable]] | None = None,
     force_rebenchmark: bool = False,
 ) -> torch.Tensor:
-    """Compute C = A @ diag(R) @ B^T with OFT structure.
+    """Compute C = A @ diag(R) @ B^T with Prism structure.
 
     Args:
         A: Input tensor of shape (M, K), float16 or bfloat16, CUDA.
@@ -195,7 +192,7 @@ def backward(
     dR_dtype: torch.dtype | None = None,
     dB_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Compute gradients for OFT backward pass.
+    """Compute gradients for Prism backward pass.
 
     Recomputes intermediate activations (AR or A*SiLU(AR)) from inputs
     rather than storing them, to minimize memory usage.

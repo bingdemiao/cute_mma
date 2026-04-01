@@ -9,7 +9,7 @@ torch::Tensor prism_backward_dB(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_dB", &prism_backward_dB,
-          "OFT backward: compute dB",
+          "Prism backward: compute dB",
           py::arg("dC"),
           py::arg("A"),
           py::arg("R"),

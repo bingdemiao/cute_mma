@@ -1,13 +1,13 @@
 # cute-prism
 
-High-performance Python library for OFT (Orthogonal Fine-Tuning) — a parameter-efficient fine-tuning technique. Provides JIT-compiled CUDA kernels that compute `C = A @ diag(R) @ B^T` via a PyTorch interface.
+High-performance Python library for the Prism linear layer — a block-diagonal reconnection layer with orthogonal structure. Provides JIT-compiled CUDA kernels that compute `C = A @ diag(R) @ B^T` via a PyTorch interface.
 
 ## Key concepts
 
-- **OFT operation**: Multiplies activation matrix A by block-diagonal orthogonal matrix R and weight matrix B
+- **Prism operation**: Multiplies activation matrix A by block-diagonal orthogonal matrix R and weight matrix B
 - **Backends**: `cute` (JIT-compiled CuTe kernel, default), `cublas` (cuBLAS), `pytorch` (pure PyTorch reference)
 - **Modes**: `ar` (activation reconnection: `(A @ R^T) @ B^T`), `rw` (reweighting: `A @ (B @ R)^T`, cublas/pytorch only)
-- **Activations**: `None` (standard linear OFT), `"silu_gate"` (gated: `A * SiLU(A @ R^T)` replaces `A @ R^T`, AR mode only)
+- **Activations**: `None` (standard linear mode), `"silu_gate"` (gated: `A * SiLU(A @ R^T)` replaces `A @ R^T`, AR mode only)
 - **CompParams / BwdDAdRCompParams / BwdDBCompParams**: Frozen dataclasses controlling tile sizes, pipeline depths, and warp layouts for each kernel type (forward, backward dA+dR, backward dB)
 - **Autotuning**: Per-kernel autotuning via pipelined compilation + benchmarking (producer-consumer overlap), caches all tested results to disk. Supports generators, callbacks, multi-GPU benchmarking, and `force_rebenchmark`. All compiled kernels are kept on disk across autotune runs (keyed by `group_size/reconn_sz/comp_params`, not MNK). Configs that fail compilation are recorded in a global registry (`compile_failed.json`) and skipped across all MNK sizes.
 - **Safe fallback**: When default `CompParams` fail to compile, `forward()`/`backward()` automatically retry with `safe_defaults()`
@@ -43,8 +43,8 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
 ## Public API
 
 - `cute_prism.forward(A, B, R, group_size, reconn_sz, backend, mode, comp_params, activation, autotuning, autotuning_search_space, force_rebenchmark)` — main entry point
-  - `activation=None`: standard OFT `C = (A @ R^T) @ B^T`
-  - `activation="silu_gate"`: gated OFT `C = (A * SiLU(A @ R^T)) @ B^T` (AR mode only)
+  - `activation=None`: standard mode `C = (A @ R^T) @ B^T`
+  - `activation="silu_gate"`: gated mode `C = (A * SiLU(A @ R^T)) @ B^T` (AR mode only)
   - `autotuning=True`: check cache first, autotune if miss, use best config
   - `autotuning_search_space`: custom `Iterable[CompParams | (CompParams, callback)]`
 - `cute_prism.backward(dC, A, B, R, group_size, reconn_sz, backend, activation, autotuning, ...)` — backward pass
@@ -69,8 +69,8 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
 - `cute_prism.BwdDAdRCompParams` — backward dA+dR kernel configuration
 - `cute_prism.BwdDBCompParams` — backward dB kernel configuration
 - All three `CompParams` classes have a `safe_defaults()` classmethod returning conservative configs that compile for all valid shapes
-- `cute_prism.OFTLinear` — `nn.Module` drop-in replacement for `nn.Linear` with OFT structure
-  - `OFTLinear.from_linear(linear, ...)` creates from an existing `nn.Linear`
+- `cute_prism.PrismLinear` — `nn.Module` drop-in replacement for `nn.Linear` with Prism structure
+  - `PrismLinear.from_linear(linear, ...)` creates from an existing `nn.Linear`
   - Standard mode: weight frozen, reconn trainable. Gated mode (`activation="silu_gate"`): both trainable.
 
 ### Search space protocol
