@@ -24,7 +24,7 @@ class _BwdScaleFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, bwd_scale):
         ctx.bwd_scale = bwd_scale
-        return x.clone()  # clone to avoid inplace-on-view issues with ReLU
+        return x.clone()
 
     @staticmethod
     def backward(ctx, grad_y):
@@ -437,11 +437,6 @@ class OFTLinear(nn.Module):
             )
             self.register_buffer("_seg_pairs", seg_pairs)
 
-        # GroupNorm pre-normalization: non-linear break between layers
-        # (Ni et al., arXiv:2406.01255) + zero-mean unit-variance input for OFT.
-        num_groups = in_features // group_size
-        self.input_norm = nn.GroupNorm(num_groups, in_features, affine=False)
-
         # Backward scalar correction for gated SiLU's multiplicative gain
         bwd_gain = _GATED_SILU_BWD_GAIN if activation == "silu_gate" else 1.0
         self._bwd_scale = 1.0 / bwd_gain
@@ -656,9 +651,6 @@ class OFTLinear(nn.Module):
         orig_shape = input.shape
         A = input.reshape(-1, self.in_features)
 
-        # GroupNorm pre-normalization (non-linear break between layers)
-        A = self.input_norm(A)
-
         if self._weight_multiplier != 1.0:
             B = self._weight_multiplier * self.weight
         else:
@@ -833,4 +825,3 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
                         dims[-1] = InfDim(int(math.sqrt(base_K * K)), K)
                     param.infshape = InfShape(dims)
                 # weight (B) and bias: keep infshape from set_base_shapes
-                # input_norm: GroupLayerNorm (no learnable params)

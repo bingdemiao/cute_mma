@@ -328,17 +328,31 @@ layer = cute_oft.OFTLinear(
 
 The trainable parameter M is stored in `reconn`; at forward time, `S = M - M^T` (skew-symmetric) is formed and R is constructed. `reconn_diag_sq_sum()` provides a diagnostic for monitoring R's health during training.
 
-## Bidirectional batch normalization
+## Normalization and stacking
 
-OFTLinear includes a built-in `BidirectionalBatchNorm` applied to the input before the OFT computation. This serves two purposes:
+When stacking OFTLinear layers, place an `nn.GroupNorm` (with `affine=False`) **before** each OFTLinear. This serves two purposes:
 
-1. **Forward normalization**: A standard learnable `BatchNorm1d` normalizes the input to zero mean and unit variance, which is required for OFTLinear's internal Layer 1 (`A * SiLU(A @ R^T)`) and Layer 2 (`H @ B^T`) to interact with the correct signal scale.
+1. **Pre-normalization**: OFTLinear's internal gated SiLU (`h = a * SiLU(a @ R^T)`) and weight projection (`y = h @ B^T`) are calibrated for zero-mean, unit-variance input. GroupNorm ensures this.
 
-2. **Backward gradient normalization**: A second `BatchNorm1d` (fixed, non-learnable) normalizes the gradient flowing backward through the layer. The gated SiLU activation has a multiplicative structure (`h = a * SiLU(ar)`) that amplifies the backward gradient by ~1.47x (from two independent gradient paths summing). Without correction, this would cause gradient explosion in deep networks. The backward BN normalizes the gradient to unit variance, bringing the end-to-end backward gain to ~1.0.
+2. **Non-linear break**: The spherical projection in GroupNorm is a genuine non-linearity ([Ni et al., 2024](https://arxiv.org/abs/2406.01255)) that prevents adjacent layers from collapsing into a single linear map. No external activation (ReLU, SiLU, etc.) is needed — and omitting them keeps the backward gradient zero-centered, which matters for the backward gain correction below.
 
-This is the same backward amplification problem that SwiGLU/GeGLU have in transformers, where it's typically handled by residual connections + LayerNorm. The built-in BiNorm makes OFTLinear self-contained — it doesn't rely on external normalization to maintain stable gradients.
+Use `num_groups = in_features // group_size` to align groups with OFT's block-diagonal structure.
 
-The backward BN operates under `torch.no_grad()` (no second-order gradients) and updates running statistics during training for use in eval mode. Adam-like optimizers are approximately scale-invariant, so the gradient rescaling has minimal impact on optimization dynamics.
+**Backward gain correction** (built-in): The gated SiLU's multiplicative structure (`h = a * SiLU(ar)`) amplifies backward gradients by ~1.437x. OFTLinear corrects this internally with a fixed scalar (`1/1.437`) on the output gradient — no user action needed.
+
+```python
+# Recommended stacking pattern
+model = nn.Sequential(
+    nn.GroupNorm(in_features // group_size, in_features, affine=False),
+    OFTLinear(in_features, hidden_dim, group_size=gs, activation="silu_gate"),
+    nn.GroupNorm(hidden_dim // group_size, hidden_dim, affine=False),
+    nn.Dropout(),
+    OFTLinear(hidden_dim, hidden_dim, group_size=gs, activation="silu_gate"),
+    nn.GroupNorm(hidden_dim // group_size, hidden_dim, affine=False),
+    nn.Dropout(),
+    nn.Linear(hidden_dim, num_classes),
+)
+```
 
 ## muP compatibility
 
