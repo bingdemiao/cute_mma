@@ -276,7 +276,7 @@ class _ShuffleOFTFunction(torch.autograd.Function):
         return dA, dB, dR, None, None, None, None
 
 
-class OFTLinear(nn.Module):
+class PrismLinear(nn.Module):
     """Drop-in replacement for ``nn.Linear`` using OFT structure.
 
     Computes ``C = (A @ R^T) @ B^T`` per group (standard OFT), or
@@ -313,12 +313,12 @@ class OFTLinear(nn.Module):
     Examples::
 
         # Standard OFT fine-tuning (freeze pretrained weights, train R only)
-        layer = cute_oft.OFTLinear(256, 1024, group_size=256, reconn_sz=8)
+        layer = cute_oft.PrismLinear(256, 1024, group_size=256, reconn_sz=8)
         layer.load_pretrained_weight(pretrained_linear.weight)
         output = layer(input)
 
         # Gated OFT as width expansion (train both R and B)
-        layer = cute_oft.OFTLinear(256, 1024, group_size=256, reconn_sz=8,
+        layer = cute_oft.PrismLinear(256, 1024, group_size=256, reconn_sz=8,
                                    activation="silu_gate")
         output = layer(input)
     """
@@ -395,7 +395,7 @@ class OFTLinear(nn.Module):
         # In gated mode, NO runtime multipliers are applied for either B or R.
         # All scaling is absorbed into initialization so that parameters live
         # at O(1/sqrt(fan_in)) — matching nn.Linear's convention. This makes
-        # OFTLinear fully compatible with muP's optimizer-level LR scaling
+        # PrismLinear fully compatible with muP's optimizer-level LR scaling
         # (MuAdamW) and allows mixing with nn.Linear in the same model.
         #
         # B: init at N(0, alpha/sqrt(K)) where alpha ≈ 1.66 compensates for
@@ -614,8 +614,8 @@ class OFTLinear(nn.Module):
         backend: Literal["cute", "cublas", "pytorch"] = "cute",
         autotuning: bool = False,
         **kwargs,
-    ) -> "OFTLinear":
-        """Create an OFTLinear layer from an existing ``nn.Linear`` layer.
+    ) -> "PrismLinear":
+        """Create an PrismLinear layer from an existing ``nn.Linear`` layer.
 
         Copies the pretrained weight and bias, initializes R as identity.
 
@@ -626,10 +626,10 @@ class OFTLinear(nn.Module):
             activation: ``None`` for fine-tuning, ``"silu_gate"`` for width expansion.
             backend: Computation backend.
             autotuning: Enable automatic kernel autotuning.
-            **kwargs: Additional arguments passed to ``OFTLinear.__init__``.
+            **kwargs: Additional arguments passed to ``PrismLinear.__init__``.
 
         Returns:
-            A new OFTLinear layer with pretrained weights loaded.
+            A new PrismLinear layer with pretrained weights loaded.
         """
         layer = cls(
             in_features=linear.in_features,
@@ -779,7 +779,7 @@ class OFTLinear(nn.Module):
 
 
 def mup_fix_oft_shapes(model: nn.Module) -> None:
-    """Fix OFTLinear infshapes for correct ``mup`` LR scaling.
+    """Fix PrismLinear infshapes for correct ``mup`` LR scaling.
 
     Must be called **after** ``mup.set_base_shapes()`` and **before**
     creating the optimizer::
@@ -803,13 +803,13 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
     so that ``width_mult = K / √(base_K * K) = √(K / base_K)``.
 
     Args:
-        model: The model containing OFTLinear layers (already processed
+        model: The model containing PrismLinear layers (already processed
             by ``mup.set_base_shapes``).
     """
     from mup.infshape import InfDim, InfShape
 
     for module in model.modules():
-        if isinstance(module, OFTLinear):
+        if isinstance(module, PrismLinear):
             for name, param in module.named_parameters():
                 if not hasattr(param, "infshape"):
                     continue
@@ -825,3 +825,6 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
                         dims[-1] = InfDim(int(math.sqrt(base_K * K)), K)
                     param.infshape = InfShape(dims)
                 # weight (B) and bias: keep infshape from set_base_shapes
+
+
+mup_fix_prism_shapes = mup_fix_oft_shapes  # preferred name

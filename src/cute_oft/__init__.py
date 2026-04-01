@@ -37,7 +37,9 @@ from ._autotune import (
 )
 from ._compiler import CompilationError, clear_cache
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
-from ._module import OFTLinear, mup_fix_oft_shapes
+from ._module import PrismLinear, mup_fix_oft_shapes, mup_fix_prism_shapes
+# Backward compatibility alias
+OFTLinear = PrismLinear
 from ._loader import get_or_compile
 from ._validate import (
     check_smem_limit,
@@ -61,7 +63,9 @@ __all__ = [
     "BwdDAdRCompParams",
     "BwdDBCompParams",
     "CompilationError",
-    "OFTLinear",
+    "PrismLinear",
+    "OFTLinear",  # backward compatibility alias
+    "mup_fix_prism_shapes",
 ]
 
 BACKENDS = ("cute", "cublas", "pytorch")

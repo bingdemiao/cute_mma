@@ -65,9 +65,9 @@ dC = torch.randn_like(C)
 dA, dR, dB = cute_oft.backward(dC, A, B, R, group_size, reconn_sz, backend="cute")
 ```
 
-## `OFTLinear` module
+## `PrismLinear` module
 
-`OFTLinear` is a drop-in replacement for `torch.nn.Linear` that uses OFT structure under the hood. It manages the weight (B), reconnection matrix (R), and optional bias, and integrates with PyTorch's autograd.
+`PrismLinear` is a drop-in replacement for `torch.nn.Linear` that uses OFT structure under the hood. It manages the weight (B), reconnection matrix (R), and optional bias, and integrates with PyTorch's autograd.
 
 ### Fine-tuning a pretrained model
 
@@ -78,7 +78,7 @@ import cute_oft
 
 # Convert an existing nn.Linear layer
 pretrained_linear = model.some_layer  # nn.Linear(256, 1024)
-model.some_layer = cute_oft.OFTLinear.from_linear(
+model.some_layer = cute_oft.PrismLinear.from_linear(
     pretrained_linear,
     group_size=256, reconn_sz=8,
     autotuning=True,
@@ -97,7 +97,7 @@ for name, p in model.some_layer.named_parameters():
 Use `activation="silu_gate"` to enable gated OFT, which acts as a width expansion. Both R and B become trainable:
 
 ```python
-layer = cute_oft.OFTLinear(
+layer = cute_oft.PrismLinear(
     in_features=256, out_features=1024,
     group_size=256, reconn_sz=8,
     activation="silu_gate",
@@ -118,10 +118,10 @@ output.sum().backward()  # gradients flow to weight, reconn, and bias
 
 ### Arbitrary batch dimensions
 
-`OFTLinear` handles any number of leading batch dimensions, just like `nn.Linear`:
+`PrismLinear` handles any number of leading batch dimensions, just like `nn.Linear`:
 
 ```python
-layer = cute_oft.OFTLinear(256, 1024, group_size=256, reconn_sz=8).cuda().half()
+layer = cute_oft.PrismLinear(256, 1024, group_size=256, reconn_sz=8).cuda().half()
 x = torch.randn(2, 4, 8, 256, dtype=torch.float16, device="cuda")
 output = layer(x)  # (2, 4, 8, 1024)
 ```
@@ -256,7 +256,7 @@ cute_oft.clear_cache()
 When using multiple groups, each group's R blocks operate on the same partition of input features by default. **Input shuffle** assigns each group a different pairing of 8-element segments into R blocks, so different groups mix different feature pairs — increasing view diversity across groups.
 
 ```python
-layer = cute_oft.OFTLinear(
+layer = cute_oft.PrismLinear(
     768, 768,
     group_size=64, reconn_sz=16,
     activation="silu_gate",
@@ -290,7 +290,7 @@ In non-gated (finetuning) mode, B is frozen and expects natural column order. Wh
 
 ```python
 # Convert pretrained layer with shuffle for finetuning
-oft = cute_oft.OFTLinear.from_linear(
+oft = cute_oft.PrismLinear.from_linear(
     pretrained_linear,
     group_size=64, reconn_sz=16,
     input_shuffle=True,
@@ -312,14 +312,14 @@ Producer for group `g+1` overlaps with consumer for group `g`. The same pipelini
 For finetuning, R is parameterized via the Cayley transform to guarantee orthogonality:
 
 ```python
-layer = cute_oft.OFTLinear(
+layer = cute_oft.PrismLinear(
     768, 768,
     group_size=64, reconn_sz=16,
     cayley_order=float("inf"),  # exact Cayley: R = (I+S)(I-S)^{-1}
 )
 
 # Or use k-th order approximation for speed:
-layer = cute_oft.OFTLinear(
+layer = cute_oft.PrismLinear(
     768, 768,
     group_size=64, reconn_sz=16,
     cayley_order=2,  # R = I + 2S + 2S²  (linear cost in order)
@@ -330,24 +330,24 @@ The trainable parameter M is stored in `reconn`; at forward time, `S = M - M^T` 
 
 ## Normalization and stacking
 
-When stacking OFTLinear layers, place an `nn.GroupNorm` (with `affine=False`) **before** each OFTLinear. This serves two purposes:
+When stacking PrismLinear layers, place an `nn.GroupNorm` (with `affine=False`) **before** each PrismLinear. This serves two purposes:
 
-1. **Pre-normalization**: OFTLinear's internal gated SiLU (`h = a * SiLU(a @ R^T)`) and weight projection (`y = h @ B^T`) are calibrated for zero-mean, unit-variance input. GroupNorm ensures this.
+1. **Pre-normalization**: PrismLinear's internal gated SiLU (`h = a * SiLU(a @ R^T)`) and weight projection (`y = h @ B^T`) are calibrated for zero-mean, unit-variance input. GroupNorm ensures this.
 
 2. **Non-linear break**: The spherical projection in GroupNorm is a genuine non-linearity ([Ni et al., 2024](https://arxiv.org/abs/2406.01255)) that prevents adjacent layers from collapsing into a single linear map. No external activation (ReLU, SiLU, etc.) is needed — and omitting them keeps the backward gradient zero-centered, which matters for the backward gain correction below.
 
 Use `num_groups = in_features // group_size` to align groups with OFT's block-diagonal structure.
 
-**Backward gain correction** (built-in): The gated SiLU's multiplicative structure (`h = a * SiLU(ar)`) amplifies backward gradients by ~1.437x. OFTLinear corrects this internally with a fixed scalar (`1/1.437`) on the output gradient — no user action needed.
+**Backward gain correction** (built-in): The gated SiLU's multiplicative structure (`h = a * SiLU(ar)`) amplifies backward gradients by ~1.437x. PrismLinear corrects this internally with a fixed scalar (`1/1.437`) on the output gradient — no user action needed.
 
 ```python
 # Recommended stacking pattern
 model = nn.Sequential(
     nn.GroupNorm(in_features // group_size, in_features, affine=False),
-    OFTLinear(in_features, hidden_dim, group_size=gs, activation="silu_gate"),
+    PrismLinear(in_features, hidden_dim, group_size=gs, activation="silu_gate"),
     nn.Dropout(),
     nn.GroupNorm(hidden_dim // group_size, hidden_dim, affine=False),
-    OFTLinear(hidden_dim, hidden_dim, group_size=gs, activation="silu_gate"),
+    PrismLinear(hidden_dim, hidden_dim, group_size=gs, activation="silu_gate"),
     nn.Dropout(),
     nn.GroupNorm(hidden_dim // group_size, hidden_dim, affine=False),
     nn.Linear(hidden_dim, num_classes),
@@ -356,7 +356,7 @@ model = nn.Sequential(
 
 ## muP compatibility
 
-OFTLinear is designed to be fully compatible with the [muP](https://github.com/microsoft/mup) library (`MuAdamW`, `set_base_shapes`) and can be freely mixed with `nn.Linear` in the same model.
+PrismLinear is designed to be fully compatible with the [muP](https://github.com/microsoft/mup) library (`MuAdamW`, `set_base_shapes`) and can be freely mixed with `nn.Linear` in the same model.
 
 - **Weight B**: No runtime multiplier. Scaling is absorbed into initialization (`std = alpha/sqrt(K)` where `alpha ≈ 1.77` compensates for gated SiLU variance reduction with skew-symmetric R). muP treats B identically to `nn.Linear`.
 - **Reconnection R**: Initialized as skew-symmetric at `std = 1/sqrt(reconn_sz)`. `mup_fix_oft_shapes()` sets R's K-dimension `base_dim = sqrt(base_K * K)` giving `width_mult = sqrt(K/base_K)`, because R's output propagates through B which adds extra `O(1/sqrt(K))` damping.
@@ -372,7 +372,7 @@ mup_fix_oft_shapes(model)  # fix R's infshape
 optimizer = MuAdamW(model.parameters(), lr=0.01)
 ```
 
-## `OFTLinear` reference
+## `PrismLinear` reference
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -389,10 +389,10 @@ optimizer = MuAdamW(model.parameters(), lr=0.01)
 | `autotuning` | `False` | Enable automatic kernel autotuning |
 
 Methods:
-- `OFTLinear.from_linear(linear, ...)` — create from an existing `nn.Linear`, copying weights and bias
+- `PrismLinear.from_linear(linear, ...)` — create from an existing `nn.Linear`, copying weights and bias
 - `load_pretrained_weight(weight, bias=None)` — load pretrained weight/bias tensors (permutes B columns per group when `input_shuffle=True` in finetuning mode)
 - `reconn_diag_sq_sum()` — diagnostic: sum of squared diagonal elements of R blocks
-- `mup_fix_oft_shapes(model)` — fix OFTLinear infshapes for correct muP LR scaling
+- `mup_fix_oft_shapes(model)` — fix PrismLinear infshapes for correct muP LR scaling
 
 ## Configuration classes
 
