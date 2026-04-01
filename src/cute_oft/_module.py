@@ -31,39 +31,43 @@ class _BwdScaleFn(torch.autograd.Function):
         return grad_y * ctx.bwd_scale, None
 
 
-class BidirectionalNorm(nn.Module):
-    """Normalizes forward activations and corrects backward gradient scale.
+class GroupLayerNorm(nn.Module):
+    """GroupLayerNorm with backward gradient rescaling for OFTLinear.
 
-    - No running statistics — works identically from step 0
-    - No train/eval mode difference
-    - No batch size dependence
-    - No learnable parameters (``elementwise_affine=False``) for muP
+    Forward: Divides features into groups of ``group_size`` and applies
+    LayerNorm independently within each group (zero mean, unit variance).
+    This serves as both the pre-normalization for OFT and a non-linear
+    break between stacked OFTLinear layers — the spherical projection
+    in LayerNorm is a genuine non-linearity that prevents layer collapse
+    (Ni et al., 2024, arXiv:2406.01255).
 
-    Forward: LayerNorm normalizes input to zero mean and unit variance
-    per sample, which is what OFT expects.
+    Backward: A fixed scalar (``1 / bwd_gain``) corrects the backward
+    gain from the gated SiLU activation inside OFTLinear. The gradient
+    remains zero-centered (GroupLayerNorm backward preserves zero mean).
 
-    Backward: A fixed scalar (``1 / bwd_gain``) corrects the ~1.47x
-    backward gain from the gated SiLU activation's multiplicative
-    structure (``h = a * SiLU(ar)``). Unlike normalization, a fixed
-    scalar preserves the gradient's natural magnitude, mean, and
-    direction — it only corrects the known per-layer amplification
-    without inflating naturally small gradients.
+    No learnable parameters, no running statistics, no train/eval
+    mode difference, no batch size dependence. Compatible with muP.
 
     Args:
-        num_features: Number of features (channels) to normalize.
-        bwd_gain: The backward/forward gain ratio to correct.
-            Default 1.47 for gated SiLU.
+        num_features: Total number of features.
+        group_size: Features per group (typically matches OFT group_size).
+        bwd_gain: Backward gain to correct (default: gated SiLU = 1.437).
     """
 
-    def __init__(self, num_features: int,
+    def __init__(self, num_features: int, group_size: int,
                  bwd_gain: float = _GATED_SILU_BWD_GAIN):
         super().__init__()
-        self.fwd_norm = nn.LayerNorm(num_features, elementwise_affine=False)
+        assert num_features % group_size == 0
+        self.num_groups = num_features // group_size
+        self.group_size = group_size
         self.bwd_scale = 1.0 / bwd_gain
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
-        x = self.fwd_norm(x.float()).to(dtype)
+        B, D = x.shape
+        x = x.float().view(B, self.num_groups, self.group_size)
+        x = F.layer_norm(x, (self.group_size,))
+        x = x.view(B, D).to(dtype)
         x = _BwdScaleFn.apply(x, self.bwd_scale)
         return x
 
@@ -472,11 +476,10 @@ class OFTLinear(nn.Module):
             )
             self.register_buffer("_seg_pairs", seg_pairs)
 
-        # Bidirectional normalization: LayerNorm in forward (for correct OFT
-        # signal scale) + fixed scalar in backward (correcting the per-layer
-        # backward gain from multiplicative gating).
+        # GroupLayerNorm: normalizes within groups of group_size (non-linear
+        # break between layers) + backward scalar correction for gated SiLU gain.
         bwd_gain = _GATED_SILU_BWD_GAIN if activation == "silu_gate" else 1.0
-        self.input_norm = BidirectionalNorm(in_features, bwd_gain=bwd_gain)
+        self.input_norm = GroupLayerNorm(in_features, group_size, bwd_gain=bwd_gain)
 
         self.reset_parameters()
 
@@ -688,7 +691,7 @@ class OFTLinear(nn.Module):
         orig_shape = input.shape
         A = input.reshape(-1, self.in_features)
 
-        # Bidirectional normalization: forward LayerNorm + backward gradient LayerNorm
+        # GroupLayerNorm: forward normalization + backward gain correction
         A = self.input_norm(A)
 
         if self._weight_multiplier != 1.0:
@@ -861,4 +864,4 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
                         dims[-1] = InfDim(int(math.sqrt(base_K * K)), K)
                     param.infshape = InfShape(dims)
                 # weight (B) and bias: keep infshape from set_base_shapes
-                # input_norm: LayerNorm with elementwise_affine=False (no learnable params)
+                # input_norm: GroupLayerNorm (no learnable params)
