@@ -31,45 +31,6 @@ class _BwdScaleFn(torch.autograd.Function):
         return grad_y * ctx.bwd_scale, None
 
 
-class GroupLayerNorm(nn.Module):
-    """GroupLayerNorm with backward gradient rescaling for OFTLinear.
-
-    Forward: Divides features into groups of ``group_size`` and applies
-    LayerNorm independently within each group (zero mean, unit variance).
-    This serves as both the pre-normalization for OFT and a non-linear
-    break between stacked OFTLinear layers — the spherical projection
-    in LayerNorm is a genuine non-linearity that prevents layer collapse
-    (Ni et al., 2024, arXiv:2406.01255).
-
-    Backward: A fixed scalar (``1 / bwd_gain``) corrects the backward
-    gain from the gated SiLU activation inside OFTLinear. The gradient
-    remains zero-centered (GroupLayerNorm backward preserves zero mean).
-
-    No learnable parameters, no running statistics, no train/eval
-    mode difference, no batch size dependence. Compatible with muP.
-
-    Args:
-        num_features: Total number of features.
-        group_size: Features per group (typically matches OFT group_size).
-        bwd_gain: Backward gain to correct (default: gated SiLU = 1.437).
-    """
-
-    def __init__(self, num_features: int, group_size: int,
-                 bwd_gain: float = _GATED_SILU_BWD_GAIN):
-        super().__init__()
-        assert num_features % group_size == 0
-        self.num_groups = num_features // group_size
-        self.group_size = group_size
-        self.bwd_scale = 1.0 / bwd_gain
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        B, D = x.shape
-        x = x.float().view(B, self.num_groups, self.group_size)
-        x = F.layer_norm(x, (self.group_size,))
-        x = x.view(B, D).to(dtype)
-        x = _BwdScaleFn.apply(x, self.bwd_scale)
-        return x
 
 _shuffle_module = None
 _shuffle_lock = __import__("threading").Lock()
@@ -476,10 +437,14 @@ class OFTLinear(nn.Module):
             )
             self.register_buffer("_seg_pairs", seg_pairs)
 
-        # GroupLayerNorm: normalizes within groups of group_size (non-linear
-        # break between layers) + backward scalar correction for gated SiLU gain.
+        # GroupNorm pre-normalization: non-linear break between layers
+        # (Ni et al., arXiv:2406.01255) + zero-mean unit-variance input for OFT.
+        num_groups = in_features // group_size
+        self.input_norm = nn.GroupNorm(num_groups, in_features, affine=False)
+
+        # Backward scalar correction for gated SiLU's multiplicative gain
         bwd_gain = _GATED_SILU_BWD_GAIN if activation == "silu_gate" else 1.0
-        self.input_norm = GroupLayerNorm(in_features, group_size, bwd_gain=bwd_gain)
+        self._bwd_scale = 1.0 / bwd_gain
 
         self.reset_parameters()
 
@@ -691,8 +656,8 @@ class OFTLinear(nn.Module):
         orig_shape = input.shape
         A = input.reshape(-1, self.in_features)
 
-        # GroupLayerNorm: forward normalization + backward gain correction
-        A = self.input_norm(A)
+        # GroupNorm pre-normalization (non-linear break between layers)
+        A = self.input_norm(A.float()).to(A.dtype)
 
         if self._weight_multiplier != 1.0:
             B = self._weight_multiplier * self.weight
@@ -712,6 +677,10 @@ class OFTLinear(nn.Module):
                 self.backend, self.activation or "",
                 self.autotuning, self.force_rebenchmark,
             )
+
+        # Correct backward gain from gated SiLU's multiplicative structure
+        if self._bwd_scale != 1.0:
+            C = _BwdScaleFn.apply(C, self._bwd_scale)
 
         # Restore leading dimensions
         out_shape = orig_shape[:-1] + (self.out_features,)
