@@ -15,90 +15,56 @@ from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 SHUFFLE_SEGMENT_SZ = 8  # 128-bit vectorized load = 8 x fp16
 
 
-class _BwdNormFn(torch.autograd.Function):
-    """Apply batch normalization to gradients in the backward pass only."""
+_GATED_SILU_BWD_GAIN = 1.47  # measured backward/forward gain ratio for gated SiLU
+
+
+class _BwdScaleFn(torch.autograd.Function):
+    """Multiply gradients by a fixed scalar in the backward pass only."""
 
     @staticmethod
-    def forward(ctx, x, bwd_bn, training, calibrated_flag):
-        ctx.bwd_bn = bwd_bn
-        ctx.training = training
-        ctx.calibrated_flag = calibrated_flag
-        return x  # identity in forward
+    def forward(ctx, x, bwd_scale):
+        ctx.bwd_scale = bwd_scale
+        return x.clone()  # clone to avoid inplace-on-view issues with ReLU
 
     @staticmethod
     def backward(ctx, grad_y):
-        bwd_bn = ctx.bwd_bn
-        # Calibrate bwd_bn running stats from first gradient batch
-        # (single scalar across all channels for robustness)
-        if not ctx.calibrated_flag[0]:
-            with torch.no_grad():
-                bwd_bn.running_mean.fill_(grad_y.mean().item())
-                bwd_bn.running_var.fill_(grad_y.var().item())
-            ctx.calibrated_flag[0] = True
-        was_training = bwd_bn.training
-        bwd_bn.train(ctx.training)
-        with torch.no_grad():
-            grad_normalized = bwd_bn(grad_y)
-        bwd_bn.train(was_training)
-        return grad_normalized, None, None, None
+        return grad_y * ctx.bwd_scale, None
 
 
-class BidirectionalBatchNorm(nn.Module):
-    """BatchNorm that normalizes both forward activations and backward gradients.
+class BidirectionalNorm(nn.Module):
+    """Normalizes forward activations and corrects backward gradient scale.
 
-    Contains two internal BatchNorm1d layers (both ``affine=False``):
+    - No running statistics — works identically from step 0
+    - No train/eval mode difference
+    - No batch size dependence
+    - No learnable parameters (``elementwise_affine=False``) for muP
 
-    - ``fwd_bn``: BatchNorm applied in the forward pass. Normalizes input
-      to zero mean and unit variance for correct OFT signal scale.
+    Forward: LayerNorm normalizes input to zero mean and unit variance
+    per sample, which is what OFT expects.
 
-    - ``bwd_bn``: BatchNorm applied to gradients in the backward pass via
-      a custom autograd Function. Normalizes the gradient to unit variance,
-      counteracting the ~1.47x backward gain from the gated SiLU
-      activation's multiplicative structure.
-
-    Both layers are non-learnable (``affine=False``) to preserve muP
-    scaling — per-element affine parameters have no fan-in summation,
-    so their updates wouldn't decay with width.
-
-    On the first forward/backward pass, running statistics are calibrated
-    directly from batch statistics (rather than slowly converging from
-    the default ``mean=0, var=1``). This avoids gradient blowup in fp16
-    during early iterations.
+    Backward: A fixed scalar (``1 / bwd_gain``) corrects the ~1.47x
+    backward gain from the gated SiLU activation's multiplicative
+    structure (``h = a * SiLU(ar)``). Unlike normalization, a fixed
+    scalar preserves the gradient's natural magnitude, mean, and
+    direction — it only corrects the known per-layer amplification
+    without inflating naturally small gradients.
 
     Args:
         num_features: Number of features (channels) to normalize.
+        bwd_gain: The backward/forward gain ratio to correct.
+            Default 1.47 for gated SiLU.
     """
 
-    def __init__(self, num_features: int):
+    def __init__(self, num_features: int,
+                 bwd_gain: float = _GATED_SILU_BWD_GAIN):
         super().__init__()
-        # affine=False: OFT expects unit-variance input, so learnable gamma/beta
-        # would fight the normalization and break muP scaling (per-element scalars
-        # have no fan-in, so their delta_y doesn't decay with width).
-        self.fwd_bn = nn.BatchNorm1d(num_features, affine=False)
-        self.bwd_bn = nn.BatchNorm1d(num_features, affine=False)
-        self._fwd_calibrated = False
-        # Mutable container so _BwdNormFn can set it from backward()
-        self._bwd_calibrated = [False]
-
-    @staticmethod
-    def _calibrate(bn: nn.BatchNorm1d, x: torch.Tensor) -> None:
-        """Set running stats from global (all-channel) batch statistics.
-
-        Uses a single scalar mean/var across all channels rather than
-        per-channel estimates — more robust with small batch sizes since
-        the estimate comes from B*K samples instead of K separate B-sample
-        estimates. Subsequent BN updates will refine per-channel details.
-        """
-        with torch.no_grad():
-            bn.running_mean.fill_(x.mean().item())
-            bn.running_var.fill_(x.var().item())
+        self.fwd_norm = nn.LayerNorm(num_features, elementwise_affine=False)
+        self.bwd_scale = 1.0 / bwd_gain
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training and not self._fwd_calibrated:
-            self._calibrate(self.fwd_bn, x)
-            self._fwd_calibrated = True
-        x = self.fwd_bn(x)
-        x = _BwdNormFn.apply(x, self.bwd_bn, self.training, self._bwd_calibrated)
+        dtype = x.dtype
+        x = self.fwd_norm(x.float()).to(dtype)
+        x = _BwdScaleFn.apply(x, self.bwd_scale)
         return x
 
 _shuffle_module = None
@@ -506,10 +472,11 @@ class OFTLinear(nn.Module):
             )
             self.register_buffer("_seg_pairs", seg_pairs)
 
-        # Bidirectional batch normalization: normalizes input in forward
-        # (for correct Layer 1/2 interaction) and normalizes gradients in
-        # backward (counteracting the ~1.47x gain from multiplicative gating).
-        self.input_norm = BidirectionalBatchNorm(in_features)
+        # Bidirectional normalization: LayerNorm in forward (for correct OFT
+        # signal scale) + fixed scalar in backward (correcting the per-layer
+        # backward gain from multiplicative gating).
+        bwd_gain = _GATED_SILU_BWD_GAIN if activation == "silu_gate" else 1.0
+        self.input_norm = BidirectionalNorm(in_features, bwd_gain=bwd_gain)
 
         self.reset_parameters()
 
@@ -721,7 +688,7 @@ class OFTLinear(nn.Module):
         orig_shape = input.shape
         A = input.reshape(-1, self.in_features)
 
-        # Bidirectional normalization: forward BN + backward gradient BN
+        # Bidirectional normalization: forward LayerNorm + backward gradient LayerNorm
         A = self.input_norm(A)
 
         if self._weight_multiplier != 1.0:
@@ -894,4 +861,4 @@ def mup_fix_oft_shapes(model: nn.Module) -> None:
                         dims[-1] = InfDim(int(math.sqrt(base_K * K)), K)
                     param.infshape = InfShape(dims)
                 # weight (B) and bias: keep infshape from set_base_shapes
-                # input_norm: fwd_bn and bwd_bn are both affine=False (no learnable params)
+                # input_norm: LayerNorm with elementwise_affine=False (no learnable params)
