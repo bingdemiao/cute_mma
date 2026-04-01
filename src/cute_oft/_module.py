@@ -15,7 +15,7 @@ from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 SHUFFLE_SEGMENT_SZ = 8  # 128-bit vectorized load = 8 x fp16
 
 
-_GATED_SILU_BWD_GAIN = 1.47  # measured backward/forward gain ratio for gated SiLU
+_GATED_SILU_BWD_GAIN = 1.437  # measured bwd/fwd gain ratio for gated SiLU (M=32768, 10 seeds)
 
 
 class _BwdScaleFn(torch.autograd.Function):
