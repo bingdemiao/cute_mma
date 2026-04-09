@@ -883,16 +883,20 @@ def mup_fix_prism_shapes(model: nn.Module) -> None:
     where ``width_mult = K / base_K``, giving O(1/√K) output change
     per Adam step.
 
-    **Reconnection R** (``reconn``): Each PrismLinear group is a two-layer
-    sub-network: R is the input layer (block-diagonal, fan-in = reconn_sz),
-    B is the output layer (dense, fan-in = K). Under the multi-head muP
-    view, R plays the role of an input weight — its per-step contribution
-    to delta_C is O(1) (damped to O(1/√K) by downstream B), analogous to
-    how attention Wq/Wk/Wv don't get width-dependent LR scaling while Wo
-    does. Therefore R needs ``width_mult = 1`` (no K-dependent LR scaling).
+    **Reconnection R** (``reconn``): R is block-diagonal with K/r blocks
+    of size r × r (r = reconn_sz). Its fan-in and fan-out are both r,
+    independent of the model width K. In muP, each parameter's LR
+    scaling depends on its own width dimension, not on downstream layers.
+    Since R's effective width is r (constant), its LR should have no
+    K-dependent scaling — analogous to how attention Wq/Wk/Wv (which
+    operate at head_dim, not d_model) don't get width-dependent LR
+    scaling while Wo does.
 
     We achieve this by marking R's K-dimension as finite (``base_dim = K``),
-    so MuAdamW treats it as a fixed-size parameter.
+    so MuAdamW treats it as a fixed-size parameter and applies no LR
+    scaling. The O(1) per-step output perturbation from R is damped to
+    O(1/√K) by the downstream B projection, just as attention head
+    outputs are damped by Wo.
 
     Args:
         model: The model containing PrismLinear layers (already processed
