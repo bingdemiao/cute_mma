@@ -1,13 +1,16 @@
 #include <torch/extension.h>
 
-torch::Tensor cublas_prism_forward(
+std::vector<torch::Tensor> cublas_prism_forward(
     torch::Tensor A,
     torch::Tensor B,
     torch::Tensor R,
     int64_t group_size,
     int64_t reconn_sz,
     bool rw_mode,
-    bool gated);
+    bool gated,
+    c10::optional<torch::Tensor> internal_bias,
+    double dropout_p,
+    bool training);
 
 std::vector<torch::Tensor> cublas_backward_dA_dR(
     torch::Tensor dC,
@@ -17,7 +20,10 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
     int64_t group_size,
     int64_t reconn_sz,
     bool gated,
-    c10::optional<at::ScalarType> dR_dtype);
+    c10::optional<at::ScalarType> dR_dtype,
+    c10::optional<torch::Tensor> internal_bias,
+    c10::optional<torch::Tensor> dropout_seeds,
+    double dropout_p);
 
 torch::Tensor cublas_backward_dB(
     torch::Tensor dC,
@@ -26,7 +32,10 @@ torch::Tensor cublas_backward_dB(
     int64_t group_size,
     int64_t reconn_sz,
     bool gated,
-    c10::optional<at::ScalarType> dB_dtype);
+    c10::optional<at::ScalarType> dB_dtype,
+    c10::optional<torch::Tensor> internal_bias,
+    c10::optional<torch::Tensor> dropout_seeds,
+    double dropout_p);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &cublas_prism_forward,
@@ -37,9 +46,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("group_size") = 256,
           py::arg("reconn_sz") = 8,
           py::arg("rw_mode") = false,
-          py::arg("gated") = false);
+          py::arg("gated") = false,
+          py::arg("internal_bias") = py::none(),
+          py::arg("dropout_p") = 0.0,
+          py::arg("training") = false);
     m.def("backward_dA_dR", &cublas_backward_dA_dR,
-          "Prism backward (cuBLAS): compute dA, dR",
+          "Prism backward (cuBLAS): compute dA, dR, d_internal_bias",
           py::arg("dC"),
           py::arg("A"),
           py::arg("B"),
@@ -47,7 +59,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("group_size") = 256,
           py::arg("reconn_sz") = 8,
           py::arg("gated") = false,
-          py::arg("dR_dtype") = py::none());
+          py::arg("dR_dtype") = py::none(),
+          py::arg("internal_bias") = py::none(),
+          py::arg("dropout_seeds") = py::none(),
+          py::arg("dropout_p") = 0.0);
     m.def("backward_dB", &cublas_backward_dB,
           "Prism backward (cuBLAS): compute dB",
           py::arg("dC"),
@@ -56,5 +71,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("group_size") = 256,
           py::arg("reconn_sz") = 8,
           py::arg("gated") = false,
-          py::arg("dB_dtype") = py::none());
+          py::arg("dB_dtype") = py::none(),
+          py::arg("internal_bias") = py::none(),
+          py::arg("dropout_seeds") = py::none(),
+          py::arg("dropout_p") = 0.0);
 }

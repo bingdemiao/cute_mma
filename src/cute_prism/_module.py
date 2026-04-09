@@ -160,6 +160,61 @@ def _prism_backward(ctx, dC):
 _prism_forward_op.register_autograd(_prism_backward, setup_context=_prism_setup_context)
 
 
+class _PrismWithBiasDropoutFn(torch.autograd.Function):
+    """Autograd wrapper that threads internal_bias and dropout through Prism."""
+
+    @staticmethod
+    def forward(ctx, A, B, R, group_size, reconn_sz, backend, activation,
+                autotuning, force_rebenchmark, internal_bias, dropout_p, training):
+        from . import forward as prism_forward
+
+        C, dropout_seeds = prism_forward(
+            A, B, R, group_size, reconn_sz,
+            backend=backend,
+            activation=activation or None,
+            autotuning=autotuning,
+            force_rebenchmark=force_rebenchmark,
+            internal_bias=internal_bias,
+            dropout_p=dropout_p,
+            training=training,
+        )
+        ctx.save_for_backward(A, B, R, internal_bias)
+        ctx.group_size = group_size
+        ctx.reconn_sz = reconn_sz
+        ctx.backend = backend
+        ctx.activation = activation
+        ctx.autotuning = autotuning
+        ctx.force_rebenchmark = force_rebenchmark
+        ctx.dropout_p = dropout_p
+        ctx.dropout_seeds = dropout_seeds
+        return C
+
+    @staticmethod
+    def backward(ctx, dC):
+        from . import backward as prism_backward
+
+        A, B, R, internal_bias = ctx.saved_tensors
+
+        dA, dR, dB, d_ib = prism_backward(
+            dC.contiguous(), A.contiguous(), B.contiguous(), R.contiguous(),
+            ctx.group_size, ctx.reconn_sz,
+            backend=ctx.backend,
+            activation=ctx.activation or None,
+            autotuning=ctx.autotuning,
+            force_rebenchmark=ctx.force_rebenchmark,
+            internal_bias=internal_bias,
+            dropout_seeds=ctx.dropout_seeds,
+            dropout_p=ctx.dropout_p,
+        )
+
+        if dB is None:
+            dB = torch.zeros_like(B)
+
+        # Grads: A, B, R, then None x 6 scalar args, internal_bias, None x 2
+        return dA, dB, dR, None, None, None, None, None, None, d_ib, None, None
+
+
+
 def _round_robin_matchings(n: int) -> list[list[tuple[int, int]]]:
     """Generate all unique perfect matchings via round-robin tournament.
 
@@ -305,6 +360,10 @@ class PrismLinear(nn.Module):
         comp_params: Explicit forward kernel configuration.
         bwd_dadr_params: Explicit backward dA+dR kernel configuration.
         bwd_db_params: Explicit backward dB kernel configuration.
+        internal_bias: If True, adds a learnable bias after A @ R^T, before
+            the SiLU gate (gated mode only). Shape (n_groups, in_features).
+        dropout: Dropout probability applied to the gated activation
+            H = A * SiLU(A @ R^T + b) before projection through B.
 
     Shape:
         - Input: ``(*, in_features)`` where ``*`` means any number of leading dimensions.
@@ -340,6 +399,8 @@ class PrismLinear(nn.Module):
         comp_params: CompParams | None = None,
         bwd_dadr_params: BwdDAdRCompParams | None = None,
         bwd_db_params: BwdDBCompParams | None = None,
+        internal_bias: bool = False,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -430,6 +491,15 @@ class PrismLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        # Internal bias: added after A @ R^T, before SiLU gate (gated mode only)
+        if internal_bias and gated:
+            self._internal_bias = nn.Parameter(
+                torch.empty(n_groups, in_features))
+        else:
+            self.register_parameter("_internal_bias", None)
+
+        self.dropout = dropout
+
         # Input shuffle: build per-group segment pair indices
         if input_shuffle:
             seg_pairs = _build_seg_pairs(
@@ -491,6 +561,12 @@ class PrismLinear(nn.Module):
             fan_in = self.in_features
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
+
+        if self._internal_bias is not None:
+            # Scale so that std(AR + bias) matches std(AR) at init.
+            # bias std ~ std(R @ x) to keep total variance ~ 2x original.
+            nn.init.normal_(self._internal_bias,
+                            std=1.0 / math.sqrt(self.reconn_sz))
 
     def _build_R(self) -> torch.Tensor:
         """Construct the reconnection matrix R from the stored parameter.
@@ -660,6 +736,15 @@ class PrismLinear(nn.Module):
 
         if self.input_shuffle:
             C = self._forward_shuffle(A, B, R)
+        elif self._internal_bias is not None or self.dropout > 0.0:
+            # Use dedicated autograd function that handles bias + dropout
+            C = _PrismWithBiasDropoutFn.apply(
+                A, B, R,
+                self.group_size, self.reconn_sz,
+                self.backend, self.activation or "",
+                self.autotuning, self.force_rebenchmark,
+                self._internal_bias, self.dropout, self.training,
+            )
         else:
             # The custom op call is opaque to torch.compile — no graph breaks.
             # activation="" is used as sentinel for None (custom_op requires str).
@@ -769,6 +854,10 @@ class PrismLinear(nn.Module):
             parts.append(f"activation={self.activation!r}")
         if self.activation is None:
             parts.append(f"cayley_order={self.cayley_order}")
+        if self._internal_bias is not None:
+            parts.append("internal_bias=True")
+        if self.dropout > 0.0:
+            parts.append(f"dropout={self.dropout}")
         if self.input_shuffle:
             parts.append(f"input_shuffle=True, shuffle_blk_k={self.shuffle_blk_k}")
         if self.backend != "cute":
@@ -794,13 +883,16 @@ def mup_fix_prism_shapes(model: nn.Module) -> None:
     where ``width_mult = K / base_K``, giving O(1/√K) output change
     per Adam step.
 
-    **Reconnection R** (``reconn``): R's contribution to the output goes
-    through ``delta_AR @ B^T``, where B is O(1/√K). This extra damping
-    means R needs ``width_mult = √(K/base_K)`` (not ``K/base_K``) so that
-    ``lr_R = lr / √(K/base_K)`` gives O(1/√K) output change — matching B.
+    **Reconnection R** (``reconn``): Each PrismLinear group is a two-layer
+    sub-network: R is the input layer (block-diagonal, fan-in = reconn_sz),
+    B is the output layer (dense, fan-in = K). Under the multi-head muP
+    view, R plays the role of an input weight — its per-step contribution
+    to delta_C is O(1) (damped to O(1/√K) by downstream B), analogous to
+    how attention Wq/Wk/Wv don't get width-dependent LR scaling while Wo
+    does. Therefore R needs ``width_mult = 1`` (no K-dependent LR scaling).
 
-    We achieve this by setting R's K-dimension ``base_dim = √(base_K * K)``
-    so that ``width_mult = K / √(base_K * K) = √(K / base_K)``.
+    We achieve this by marking R's K-dimension as finite (``base_dim = K``),
+    so MuAdamW treats it as a fixed-size parameter.
 
     Args:
         model: The model containing PrismLinear layers (already processed
@@ -815,14 +907,14 @@ def mup_fix_prism_shapes(model: nn.Module) -> None:
                     continue
                 if name == "reconn":
                     # R shape: (n_groups * reconn_sz, K)
-                    # Set K dim's base_dim = sqrt(base_K * K) so that
-                    # width_mult = K / sqrt(base_K * K) = sqrt(K / base_K)
+                    # Mark K dim as finite so width_mult = 1 and MuAdamW
+                    # applies no LR scaling. R's block-diagonal structure
+                    # means its effective fan-in is reconn_sz (constant),
+                    # and it acts as the input layer in each group's
+                    # two-layer sub-network.
                     dims = list(param.infshape)
-                    K_dim = dims[-1]
-                    if K_dim.base_dim is not None:
-                        K = K_dim.dim
-                        base_K = K_dim.base_dim
-                        dims[-1] = InfDim(int(math.sqrt(base_K * K)), K)
+                    K = dims[-1].dim
+                    dims[-1] = InfDim(K, K)  # base_dim = dim → width_mult = 1
                     param.infshape = InfShape(dims)
                 # weight (B) and bias: keep infshape from set_base_shapes
 

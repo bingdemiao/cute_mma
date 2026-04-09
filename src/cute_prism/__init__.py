@@ -83,7 +83,10 @@ def forward(
     autotuning: bool = False,
     autotuning_search_space: Iterable[CompParams | tuple[CompParams, Callable]] | None = None,
     force_rebenchmark: bool = False,
-) -> torch.Tensor:
+    internal_bias: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    training: bool = False,
+) -> tuple[torch.Tensor, list[int] | torch.Tensor]:
     """Compute C = A @ diag(R) @ B^T with Prism structure.
 
     Args:
@@ -99,9 +102,15 @@ def forward(
         activation: Optional non-linearity ("silu_gate" or None).
         autotuning: When True, check cache first, autotune if miss, use best config.
         autotuning_search_space: Custom search space for autotuning (uses default if None).
+        internal_bias: Optional bias added after A @ R^T, before SiLU gate.
+            Shape (n_groups, K). Only used in gated mode.
+        dropout_p: Dropout probability applied to H = A * SiLU(AR + bias).
+        training: Whether in training mode (dropout only active when True).
 
     Returns:
-        Output tensor of shape (M, N), same dtype as inputs, CUDA.
+        (C, dropout_seeds) — C is the output tensor of shape (M, N).
+        dropout_seeds is a list[int] (pytorch) or Tensor (cublas) of per-group
+        seeds for backward replay. Empty/zeros when dropout is inactive.
     """
     if backend not in BACKENDS:
         raise ValueError(
@@ -125,14 +134,17 @@ def forward(
     gated = activation == "silu_gate"
 
     validate_kernel_params(group_size, reconn_sz)
-    validate_tensor_params(A, B, R, group_size, reconn_sz)
 
     if backend == "pytorch":
         from ._pytorch_backend import pytorch_forward
         return pytorch_forward(
             A, B, R, group_size, reconn_sz,
             rw_mode=(mode == "rw"), activation=activation,
+            internal_bias=internal_bias,
+            dropout_p=dropout_p, training=training,
         )
+
+    validate_tensor_params(A, B, R, group_size, reconn_sz)
 
     if backend == "cute":
         if comp_params == "auto" or (autotuning and comp_params is None):
@@ -166,11 +178,15 @@ def forward(
                 group_size, reconn_sz, backend, comp_params,
                 gated=gated, kernel_type="fwd",
             )
-        return module.forward(A, B, R, group_size, reconn_sz)
+        return module.forward(A, B, R, group_size, reconn_sz), []
 
     # cublas backend
     module = get_or_compile(group_size, reconn_sz, backend, comp_params)
-    return module.forward(A, B, R, group_size, reconn_sz, mode == "rw", gated)
+    results = module.forward(
+        A, B, R, group_size, reconn_sz, mode == "rw", gated,
+        internal_bias, dropout_p, training,
+    )
+    return results[0], results[1]
 
 
 def backward(
@@ -191,7 +207,10 @@ def backward(
     force_rebenchmark: bool = False,
     dR_dtype: torch.dtype | None = None,
     dB_dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    internal_bias: torch.Tensor | None = None,
+    dropout_seeds: list[int] | torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Compute gradients for Prism backward pass.
 
     Recomputes intermediate activations (AR or A*SiLU(AR)) from inputs
@@ -219,10 +238,14 @@ def backward(
             Useful for mixed-precision training (e.g. torch.float32).
         dB_dtype: Optional dtype for dB gradient (default: B.dtype).
             Useful for mixed-precision training (e.g. torch.float32).
+        internal_bias: Same internal_bias used in forward (for recompute).
+        dropout_seeds: Per-group seeds from forward pass for mask replay.
+        dropout_p: Dropout probability (must match forward).
 
     Returns:
-        (dA, dR, dB) — gradients w.r.t. A, R, B respectively.
+        (dA, dR, dB, d_internal_bias) — gradients w.r.t. A, R, B, internal_bias.
         dB is None when activation is None (non-gated mode).
+        d_internal_bias is None when internal_bias is None.
     """
     if activation not in ACTIVATIONS:
         raise ValueError(
@@ -230,23 +253,44 @@ def backward(
         )
 
     validate_kernel_params(group_size, reconn_sz)
-    validate_tensor_params(A, B, R, group_size, reconn_sz)
 
     gated = activation == "silu_gate"
 
     if backend == "pytorch":
         from ._pytorch_backend import pytorch_backward
-        return pytorch_backward(dC, A, B, R, group_size, reconn_sz, activation=activation)
+        # Convert tensor seeds to list for pytorch backend
+        py_seeds = None
+        if dropout_seeds is not None:
+            if isinstance(dropout_seeds, torch.Tensor):
+                py_seeds = dropout_seeds.tolist()
+            else:
+                py_seeds = dropout_seeds
+        return pytorch_backward(
+            dC, A, B, R, group_size, reconn_sz,
+            activation=activation, internal_bias=internal_bias,
+            dropout_seeds=py_seeds, dropout_p=dropout_p,
+        )
+
+    validate_tensor_params(A, B, R, group_size, reconn_sz)
 
     if backend == "cublas":
         module = get_or_compile(group_size, reconn_sz, backend)
-        grads = module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz, gated, dR_dtype)
+        # dropout_seeds is a Tensor from cublas forward
+        ds_tensor = dropout_seeds if isinstance(dropout_seeds, torch.Tensor) else None
+        grads = module.backward_dA_dR(
+            dC, A, B, R, group_size, reconn_sz, gated, dR_dtype,
+            internal_bias, ds_tensor, dropout_p,
+        )
         dA, dR = grads[0], grads[1]
+        d_ib = grads[2] if (len(grads) > 2 and grads[2] is not None and grads[2].numel() > 0) else None
         if gated:
-            dB_out = module.backward_dB(dC, A, R, group_size, reconn_sz, gated, dB_dtype)
+            dB_out = module.backward_dB(
+                dC, A, R, group_size, reconn_sz, gated, dB_dtype,
+                internal_bias, ds_tensor, dropout_p,
+            )
         else:
             dB_out = None
-        return dA, dR, dB_out
+        return dA, dR, dB_out, d_ib
 
     if backend == "cute":
         M, K = A.shape
@@ -312,7 +356,7 @@ def backward(
         else:
             dB_out = None
 
-        return dA, dR, dB_out
+        return dA, dR, dB_out, None
 
     raise ValueError(
         f"Backend {backend!r} is not yet supported for backward pass."
