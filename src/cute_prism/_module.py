@@ -795,8 +795,16 @@ class PrismLinear(nn.Module):
 
         When backend='cublas', uses the CUDA kernel with autograd support.
         When backend='pytorch', uses pure PyTorch ops (reference/testing).
+        The cublas kernel does not support internal_bias / dropout, so we
+        fall back to the pytorch path whenever either is active.
         """
-        if self.backend == "cublas" and A.is_cuda:
+        use_kernel = (
+            self.backend == "cublas"
+            and A.is_cuda
+            and self._internal_bias is None
+            and self.dropout == 0.0
+        )
+        if use_kernel:
             return _ShufflePrismFunction.apply(
                 A, B, R, self._seg_pairs,
                 self.group_size, self.reconn_sz,
@@ -834,8 +842,17 @@ class PrismLinear(nn.Module):
 
             if gated:
                 H_perm = A_perm * F.silu(AR_perm)
+            
+            # option b:
+            # if gated:
+            #     alpha = 4.0
+            #     H_perm = A_perm * torch.sigmoid(alpha * AR_perm)
             else:
                 H_perm = AR_perm
+            
+            # adding inner dropout part
+            # if self.inner_dropout > 0.0:
+            #     H_perm = F.dropout(H_perm, p=self.inner_dropout, training=self.training)
 
             B_g = B[g * self.group_size : (g + 1) * self.group_size]
             C[:, g * self.group_size : (g + 1) * self.group_size] = torch.mm(H_perm, B_g.T)
