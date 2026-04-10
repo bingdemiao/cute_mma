@@ -262,7 +262,7 @@ layer = cute_prism.PrismLinear(
     activation="silu_gate",
     backend="cublas",
     input_shuffle=True,    # enable per-group segment shuffling
-    shuffle_blk_k=128,     # permutation locality (max 256, for dAdR kernel compat)
+    shuffle_blk_k=128,     # permutation locality
 )
 ```
 
@@ -281,7 +281,6 @@ The segment pair assignments are stored as a buffer (`_seg_pairs`) and saved wit
 | Constraint | Reason |
 |---|---|
 | `reconn_sz=16` | Each R block pairs exactly 2 segments of 8 elements |
-| `shuffle_blk_k ≤ 256` | Permutation must be local within dAdR backward kernel's BLK_K tile |
 | `backend ≠ "cute"` | CuTe fused kernel does not support shuffle (use `cublas` or `pytorch`) |
 
 ### Shuffle in finetuning mode
@@ -384,7 +383,7 @@ optimizer = MuAdamW(model.parameters(), lr=0.01)
 | `activation` | `None` | `None` (standard mode) or `"silu_gate"` (gated/width expansion) |
 | `cayley_order` | `inf` | Cayley approximation order (`inf` = exact, `k` = k-th order) |
 | `input_shuffle` | `False` | Per-group segment shuffling for cross-block feature mixing |
-| `shuffle_blk_k` | `128` | Shuffle locality chunk size (max 256) |
+| `shuffle_blk_k` | `128` | Shuffle locality chunk size |
 | `backend` | `"cute"` | `"cute"`, `"cublas"`, or `"pytorch"` |
 | `autotuning` | `False` | Enable automatic kernel autotuning |
 
@@ -443,8 +442,7 @@ torch_ext/              C++/CUDA PyTorch extensions
   prism_fwd_torch.cu        Forward kernel torch binding
   prism_bwd_dadr_torch.cu   Backward dA+dR kernel torch binding
   prism_bwd_db_torch.cu     Backward dB kernel torch binding
-  cublas_prism_torch.cu     cuBLAS backend (pipelined two-stream)
-  shuffle_prism_torch.cu    Shuffle backend (gather + cuBLAS + scatter-add)
+  cublas_prism_torch.cu     cuBLAS backend (pipelined two-stream; handles shuffle, gated, internal_bias, dropout)
 *.cu, *.hpp             CUDA kernel source (CuTe cooperative kernels, utilities)
 cmake/                  CMake modules (CUTLASS detection)
 tests/                  pytest test suite
