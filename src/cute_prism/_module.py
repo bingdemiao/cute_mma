@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import math
-import random as _random
-from typing import Callable, Iterable, Literal
+from typing import Literal
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 
@@ -32,34 +30,6 @@ class _BwdScaleFn(torch.autograd.Function):
 
 
 
-_shuffle_module = None
-_shuffle_lock = __import__("threading").Lock()
-
-
-def _get_shuffle_module():
-    """JIT-compile and load the shuffle Prism CUDA kernel."""
-    global _shuffle_module
-    if _shuffle_module is not None:
-        return _shuffle_module
-    with _shuffle_lock:
-        if _shuffle_module is not None:
-            return _shuffle_module
-        from pathlib import Path
-        from torch.utils.cpp_extension import load
-        _dir = Path(__file__).parent.parent.parent / "torch_ext"
-        _shuffle_module = load(
-            name="shuffle_prism_cuda",
-            sources=[
-                str(_dir / "shuffle_prism_torch.cu"),
-                str(_dir / "shuffle_prism_bind.cpp"),
-            ],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
-            extra_ldflags=["-lcublas"],
-            verbose=False,
-        )
-        return _shuffle_module
-
-
 # ---------------------------------------------------------------------------
 # Custom ops: opaque to torch.compile, with fake-tensor + autograd support
 # ---------------------------------------------------------------------------
@@ -78,13 +48,14 @@ def _prism_forward_op(
 ) -> torch.Tensor:
     from . import forward as prism_forward
 
-    return prism_forward(
+    C, _seeds = prism_forward(
         A, B, R, group_size, reconn_sz,
         backend=backend,
         activation=activation or None,
         autotuning=autotuning,
         force_rebenchmark=force_rebenchmark,
     )
+    return C
 
 
 @_prism_forward_op.register_fake
@@ -108,7 +79,7 @@ def _prism_backward_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from . import backward as prism_backward
 
-    dA, dR, dB = prism_backward(
+    dA, dR, dB, _d_ib = prism_backward(
         dC.contiguous(), A.contiguous(), B.contiguous(), R.contiguous(),
         group_size, reconn_sz,
         backend=backend,
@@ -160,12 +131,17 @@ def _prism_backward(ctx, dC):
 _prism_forward_op.register_autograd(_prism_backward, setup_context=_prism_setup_context)
 
 
-class _PrismWithBiasDropoutFn(torch.autograd.Function):
-    """Autograd wrapper that threads internal_bias and dropout through Prism."""
+class _PrismFn(torch.autograd.Function):
+    """Unified autograd wrapper for Prism forward/backward.
+
+    Threads internal_bias, dropout, and seg_pairs (input shuffle) through
+    the main ``forward()`` / ``backward()`` entry points.
+    """
 
     @staticmethod
     def forward(ctx, A, B, R, group_size, reconn_sz, backend, activation,
-                autotuning, force_rebenchmark, internal_bias, dropout_p, training):
+                autotuning, force_rebenchmark, internal_bias, dropout_p, training,
+                seg_pairs):
         from . import forward as prism_forward
 
         C, dropout_seeds = prism_forward(
@@ -177,8 +153,9 @@ class _PrismWithBiasDropoutFn(torch.autograd.Function):
             internal_bias=internal_bias,
             dropout_p=dropout_p,
             training=training,
+            seg_pairs=seg_pairs,
         )
-        ctx.save_for_backward(A, B, R, internal_bias)
+        ctx.save_for_backward(A, B, R, internal_bias, seg_pairs)
         ctx.group_size = group_size
         ctx.reconn_sz = reconn_sz
         ctx.backend = backend
@@ -193,7 +170,7 @@ class _PrismWithBiasDropoutFn(torch.autograd.Function):
     def backward(ctx, dC):
         from . import backward as prism_backward
 
-        A, B, R, internal_bias = ctx.saved_tensors
+        A, B, R, internal_bias, seg_pairs = ctx.saved_tensors
 
         dA, dR, dB, d_ib = prism_backward(
             dC.contiguous(), A.contiguous(), B.contiguous(), R.contiguous(),
@@ -205,13 +182,14 @@ class _PrismWithBiasDropoutFn(torch.autograd.Function):
             internal_bias=internal_bias,
             dropout_seeds=ctx.dropout_seeds,
             dropout_p=ctx.dropout_p,
+            seg_pairs=seg_pairs,
         )
 
         if dB is None:
             dB = torch.zeros_like(B)
 
-        # Grads: A, B, R, then None x 6 scalar args, internal_bias, None x 2
-        return dA, dB, dR, None, None, None, None, None, None, d_ib, None, None
+        # Grads: A, B, R, then None x 6 scalar args, internal_bias, None x 2, seg_pairs
+        return dA, dB, dR, None, None, None, None, None, None, d_ib, None, None, None
 
 
 
@@ -301,36 +279,6 @@ def _build_seg_pairs(
     return seg_pairs
 
 
-class _ShufflePrismFunction(torch.autograd.Function):
-    """Autograd wrapper for the shuffle Prism CUDA kernel."""
-
-    @staticmethod
-    def forward(ctx, A, B, R, seg_pairs, group_size, reconn_sz, gated):
-        mod = _get_shuffle_module()
-        C = mod.forward(A, B, R, seg_pairs, group_size, reconn_sz, gated)
-        ctx.save_for_backward(A, B, R, seg_pairs)
-        ctx.group_size = group_size
-        ctx.reconn_sz = reconn_sz
-        ctx.gated = gated
-        return C
-
-    @staticmethod
-    def backward(ctx, dC):
-        A, B, R, seg_pairs = ctx.saved_tensors
-        mod = _get_shuffle_module()
-
-        dC = dC.contiguous()
-        dA, dR = mod.backward_dA_dR(
-            dC, A, B, R, seg_pairs,
-            ctx.group_size, ctx.reconn_sz, ctx.gated)
-        dB = mod.backward_dB(
-            dC, A, R, seg_pairs,
-            ctx.group_size, ctx.reconn_sz, ctx.gated)
-
-        # Grads for: A, B, R, seg_pairs, group_size, reconn_sz, gated
-        return dA, dB, dR, None, None, None, None
-
-
 class PrismLinear(nn.Module):
     """Drop-in replacement for ``nn.Linear`` using Prism structure.
 
@@ -417,11 +365,6 @@ class PrismLinear(nn.Module):
         if input_shuffle:
             if reconn_sz != 16:
                 raise ValueError("input_shuffle requires reconn_sz=16")
-            if shuffle_blk_k > 256:
-                raise ValueError(
-                    f"shuffle_blk_k ({shuffle_blk_k}) must be <= 256 "
-                    f"(dAdR kernel BLK_K constraint)"
-                )
             if in_features % shuffle_blk_k != 0:
                 raise ValueError(
                     f"in_features ({in_features}) must be divisible by "
@@ -734,16 +677,21 @@ class PrismLinear(nn.Module):
 
         R = self._build_R()
 
-        if self.input_shuffle:
-            C = self._forward_shuffle(A, B, R)
-        elif self._internal_bias is not None or self.dropout > 0.0:
-            # Use dedicated autograd function that handles bias + dropout
-            C = _PrismWithBiasDropoutFn.apply(
+        needs_full_fn = (
+            self.input_shuffle
+            or self._internal_bias is not None
+            or self.dropout > 0.0
+        )
+
+        if needs_full_fn:
+            seg_pairs = self._seg_pairs if self.input_shuffle else None
+            C = _PrismFn.apply(
                 A, B, R,
                 self.group_size, self.reconn_sz,
                 self.backend, self.activation or "",
                 self.autotuning, self.force_rebenchmark,
                 self._internal_bias, self.dropout, self.training,
+                seg_pairs,
             )
         else:
             # The custom op call is opaque to torch.compile — no graph breaks.
@@ -788,76 +736,6 @@ class PrismLinear(nn.Module):
             perm[dst:dst + seg_sz] = sa * seg_sz + offsets
             perm[dst + seg_sz:dst + 2 * seg_sz] = sb * seg_sz + offsets
         return perm
-
-    def _forward_shuffle(self, A: torch.Tensor, B: torch.Tensor,
-                         R: torch.Tensor) -> torch.Tensor:
-        """Forward with input shuffling — each group sees permuted segments.
-
-        When backend='cublas', uses the CUDA kernel with autograd support.
-        When backend='pytorch', uses pure PyTorch ops (reference/testing).
-        The cublas kernel does not support internal_bias / dropout, so we
-        fall back to the pytorch path whenever either is active.
-        """
-        use_kernel = (
-            self.backend == "cublas"
-            and A.is_cuda
-            and self._internal_bias is None
-            and self.dropout == 0.0
-        )
-        if use_kernel:
-            return _ShufflePrismFunction.apply(
-                A, B, R, self._seg_pairs,
-                self.group_size, self.reconn_sz,
-                self.activation == "silu_gate",
-            )
-        return self._forward_shuffle_pytorch(A, B, R)
-
-    def _forward_shuffle_pytorch(self, A: torch.Tensor, B: torch.Tensor,
-                                 R: torch.Tensor) -> torch.Tensor:
-        """Shuffle forward using pure PyTorch ops."""
-        M = A.shape[0]
-        N = self.out_features
-        n_groups = N // self.group_size
-        n_blocks = self.in_features // self.reconn_sz
-        r = self.reconn_sz
-        seg_sz = SHUFFLE_SEGMENT_SZ
-
-        R_blocks = R.reshape(n_groups, r, n_blocks, r).permute(0, 2, 1, 3)
-
-        n_total_segments = self.in_features // seg_sz
-        A_segs = A.reshape(M, n_total_segments, seg_sz).permute(1, 0, 2)
-
-        C = torch.zeros(M, N, dtype=A.dtype, device=A.device)
-        gated = self.activation == "silu_gate"
-
-        for g in range(n_groups):
-            seg_a = self._seg_pairs[g, :, 0]
-            seg_b = self._seg_pairs[g, :, 1]
-            A_batch = torch.cat([A_segs[seg_a], A_segs[seg_b]], dim=-1)
-
-            AR_batch = torch.bmm(A_batch, R_blocks[g].transpose(-1, -2))
-
-            A_perm = A_batch.permute(1, 0, 2).reshape(M, self.in_features)
-            AR_perm = AR_batch.permute(1, 0, 2).reshape(M, self.in_features)
-
-            if gated:
-                H_perm = A_perm * F.silu(AR_perm)
-            
-            # option b:
-            # if gated:
-            #     alpha = 4.0
-            #     H_perm = A_perm * torch.sigmoid(alpha * AR_perm)
-            else:
-                H_perm = AR_perm
-            
-            # adding inner dropout part
-            # if self.inner_dropout > 0.0:
-            #     H_perm = F.dropout(H_perm, p=self.inner_dropout, training=self.training)
-
-            B_g = B[g * self.group_size : (g + 1) * self.group_size]
-            C[:, g * self.group_size : (g + 1) * self.group_size] = torch.mm(H_perm, B_g.T)
-
-        return C
 
     def extra_repr(self) -> str:
         parts = [

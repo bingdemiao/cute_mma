@@ -70,7 +70,7 @@ def test_prism(m, n, k, group_size=256, reconn_sz=8, backend="cute", mode="ar", 
     A, B, R = make_test_tensors(m, n, k, group_size, reconn_sz)
 
     C_ref = prism_reference(A, B, R, group_size, reconn_sz, activation=activation)
-    C_kernel = cute_prism.forward(A, B, R, group_size, reconn_sz, backend=backend, mode=mode, activation=activation)
+    C_kernel, _seeds = cute_prism.forward(A, B, R, group_size, reconn_sz, backend=backend, mode=mode, activation=activation)
 
     # Check for NaN/Inf
     nan_count = C_kernel.isnan().sum().item()

@@ -86,6 +86,7 @@ def forward(
     internal_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     training: bool = False,
+    seg_pairs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, list[int] | torch.Tensor]:
     """Compute C = A @ diag(R) @ B^T with Prism structure.
 
@@ -106,6 +107,9 @@ def forward(
             Shape (n_groups, K). Only used in gated mode.
         dropout_p: Dropout probability applied to H = A * SiLU(AR + bias).
         training: Whether in training mode (dropout only active when True).
+        seg_pairs: Optional (n_groups, n_blocks, 2) int64 tensor of per-group
+            segment pair indices for input shuffling. Only supported by the
+            ``cublas`` and ``pytorch`` backends in AR mode.
 
     Returns:
         (C, dropout_seeds) — C is the output tensor of shape (M, N).
@@ -142,7 +146,11 @@ def forward(
             rw_mode=(mode == "rw"), activation=activation,
             internal_bias=internal_bias,
             dropout_p=dropout_p, training=training,
+            seg_pairs=seg_pairs,
         )
+
+    if seg_pairs is not None and backend == "cute":
+        raise ValueError("seg_pairs is not supported with the 'cute' backend")
 
     validate_tensor_params(A, B, R, group_size, reconn_sz)
 
@@ -184,7 +192,7 @@ def forward(
     module = get_or_compile(group_size, reconn_sz, backend, comp_params)
     results = module.forward(
         A, B, R, group_size, reconn_sz, mode == "rw", gated,
-        internal_bias, dropout_p, training,
+        internal_bias, dropout_p, training, seg_pairs,
     )
     return results[0], results[1]
 
@@ -210,6 +218,7 @@ def backward(
     internal_bias: torch.Tensor | None = None,
     dropout_seeds: list[int] | torch.Tensor | None = None,
     dropout_p: float = 0.0,
+    seg_pairs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Compute gradients for Prism backward pass.
 
@@ -269,9 +278,13 @@ def backward(
             dC, A, B, R, group_size, reconn_sz,
             activation=activation, internal_bias=internal_bias,
             dropout_seeds=py_seeds, dropout_p=dropout_p,
+            seg_pairs=seg_pairs,
         )
 
     validate_tensor_params(A, B, R, group_size, reconn_sz)
+
+    if seg_pairs is not None and backend == "cute":
+        raise ValueError("seg_pairs is not supported with the 'cute' backend")
 
     if backend == "cublas":
         module = get_or_compile(group_size, reconn_sz, backend)
@@ -279,14 +292,14 @@ def backward(
         ds_tensor = dropout_seeds if isinstance(dropout_seeds, torch.Tensor) else None
         grads = module.backward_dA_dR(
             dC, A, B, R, group_size, reconn_sz, gated, dR_dtype,
-            internal_bias, ds_tensor, dropout_p,
+            internal_bias, ds_tensor, dropout_p, seg_pairs,
         )
         dA, dR = grads[0], grads[1]
         d_ib = grads[2] if (len(grads) > 2 and grads[2] is not None and grads[2].numel() > 0) else None
         if gated:
             dB_out = module.backward_dB(
                 dC, A, R, group_size, reconn_sz, gated, dB_dtype,
-                internal_bias, ds_tensor, dropout_p,
+                internal_bias, ds_tensor, dropout_p, seg_pairs,
             )
         else:
             dB_out = None

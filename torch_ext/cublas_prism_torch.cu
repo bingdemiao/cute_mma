@@ -1,5 +1,6 @@
 #include <torch/types.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -42,6 +43,22 @@ template<> __device__ __forceinline__ float to_float(__nv_bfloat16 v) { return _
 template<typename T> __device__ __forceinline__ T from_float(float v);
 template<> __device__ __forceinline__ half from_float(float v) { return __float2half(v); }
 template<> __device__ __forceinline__ __nv_bfloat16 from_float(float v) { return __float2bfloat16(v); }
+
+// Deterministic hash-based uniform[0,1) for dropout masks. Same (seed, idx)
+// produces the same value across forward and backward, so we can replay the
+// mask without materializing a rand buffer.
+__device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+__device__ __forceinline__ float uniform_from_hash(uint64_t seed, int64_t idx) {
+    uint64_t h = splitmix64(seed + 0xdeadbeefULL) ^ splitmix64((uint64_t)idx);
+    h = splitmix64(h);
+    // Top 24 bits → [0, 1)
+    return (float)((h >> 40) & 0xFFFFFF) * (1.0f / 16777216.0f);
+}
 
 // ---------------------------------------------------------------------------
 // cuBLAS GemmEx wrappers (f32 compute, f32 alpha/beta)
@@ -95,25 +112,120 @@ static void gemm_strided_batched_ex(
 // Templated element-wise kernels
 // ---------------------------------------------------------------------------
 
-// AR = A * SiLU(AR)
+// ---------------------------------------------------------------------------
+// Input shuffle helpers
+// ---------------------------------------------------------------------------
+
+// Gather per-group permuted layout from natural A.
+// seg_pairs: (n_blocks, 2) — for block b, positions [b*rs .. b*rs+seg_sz) read
+// from segment seg_pairs[b,0] and [b*rs+seg_sz .. b*rs+2*seg_sz) from
+// seg_pairs[b,1], where rs = 2 * seg_sz.
 template<typename T>
-__global__ void silu_gate_kernel(const T* A, T* AR, int64_t numel) {
+__global__ void gather_segments_kernel(
+    const T* __restrict__ A,         // (M, K) row-major
+    T* __restrict__ A_perm,          // (M, K) permuted layout
+    const int64_t* __restrict__ seg_pairs,  // (n_blocks, 2)
+    int64_t M, int64_t K, int64_t seg_sz)
+{
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < numel) {
-        float a = to_float(A[idx]);
-        float ar = to_float(AR[idx]);
-        float silu_ar = ar / (1.0f + __expf(-ar));
-        AR[idx] = from_float<T>(a * silu_ar);
-    }
+    int64_t total = M * K;
+    if (idx >= total) return;
+
+    int64_t col = idx % K;
+    int64_t row = idx / K;
+
+    int64_t two_seg = 2 * seg_sz;
+    int64_t block = col / two_seg;
+    int64_t within_block = col % two_seg;
+    int64_t seg_local = within_block / seg_sz;
+    int64_t elem_in_seg = within_block % seg_sz;
+
+    int64_t src_seg = seg_pairs[block * 2 + seg_local];
+    int64_t src_col = src_seg * seg_sz + elem_in_seg;
+
+    A_perm[idx] = A[row * K + src_col];
 }
 
-// Fused: AR[i] = A[i] * SiLU(AR[i] + bias[i%K])  with optional dropout on result
-// rand_buf (if non-null) contains pre-generated uniform [0,1) values from torch::rand.
+// Build per-group inverse permutation. perm_inv[g, c_nat] gives the position
+// in the permuted layout that holds natural column c_nat.
+__global__ void build_perm_inv_kernel(
+    const int64_t* __restrict__ seg_pairs,  // (n_groups, n_blocks, 2)
+    int64_t* __restrict__ perm_inv,          // (n_groups, K)
+    int64_t n_blocks, int64_t K, int64_t seg_sz)
+{
+    int64_t g = blockIdx.y;
+    int64_t c = blockIdx.x * blockDim.x + threadIdx.x;  // permuted column
+    if (c >= K) return;
+
+    int64_t two_seg = 2 * seg_sz;
+    int64_t block = c / two_seg;
+    int64_t within_block = c % two_seg;
+    int64_t seg_local = within_block / seg_sz;
+    int64_t elem_in_seg = within_block % seg_sz;
+
+    int64_t src_seg = seg_pairs[(g * n_blocks + block) * 2 + seg_local];
+    int64_t src_col = src_seg * seg_sz + elem_in_seg;
+    perm_inv[g * K + src_col] = c;
+}
+
+// Non-atomic unpermute-add: dA[row, c] += dA_perm[row, perm_inv[c]].
+// perm_inv is indexed by natural column and gives the permuted-layout
+// position. Since each output element is written exactly once per launch,
+// no atomics are needed (serialization happens across per-group launches
+// on the stream).
+template<typename T>
+__global__ void unpermute_add_kernel(
+    T* __restrict__ dA,                  // (M, K) natural layout, accumulated
+    const T* __restrict__ dA_perm,       // (M, K) permuted layout
+    const int64_t* __restrict__ perm_inv,  // (K,)
+    int64_t M, int64_t K)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = M * K;
+    if (idx >= total) return;
+
+    int64_t col = idx % K;
+    int64_t row = idx / K;
+    int64_t src_col = perm_inv[col];
+    float prev = to_float(dA[idx]);
+    float add = to_float(dA_perm[row * K + src_col]);
+    dA[idx] = from_float<T>(prev + add);
+}
+
+// Fused variant: dA[row, c] += dA_perm[row, perm_inv[c]] + dA_gate_perm[row, perm_inv[c]]
+// Used in shuffle+gated dA/dR backward, replacing the add_kernel + unpermute_add
+// pair with a single pass over (M, K).
+template<typename T>
+__global__ void unpermute_add_with_gate_kernel(
+    T* __restrict__ dA,                     // (M, K) natural layout, accumulated
+    const T* __restrict__ dA_perm,          // (M, K) permuted: dS_perm @ R_g
+    const T* __restrict__ dA_gate_perm,     // (M, K) permuted: dh * silu(s)
+    const int64_t* __restrict__ perm_inv,   // (K,)
+    int64_t M, int64_t K)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = M * K;
+    if (idx >= total) return;
+
+    int64_t col = idx % K;
+    int64_t row = idx / K;
+    int64_t src = row * K + perm_inv[col];
+    float prev = to_float(dA[idx]);
+    float add = to_float(dA_perm[src]) + to_float(dA_gate_perm[src]);
+    dA[idx] = from_float<T>(prev + add);
+}
+
+// Fused forward gate: AR[i] = A[i] * SiLU(AR[i] + bias[i%K])  with optional
+// dropout on the result.
+//   bias == nullptr     → no bias add
+//   dropout_seed == 0   → no dropout (no hash cost either; branch is uniform)
+// For dropout, per-element mask is derived from (seed, idx) so backward can
+// replay deterministically without a rand buffer.
 template<typename T>
 __global__ void silu_gate_bias_dropout_kernel(
     const T* A, T* AR, const T* bias,
     int64_t M, int64_t K,
-    const float* rand_buf, float dropout_p, float inv_keep)
+    uint64_t dropout_seed, float dropout_p, float inv_keep)
 {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t numel = M * K;
@@ -123,62 +235,33 @@ __global__ void silu_gate_bias_dropout_kernel(
         if (bias) ar += to_float(bias[idx % K]);
         float silu_ar = ar / (1.0f + __expf(-ar));
         float h = a * silu_ar;
-        if (rand_buf) {
-            h = (rand_buf[idx] >= dropout_p) ? h * inv_keep : 0.0f;
+        if (dropout_seed) {
+            float u = uniform_from_hash(dropout_seed, idx);
+            h = (u >= dropout_p) ? h * inv_keep : 0.0f;
         }
         AR[idx] = from_float<T>(h);
-    }
-}
-
-// dst[i] += src[i]
-template<typename T>
-__global__ void add_kernel(T* dst, const T* src, int64_t numel) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < numel) {
-        dst[idx] = from_float<T>(to_float(dst[idx]) + to_float(src[idx]));
-    }
-}
-
-// dS[i] = dH[i] * A[i] * silu_prime(S[i])
-template<typename T>
-__global__ void silu_gate_backward_ds_kernel(
-    const T* dH, const T* A, const T* S, T* dS, int64_t numel)
-{
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < numel) {
-        float dh = to_float(dH[idx]);
-        float a = to_float(A[idx]);
-        float s = to_float(S[idx]);
-        float sigma = 1.0f / (1.0f + __expf(-s));
-        float silu_prime = sigma * (1.0f + s * (1.0f - sigma));
-        dS[idx] = from_float<T>(dh * a * silu_prime);
-    }
-}
-
-// dA_gate[i] = dH[i] * silu(S[i])
-template<typename T>
-__global__ void silu_gate_backward_da_kernel(
-    const T* dH, const T* S, T* dA_gate, int64_t numel)
-{
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < numel) {
-        float dh = to_float(dH[idx]);
-        float s = to_float(S[idx]);
-        float silu_s = s / (1.0f + __expf(-s));
-        dA_gate[idx] = from_float<T>(dh * silu_s);
     }
 }
 
 // Fused backward: given recomputed AR (= A @ R^T), add bias, then compute
 //   dA_gate[i] = dH[i] * silu(S[i])
 //   dS[i]      = dH[i] * A[i] * silu'(S[i])
-// where S = AR + bias. Replays dropout on dH using the saved rand_buf.
-template<typename T>
+// where S = AR + bias. Replays dropout via the same (seed, idx) hash used
+// in the forward kernel.
+//
+// Template ACCUMULATE:
+//   false → dA_gate[idx] = dh*silu_s    (overwrite; used in shuffle mode
+//           where dA_gate_perm is a fresh scratch buffer)
+//   true  → dA_gate[idx] += dh*silu_s   (accumulate directly into dA;
+//           used in non-shuffle mode to eliminate a temp + add_kernel pass.
+//           Each output element is owned by exactly one thread so the RMW
+//           needs no atomic.)
+template<typename T, bool ACCUMULATE>
 __global__ void silu_gate_backward_fused_kernel(
     const T* dH_in, const T* A, T* AR,    // AR is modified in-place to S
     T* dA_gate, T* dS,
     const T* bias, int64_t M, int64_t K,
-    const float* rand_buf, float dropout_p, float inv_keep)
+    uint64_t dropout_seed, float dropout_p, float inv_keep)
 {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t numel = M * K;
@@ -187,10 +270,11 @@ __global__ void silu_gate_backward_fused_kernel(
         if (bias) s += to_float(bias[idx % K]);
         AR[idx] = from_float<T>(s);  // store S for later dR computation
 
-        // Replay dropout on dH
+        // Replay dropout on dH using the same hash as forward
         float dh = to_float(dH_in[idx]);
-        if (rand_buf) {
-            dh = (rand_buf[idx] >= dropout_p) ? dh * inv_keep : 0.0f;
+        if (dropout_seed) {
+            float u = uniform_from_hash(dropout_seed, idx);
+            dh = (u >= dropout_p) ? dh * inv_keep : 0.0f;
         }
 
         float a = to_float(A[idx]);
@@ -198,59 +282,115 @@ __global__ void silu_gate_backward_fused_kernel(
         float silu_s = s * sigma;
         float silu_prime = sigma * (1.0f + s * (1.0f - sigma));
 
-        dA_gate[idx] = from_float<T>(dh * silu_s);
+        float dA_gate_val = dh * silu_s;
+        if (ACCUMULATE) {
+            dA_gate[idx] = from_float<T>(to_float(dA_gate[idx]) + dA_gate_val);
+        } else {
+            dA_gate[idx] = from_float<T>(dA_gate_val);
+        }
         dS[idx] = from_float<T>(dh * a * silu_prime);
     }
 }
 
-// Fused backward for dB: recompute H = A * SiLU(AR + bias), apply dropout
-// Writes H into AR buffer (in-place). Uses saved rand_buf for mask replay.
-template<typename T>
-__global__ void silu_gate_bias_dropout_kernel_for_db(
-    const T* A, T* AR, const T* bias,
-    int64_t M, int64_t K,
-    const float* rand_buf, float dropout_p, float inv_keep)
+// Reduce-variant of silu_gate_backward_fused_kernel: in addition to writing
+// dA_gate and dS, performs a column-wise sum of dS into an fp32 scratch
+// buffer d_ib_f32 (shape (K,)). The element-wise work uses the standard
+// 2D launch (one thread per element) to preserve element-wise latency
+// hiding; a block-local tree reduction along the row (y) axis produces a
+// partial sum per column, then one thread per column-block atomicAdds that
+// partial to d_ib_f32[col]. A separate cast kernel finalizes the result.
+//
+// Launch:
+//   block = dim3(BN, BM)  (threads.x = column, threads.y = row)
+//   grid  = dim3(ceil(K/BN), ceil(M/BM))
+// BM must be a power of 2 for the in-block tree reduction.
+template<typename T, bool ACCUMULATE, int BM, int BN>
+__global__ void silu_gate_backward_fused_reduce_kernel(
+    const T* dH_in, const T* A, T* AR,
+    T* dA_gate, T* dS,
+    float* d_ib_f32,                 // (K,) fp32 accumulator (pre-zero'd)
+    const T* bias, int64_t M, int64_t K,
+    uint64_t dropout_seed, float dropout_p, float inv_keep)
 {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t numel = M * K;
-    if (idx < numel) {
-        float a = to_float(A[idx]);
-        float ar = to_float(AR[idx]);
-        if (bias) ar += to_float(bias[idx % K]);
-        float silu_ar = ar / (1.0f + __expf(-ar));
-        float h = a * silu_ar;
-        if (rand_buf) {
-            h = (rand_buf[idx] >= dropout_p) ? h * inv_keep : 0.0f;
+    int64_t col = (int64_t)blockIdx.x * BN + threadIdx.x;
+    int64_t row = (int64_t)blockIdx.y * BM + threadIdx.y;
+
+    float dS_val = 0.0f;
+    if (row < M && col < K) {
+        int64_t idx = row * K + col;
+        float s = to_float(AR[idx]);
+        if (bias) s += to_float(bias[col]);
+        AR[idx] = from_float<T>(s);
+
+        float dh = to_float(dH_in[idx]);
+        if (dropout_seed) {
+            float u = uniform_from_hash(dropout_seed, idx);
+            dh = (u >= dropout_p) ? dh * inv_keep : 0.0f;
         }
-        AR[idx] = from_float<T>(h);
+
+        float a = to_float(A[idx]);
+        float sigma = 1.0f / (1.0f + __expf(-s));
+        float silu_s = s * sigma;
+        float silu_prime = sigma * (1.0f + s * (1.0f - sigma));
+
+        float dA_gate_val = dh * silu_s;
+        if (ACCUMULATE) {
+            dA_gate[idx] = from_float<T>(to_float(dA_gate[idx]) + dA_gate_val);
+        } else {
+            dA_gate[idx] = from_float<T>(dA_gate_val);
+        }
+        dS_val = dh * a * silu_prime;
+        dS[idx] = from_float<T>(dS_val);
     }
+
+    // Block-wide column reduction along the row (y) axis.
+    __shared__ float sm[BM * BN];
+    int sm_idx = threadIdx.y * BN + threadIdx.x;
+    sm[sm_idx] = dS_val;
+    __syncthreads();
+
+    #pragma unroll
+    for (int stride = BM / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.y < stride) {
+            sm[sm_idx] += sm[sm_idx + stride * BN];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.y == 0 && col < K) {
+        atomicAdd(&d_ib_f32[col], sm[threadIdx.x]);
+    }
+}
+
+// Cast an fp32 buffer to T (half / bfloat16). Used once per group to
+// finalize that group's d_internal_bias row after the fused reduction.
+template<typename T>
+__global__ void f32_to_t_kernel(const float* in, T* out, int64_t numel) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numel) out[idx] = from_float<T>(in[idx]);
 }
 
 // ---------------------------------------------------------------------------
 // Forward: AR mode  C = (A @ R^T) @ B^T  [gated: C = (A * SiLU(A @ R^T)) @ B^T]
 // ---------------------------------------------------------------------------
 
-// Generate a rand buffer of shape (m, k) in float32 using a seeded generator.
-// The seed is stored so backward can regenerate the same buffer.
-static torch::Tensor _make_rand_buf(int64_t m, int64_t k,
-                                     torch::Device device, int64_t seed) {
-    auto gen = at::cuda::detail::createCUDAGenerator(device.index());
-    gen.set_current_seed(seed);
-    auto rand_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-    return torch::rand({m, k}, gen, rand_opts);
-}
+// Dropout uses a hash-based per-element mask (see uniform_from_hash). A seed
+// of 0 is reserved for "no dropout"; we coerce to 1 if the host RNG happens to
+// produce 0 so the kernel branch stays consistent.
+static inline uint64_t _nonzero_seed(uint64_t s) { return s ? s : 1ULL; }
 
 template<typename scalar_t>
 static void cublas_prism_ar_impl(
     const scalar_t* A_ptr, const scalar_t* B_ptr, const scalar_t* R_ptr, scalar_t* C_ptr,
     int64_t m, int64_t n, int64_t k,
     int64_t group_size, int64_t reconn_sz, int64_t n_groups,
-    cublasHandle_t handle, cudaDataType_t dt, 
+    cublasHandle_t handle, cudaDataType_t dt,
     torch::TensorOptions opts,
     bool gated, cudaStream_t stream,
     const scalar_t* internal_bias_ptr = nullptr,
     float dropout_p = 0.0f, bool training = false,
-    int64_t* dropout_seeds_out = nullptr)
+    int64_t* dropout_seeds_out = nullptr,
+    const int64_t* seg_pairs_ptr = nullptr)
 {
     // Two-stream pipeline: producer (batched AR + gate) overlaps with
     // consumer (dense C_g GEMM) across groups. Double-buffer AR.
@@ -260,6 +400,20 @@ static void cublas_prism_ar_impl(
     for (int p = 0; p < PIPE; ++p) {
         AR_t[p] = torch::empty({m, k}, opts);
         AR_ptr[p] = static_cast<scalar_t*>(AR_t[p].data_ptr());
+    }
+
+    // Single-buffer A_perm for shuffle mode (gather target, input to AR GEMM
+    // and to the downstream gate kernel). Reused across groups; safe because
+    // every use of A_perm for group g finishes on stream_p before produce(g+1)
+    // writes it again on the same stream.
+    const bool shuffle = seg_pairs_ptr != nullptr;
+    int64_t n_blocks = k / reconn_sz;
+    int64_t seg_sz = reconn_sz / 2;
+    torch::Tensor A_perm_t;
+    scalar_t* A_perm_ptr = nullptr;
+    if (shuffle) {
+        A_perm_t = torch::empty({m, k}, opts);
+        A_perm_ptr = static_cast<scalar_t*>(A_perm_t.data_ptr());
     }
 
     cudaStream_t stream_p;
@@ -279,35 +433,38 @@ static void cublas_prism_ar_impl(
     auto device = opts.device();
 
     auto produce = [&](int64_t g, int p) {
+        int64_t numel = m * k;
+        int nblocks = (int)((numel + threads - 1) / threads);
+
+        const scalar_t* A_gemm_in = A_ptr;
+        if (shuffle) {
+            gather_segments_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+                A_ptr, A_perm_ptr,
+                seg_pairs_ptr + g * n_blocks * 2,
+                m, k, seg_sz);
+            A_gemm_in = A_perm_ptr;
+        }
+
         gemm_strided_batched_ex(
             handle_p, CUBLAS_OP_T, CUBLAS_OP_N,
             reconn_sz, m, reconn_sz,
             R_ptr + g * reconn_sz * k, dt, k, reconn_sz,
-            A_ptr,                     dt, k, reconn_sz,
+            A_gemm_in,                 dt, k, reconn_sz,
             AR_ptr[p],                 dt, k, reconn_sz,
             k / reconn_sz);
 
         if (gated) {
-            int64_t numel = m * k;
-            int nblocks = (int)((numel + threads - 1) / threads);
-
-            if (internal_bias_ptr || apply_dropout) {
-                const float* rand_ptr = nullptr;
-                torch::Tensor rand_buf;
-                if (apply_dropout) {
-                    int64_t seed = (int64_t)std::random_device{}();
-                    if (dropout_seeds_out) dropout_seeds_out[g] = seed;
-                    rand_buf = _make_rand_buf(m, k, device, seed);
-                    rand_ptr = rand_buf.data_ptr<float>();
-                }
-                silu_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
-                    A_ptr, AR_ptr[p],
-                    internal_bias_ptr ? internal_bias_ptr + g * k : nullptr,
-                    m, k, rand_ptr, dropout_p, inv_keep);
-            } else {
-                silu_gate_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
-                    A_ptr, AR_ptr[p], numel);
+            // Unified fused gate: bias / dropout are optional (nullptr / seed=0
+            // branches are uniform across the warp and compile out).
+            uint64_t seed = 0;
+            if (apply_dropout) {
+                seed = _nonzero_seed((uint64_t)std::random_device{}());
+                if (dropout_seeds_out) dropout_seeds_out[g] = (int64_t)seed;
             }
+            silu_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+                A_gemm_in, AR_ptr[p],
+                internal_bias_ptr ? internal_bias_ptr + g * k : nullptr,
+                m, k, seed, dropout_p, inv_keep);
         }
 
         cudaEventRecord(ready[p], stream_p);
@@ -398,7 +555,8 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
     cudaDataType_t dR_dt, torch::TensorOptions dR_opts,
     bool gated, cudaStream_t stream,
     const scalar_t* internal_bias_ptr = nullptr,
-    const int64_t* dropout_seeds = nullptr, float dropout_p = 0.0f)
+    const int64_t* dropout_seeds = nullptr, float dropout_p = 0.0f,
+    const int64_t* seg_pairs_ptr = nullptr)
 {
     auto dA  = torch::zeros({m, k}, compute_opts);
     auto dR  = torch::zeros({n_groups * reconn_sz, k}, dR_opts);
@@ -413,6 +571,33 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
     int64_t dR_es = dR.element_size();
     auto* AR_ptr  = static_cast<scalar_t*>(AR.data_ptr());
     auto* dAR_ptr = static_cast<scalar_t*>(dAR.data_ptr());
+
+    // Shuffle-mode scratch buffers and inverse permutation.
+    const bool shuffle = seg_pairs_ptr != nullptr;
+    int64_t n_blocks = k / reconn_sz;
+    int64_t seg_sz = reconn_sz / 2;
+    torch::Tensor A_perm_t, dA_perm_t, dA_gate_perm_t, perm_inv_t;
+    scalar_t* A_perm_ptr = nullptr;
+    scalar_t* dA_perm_ptr = nullptr;
+    scalar_t* dA_gate_perm_ptr = nullptr;
+    int64_t* perm_inv_ptr = nullptr;
+    if (shuffle) {
+        A_perm_t = torch::empty({m, k}, compute_opts);
+        dA_perm_t = torch::empty({m, k}, compute_opts);
+        A_perm_ptr = static_cast<scalar_t*>(A_perm_t.data_ptr());
+        dA_perm_ptr = static_cast<scalar_t*>(dA_perm_t.data_ptr());
+        if (gated) {
+            dA_gate_perm_t = torch::empty({m, k}, compute_opts);
+            dA_gate_perm_ptr = static_cast<scalar_t*>(dA_gate_perm_t.data_ptr());
+        }
+
+        // (K,) int64 scratch; rebuilt per group inside the loop via
+        // build_perm_inv_kernel launched with gridDim.y = 1. This keeps
+        // perm_inv scratch O(K) rather than O(n_groups * K).
+        auto idx_opts = torch::TensorOptions().dtype(torch::kInt64).device(compute_opts.device());
+        perm_inv_t = torch::empty({k}, idx_opts);
+        perm_inv_ptr = perm_inv_t.data_ptr<int64_t>();
+    }
 
     // Parallel streams: overlap AR recompute with dH dense GEMM within each group
     cudaStream_t stream_ar;
@@ -431,21 +616,68 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
     float inv_keep = has_dropout ? 1.0f / (1.0f - dropout_p) : 1.0f;
     auto device = compute_opts.device();
 
+    // Per-group fp32 scratch for d_internal_bias. Shared across groups — we
+    // zero it at the start of each group iteration, let the fused reduce
+    // kernel atomicAdd into it, then cast the result into the matching
+    // d_internal_bias[g] row. This keeps scratch at O(K) instead of
+    // O(n_groups * K).
+    torch::Tensor d_ib_f32;
+    float* d_ib_f32_ptr = nullptr;
+    scalar_t* d_ib_base = nullptr;
+    if (has_bias) {
+        auto f32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        d_ib_f32 = torch::zeros({k}, f32_opts);
+        d_ib_f32_ptr = d_ib_f32.data_ptr<float>();
+        d_ib_base = static_cast<scalar_t*>(d_internal_bias.data_ptr());
+    }
+
     for (int64_t g = 0; g < n_groups; ++g) {
         const scalar_t* dC_g = dC_ptr + g * group_size;
         const scalar_t* B_g  = B_ptr  + g * group_size * k;
         const scalar_t* R_g  = R_ptr  + g * reconn_sz * k;
         void* dR_g = static_cast<char*>(dR_raw) + g * reconn_sz * k * dR_es;
 
-        // Stream AR: recompute AR_g = A @ R_g^T
+        int64_t numel = m * k;
+        int nblocks = (int)((numel + threads - 1) / threads);
+
+        // In shuffle mode, gather A→A_perm first. The AR GEMM and downstream
+        // gate_bwd + dR GEMM all read A_perm instead of A.
+        const scalar_t* A_use_ptr = A_ptr;
+        if (shuffle) {
+            // Rebuild this group's inverse permutation into the (K,) scratch.
+            // Launched on the main stream so the later unpermute kernels (also
+            // on stream) see it in order without any extra synchronization.
+            {
+                int bx = 256;
+                dim3 pi_grid((int)((k + bx - 1) / bx), 1);
+                build_perm_inv_kernel<<<pi_grid, bx, 0, stream>>>(
+                    seg_pairs_ptr + g * n_blocks * 2,
+                    perm_inv_ptr,
+                    n_blocks, k, seg_sz);
+            }
+
+            gather_segments_kernel<scalar_t><<<nblocks, threads, 0, stream_ar>>>(
+                A_ptr, A_perm_ptr,
+                seg_pairs_ptr + g * n_blocks * 2,
+                m, k, seg_sz);
+            A_use_ptr = A_perm_ptr;
+        }
+
+        // Stream AR: recompute AR_g = A_use @ R_g^T
         gemm_strided_batched_ex(
             handle_ar, CUBLAS_OP_T, CUBLAS_OP_N,
             reconn_sz, m, reconn_sz,
-            R_g,    compute_dt, k, reconn_sz,
-            A_ptr,  compute_dt, k, reconn_sz,
-            AR_ptr, compute_dt, k, reconn_sz,
+            R_g,       compute_dt, k, reconn_sz,
+            A_use_ptr, compute_dt, k, reconn_sz,
+            AR_ptr,    compute_dt, k, reconn_sz,
             k / reconn_sz);
         cudaEventRecord(ar_ready, stream_ar);
+
+        // Target buffer for the dS_g @ R_g (or dAR_g @ R_g non-gated) GEMM:
+        // for shuffle we accumulate into a permuted scratch then unpermute;
+        // otherwise we accumulate directly into dA with beta=1.
+        scalar_t* dA_accum_ptr = shuffle ? dA_perm_ptr : dA_ptr;
+        float dA_accum_beta = shuffle ? 0.0f : 1.0f;
 
         if (gated) {
             // Stream main: dH_g = dC_g @ B_g (runs in parallel with AR recompute)
@@ -459,65 +691,106 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
             cudaStreamWaitEvent(stream, ar_ready);
 
             {
-                int64_t numel = m * k;
-                int nblocks = (int)((numel + threads - 1) / threads);
+                // Target for the dA_gate contribution:
+                //   non-shuffle → accumulate directly into dA (ACCUMULATE=true),
+                //                 no temp buffer.
+                //   shuffle     → write into dA_gate_perm scratch; the
+                //                 unpermute_add_with_gate_kernel below scatters
+                //                 it together with the dS@R contribution.
+                scalar_t* dA_gate_dst = shuffle ? dA_gate_perm_ptr : dA_ptr;
 
-                auto temp = torch::empty({m, k}, compute_opts);
-                auto* temp_ptr = static_cast<scalar_t*>(temp.data_ptr());
+                uint64_t seed = has_dropout ? (uint64_t)dropout_seeds[g] : 0ULL;
+                const scalar_t* bias_g =
+                    has_bias ? internal_bias_ptr + g * k : nullptr;
 
-                // Regenerate dropout mask from saved seed
-                const float* rand_ptr = nullptr;
-                torch::Tensor rand_buf;
-                if (has_dropout) {
-                    rand_buf = _make_rand_buf(m, k, device, dropout_seeds[g]);
-                    rand_ptr = rand_buf.data_ptr<float>();
-                }
-
-                // Fused: add bias to AR, replay dropout on dH, compute dA_gate and dS
-                silu_gate_backward_fused_kernel<scalar_t><<<nblocks, threads, 0, stream>>>(
-                    dAR_ptr, A_ptr, AR_ptr,
-                    temp_ptr, dAR_ptr,
-                    has_bias ? internal_bias_ptr + g * k : nullptr,
-                    m, k, rand_ptr, dropout_p, inv_keep);
-
-                // dA += dA_gate (= dH * silu(S))
-                add_kernel<scalar_t><<<nblocks, threads, 0, stream>>>(
-                    dA_ptr, temp_ptr, numel);
-
-                // d_internal_bias[g] = dS.sum(dim=0)
+                // Fused silu-gate backward. When has_bias, also reduces dS
+                // column-wise into the per-group fp32 scratch d_ib_f32 via
+                // 2D-grid element-wise + block-local reduction + atomicAdd.
                 if (has_bias) {
-                    // Simple reduction: iterate rows. For large M this could
-                    // use a proper reduction kernel, but matches the PyTorch
-                    // reference and M is typically modest.
-                    auto dS_2d = torch::from_blob(dAR_ptr, {m, k}, compute_opts);
-                    auto dib_g = dS_2d.sum(0);
-                    auto* dib_ptr = static_cast<scalar_t*>(d_internal_bias.data_ptr());
-                    cudaMemcpyAsync(dib_ptr + g * k, dib_g.data_ptr(),
-                                    k * sizeof(scalar_t), cudaMemcpyDeviceToDevice, stream);
+                    // Zero the K-element scratch before this group's pass.
+                    cudaMemsetAsync(d_ib_f32_ptr, 0, k * sizeof(float), stream);
+
+                    constexpr int BM = 16;
+                    constexpr int BN = 16;
+                    dim3 block(BN, BM);
+                    dim3 grid((int)((k + BN - 1) / BN),
+                              (int)((m + BM - 1) / BM));
+                    if (shuffle) {
+                        silu_gate_backward_fused_reduce_kernel<
+                            scalar_t, /*ACCUMULATE=*/false, BM, BN>
+                            <<<grid, block, 0, stream>>>(
+                                dAR_ptr, A_use_ptr, AR_ptr,
+                                dA_gate_dst, dAR_ptr,
+                                d_ib_f32_ptr, bias_g,
+                                m, k, seed, dropout_p, inv_keep);
+                    } else {
+                        silu_gate_backward_fused_reduce_kernel<
+                            scalar_t, /*ACCUMULATE=*/true, BM, BN>
+                            <<<grid, block, 0, stream>>>(
+                                dAR_ptr, A_use_ptr, AR_ptr,
+                                dA_gate_dst, dAR_ptr,
+                                d_ib_f32_ptr, bias_g,
+                                m, k, seed, dropout_p, inv_keep);
+                    }
+
+                    // Cast this group's scratch into d_internal_bias[g].
+                    int cvt_threads = 256;
+                    int cvt_blocks = (int)((k + cvt_threads - 1) / cvt_threads);
+                    f32_to_t_kernel<scalar_t><<<cvt_blocks, cvt_threads, 0, stream>>>(
+                        d_ib_f32_ptr, d_ib_base + g * k, k);
+                } else {
+                    if (shuffle) {
+                        silu_gate_backward_fused_kernel<
+                            scalar_t, /*ACCUMULATE=*/false>
+                            <<<nblocks, threads, 0, stream>>>(
+                                dAR_ptr, A_use_ptr, AR_ptr,
+                                dA_gate_dst, dAR_ptr,
+                                bias_g, m, k, seed, dropout_p, inv_keep);
+                    } else {
+                        silu_gate_backward_fused_kernel<
+                            scalar_t, /*ACCUMULATE=*/true>
+                            <<<nblocks, threads, 0, stream>>>(
+                                dAR_ptr, A_use_ptr, AR_ptr,
+                                dA_gate_dst, dAR_ptr,
+                                bias_g, m, k, seed, dropout_p, inv_keep);
+                    }
                 }
             }
 
-            // dA += dS_g @ R_g
+            // dA_accum = dS_g @ R_g  (beta=1 non-shuffle, beta=0 shuffle).
+            // Non-shuffle: dA already holds the dA_gate contribution from the
+            // fused kernel above; beta=1 adds dS@R on top.
             gemm_strided_batched_ex(
                 handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 reconn_sz, m, reconn_sz,
-                R_g,    compute_dt, k, reconn_sz,
-                dAR_ptr, compute_dt, k, reconn_sz,
-                dA_ptr, compute_dt, k, reconn_sz,
+                R_g,          compute_dt, k, reconn_sz,
+                dAR_ptr,      compute_dt, k, reconn_sz,
+                dA_accum_ptr, compute_dt, k, reconn_sz,
                 k / reconn_sz,
-                1.0f, 1.0f);   // beta = 1 for accumulation
+                1.0f, dA_accum_beta);
 
-            // dR_g[b] = dS_g^T @ A
+            if (shuffle) {
+                // Fused: dA[r, c] += dA_perm[r, perm_inv[c]]
+                //                   + dA_gate_perm[r, perm_inv[c]]
+                // One pass over (M, K) instead of add_kernel + unpermute_add.
+                unpermute_add_with_gate_kernel<scalar_t>
+                    <<<nblocks, threads, 0, stream>>>(
+                        dA_ptr, dA_perm_ptr, dA_gate_perm_ptr,
+                        perm_inv_ptr, m, k);
+            }
+
+            // dR_g[b] = dS_g^T @ A_use
             gemm_strided_batched_ex(
                 handle, CUBLAS_OP_N, CUBLAS_OP_T,
                 reconn_sz, reconn_sz, m,
-                A_ptr,   compute_dt, k, reconn_sz,
-                dAR_ptr, compute_dt, k, reconn_sz,
-                dR_g,    dR_dt,      k, reconn_sz,
+                A_use_ptr, compute_dt, k, reconn_sz,
+                dAR_ptr,   compute_dt, k, reconn_sz,
+                dR_g,      dR_dt,      k, reconn_sz,
                 k / reconn_sz);
         } else {
-            // Non-gated: no AR recompute needed, just dH = dC @ B
-            // Wait for AR stream (no-op if nothing was launched, but safe)
+            // Non-gated: no gate recompute needed, just dH = dC @ B.
+            // Still need to wait for AR stream because shuffle=true also
+            // runs the gather there.
             cudaStreamWaitEvent(stream, ar_ready);
 
             // dAR_g = dC_g @ B_g
@@ -527,26 +800,34 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
                 dC_g,    compute_dt, n,
                 dAR_ptr, compute_dt, k);
 
-            // dA += dAR_g @ R_g
+            // dA_accum = dAR_g @ R_g
             gemm_strided_batched_ex(
                 handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 reconn_sz, m, reconn_sz,
-                R_g,     compute_dt, k, reconn_sz,
-                dAR_ptr, compute_dt, k, reconn_sz,
-                dA_ptr,  compute_dt, k, reconn_sz,
+                R_g,          compute_dt, k, reconn_sz,
+                dAR_ptr,      compute_dt, k, reconn_sz,
+                dA_accum_ptr, compute_dt, k, reconn_sz,
                 k / reconn_sz,
-                1.0f, 1.0f);
+                1.0f, dA_accum_beta);
 
-            // dR_g[b] = dAR_g^T @ A
+            if (shuffle) {
+                unpermute_add_kernel<scalar_t><<<nblocks, threads, 0, stream>>>(
+                    dA_ptr, dA_perm_ptr, perm_inv_ptr, m, k);
+            }
+
+            // dR_g[b] = dAR_g^T @ A_use
             gemm_strided_batched_ex(
                 handle, CUBLAS_OP_N, CUBLAS_OP_T,
                 reconn_sz, reconn_sz, m,
-                A_ptr,   compute_dt, k, reconn_sz,
-                dAR_ptr, compute_dt, k, reconn_sz,
-                dR_g,    dR_dt,      k, reconn_sz,
+                A_use_ptr, compute_dt, k, reconn_sz,
+                dAR_ptr,   compute_dt, k, reconn_sz,
+                dR_g,      dR_dt,      k, reconn_sz,
                 k / reconn_sz);
         }
     }
+
+    // (d_internal_bias is written directly by the fused reduce kernel —
+    // no post-loop cast needed.)
 
     cudaStreamSynchronize(stream_ar);
     GEMM_CHECK_CUBLAS(cublasDestroy(handle_ar));
@@ -570,7 +851,8 @@ static torch::Tensor cublas_backward_dB_impl(
     cudaDataType_t dB_dt, torch::TensorOptions dB_opts,
     bool gated, cudaStream_t stream,
     const scalar_t* internal_bias_ptr = nullptr,
-    const int64_t* dropout_seeds = nullptr, float dropout_p = 0.0f)
+    const int64_t* dropout_seeds = nullptr, float dropout_p = 0.0f,
+    const int64_t* seg_pairs_ptr = nullptr)
 {
     auto dB = torch::zeros({n, k}, dB_opts);
     void* dB_raw  = dB.data_ptr();
@@ -583,6 +865,17 @@ static torch::Tensor cublas_backward_dB_impl(
     for (int p = 0; p < PIPE; ++p) {
         AR_t[p] = torch::empty({m, k}, compute_opts);
         AR_ptr[p] = static_cast<scalar_t*>(AR_t[p].data_ptr());
+    }
+
+    // Single-buffer A_perm for shuffle mode.
+    const bool shuffle = seg_pairs_ptr != nullptr;
+    int64_t n_blocks = k / reconn_sz;
+    int64_t seg_sz = reconn_sz / 2;
+    torch::Tensor A_perm_t;
+    scalar_t* A_perm_ptr = nullptr;
+    if (shuffle) {
+        A_perm_t = torch::empty({m, k}, compute_opts);
+        A_perm_ptr = static_cast<scalar_t*>(A_perm_t.data_ptr());
     }
 
     cudaStream_t stream_p;
@@ -604,34 +897,35 @@ static torch::Tensor cublas_backward_dB_impl(
 
     auto produce = [&](int64_t g, int p) {
         const scalar_t* R_g = R_ptr + g * reconn_sz * k;
+        int64_t numel = m * k;
+        int nblocks = (int)((numel + threads - 1) / threads);
+
+        const scalar_t* A_gemm_in = A_ptr;
+        if (shuffle) {
+            gather_segments_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+                A_ptr, A_perm_ptr,
+                seg_pairs_ptr + g * n_blocks * 2,
+                m, k, seg_sz);
+            A_gemm_in = A_perm_ptr;
+        }
 
         gemm_strided_batched_ex(
             handle_p, CUBLAS_OP_T, CUBLAS_OP_N,
             reconn_sz, m, reconn_sz,
             R_g,       compute_dt, k, reconn_sz,
-            A_ptr,     compute_dt, k, reconn_sz,
+            A_gemm_in, compute_dt, k, reconn_sz,
             AR_ptr[p], compute_dt, k, reconn_sz,
             k / reconn_sz);
 
         if (gated) {
-            int64_t numel = m * k;
-            int nblocks = (int)((numel + threads - 1) / threads);
-
-            if (has_bias || has_dropout) {
-                const float* rand_ptr = nullptr;
-                torch::Tensor rand_buf;
-                if (has_dropout) {
-                    rand_buf = _make_rand_buf(m, k, device, dropout_seeds[g]);
-                    rand_ptr = rand_buf.data_ptr<float>();
-                }
-                silu_gate_bias_dropout_kernel_for_db<scalar_t><<<nblocks, threads, 0, stream_p>>>(
-                    A_ptr, AR_ptr[p],
-                    has_bias ? internal_bias_ptr + g * k : nullptr,
-                    m, k, rand_ptr, dropout_p, inv_keep);
-            } else {
-                silu_gate_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
-                    A_ptr, AR_ptr[p], numel);
-            }
+            // Unified fused gate: nullptr bias and seed=0 are no-ops, so this
+            // single kernel handles all four sub-cases (plain / bias / dropout
+            // / bias+dropout).
+            uint64_t seed = has_dropout ? (uint64_t)dropout_seeds[g] : 0ULL;
+            silu_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+                A_gemm_in, AR_ptr[p],
+                has_bias ? internal_bias_ptr + g * k : nullptr,
+                m, k, seed, dropout_p, inv_keep);
         }
 
         cudaEventRecord(ready[p], stream_p);
@@ -760,7 +1054,8 @@ std::vector<torch::Tensor> cublas_prism_forward(
     bool gated,
     c10::optional<torch::Tensor> internal_bias,
     double dropout_p,
-    bool training)
+    bool training,
+    c10::optional<torch::Tensor> seg_pairs)
 {
     auto dtype = validate_forward_inputs(A, B, R, group_size, reconn_sz);
     auto cuda_dt = torch_to_cublas_dtype(dtype);
@@ -773,10 +1068,22 @@ std::vector<torch::Tensor> cublas_prism_forward(
     TORCH_CHECK(!gated || !rw_mode,
                 "Gated activation is only supported in AR mode, not RW mode");
 
+    const int64_t* seg_pairs_ptr = nullptr;
+    if (seg_pairs.has_value() && seg_pairs->defined()) {
+        TORCH_CHECK(!rw_mode, "seg_pairs not supported in rw_mode");
+        TORCH_CHECK(seg_pairs->is_cuda() && seg_pairs->device() == A.device(),
+                    "seg_pairs must be on the same CUDA device as A");
+        TORCH_CHECK(seg_pairs->scalar_type() == at::kLong, "seg_pairs must be int64");
+        TORCH_CHECK(seg_pairs->is_contiguous(), "seg_pairs must be contiguous");
+        seg_pairs_ptr = seg_pairs->data_ptr<int64_t>();
+    }
+
     auto C = torch::zeros({m, n}, A.options());
 
-    // Allocate dropout seeds tensor (returned to Python for backward replay)
-    auto seeds_opts = torch::TensorOptions().dtype(torch::kInt64).device(A.device());
+    // Allocate dropout seeds tensor on the CPU. The kernel receives seeds as
+    // scalar uint64_t launch parameters, so we only need host-side storage
+    // for them; it's also returned to Python for backward replay.
+    auto seeds_opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
     auto dropout_seeds_t = torch::zeros({n_groups}, seeds_opts);
     int64_t* seeds_ptr = dropout_seeds_t.data_ptr<int64_t>();
 
@@ -801,7 +1108,7 @@ std::vector<torch::Tensor> cublas_prism_forward(
         else \
             cublas_prism_ar_impl<cpp_type>(A_p, B_p, R_p, C_p, m, n, k, \
                 group_size, reconn_sz, n_groups, handle, cuda_dt, A.options(), \
-                gated, stream, ib_p, dp, training, seeds_ptr); \
+                gated, stream, ib_p, dp, training, seeds_ptr, seg_pairs_ptr); \
     }
 
     if (dtype == at::kHalf) {
@@ -826,7 +1133,8 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
     c10::optional<at::ScalarType> dR_dtype,
     c10::optional<torch::Tensor> internal_bias,
     c10::optional<torch::Tensor> dropout_seeds,
-    double dropout_p)
+    double dropout_p,
+    c10::optional<torch::Tensor> seg_pairs)
 {
     auto dtype = validate_backward_inputs(dC, A, R);
     TORCH_CHECK(B.is_cuda() && B.scalar_type() == dtype && B.is_contiguous(),
@@ -849,8 +1157,23 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
     GEMM_CHECK_CUBLAS(cublasSetStream(handle, stream));
 
     float dp = (float)dropout_p;
-    const int64_t* seeds_ptr = (dropout_seeds.has_value() && dropout_seeds->defined())
-        ? dropout_seeds->data_ptr<int64_t>() : nullptr;
+    // Seeds are consumed by host code (passed as kernel launch scalars), so
+    // they must live in CPU memory. Forward allocates them on CPU; accept a
+    // GPU tensor defensively by moving to CPU.
+    torch::Tensor seeds_cpu;
+    const int64_t* seeds_ptr = nullptr;
+    if (dropout_seeds.has_value() && dropout_seeds->defined()) {
+        seeds_cpu = dropout_seeds->is_cpu() ? *dropout_seeds : dropout_seeds->cpu();
+        seeds_ptr = seeds_cpu.data_ptr<int64_t>();
+    }
+    const int64_t* seg_pairs_ptr = nullptr;
+    if (seg_pairs.has_value() && seg_pairs->defined()) {
+        TORCH_CHECK(seg_pairs->is_cuda() && seg_pairs->device() == A.device(),
+                    "seg_pairs must be on the same CUDA device as A");
+        TORCH_CHECK(seg_pairs->scalar_type() == at::kLong, "seg_pairs must be int64");
+        TORCH_CHECK(seg_pairs->is_contiguous(), "seg_pairs must be contiguous");
+        seg_pairs_ptr = seg_pairs->data_ptr<int64_t>();
+    }
 
     torch::Tensor dA, dR_out, d_ib;
 
@@ -865,7 +1188,7 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
         std::tie(dA, dR_out, d_ib) = cublas_backward_dA_dR_impl<cpp_type>( \
             dC_p, A_p, B_p, R_p, m, n, k, group_size, reconn_sz, n_groups, \
             handle, compute_dt, A.options(), dR_dt, dR_opts, gated, stream, \
-            ib_p, seeds_ptr, dp); \
+            ib_p, seeds_ptr, dp, seg_pairs_ptr); \
     }
 
     if (dtype == at::kHalf) {
@@ -889,7 +1212,8 @@ torch::Tensor cublas_backward_dB(
     c10::optional<at::ScalarType> dB_dtype,
     c10::optional<torch::Tensor> internal_bias,
     c10::optional<torch::Tensor> dropout_seeds,
-    double dropout_p)
+    double dropout_p,
+    c10::optional<torch::Tensor> seg_pairs)
 {
     auto dtype = validate_backward_inputs(dC, A, R);
     validate_grad_dtype(dB_dtype, "dB_dtype");
@@ -910,8 +1234,20 @@ torch::Tensor cublas_backward_dB(
     GEMM_CHECK_CUBLAS(cublasSetStream(handle, stream));
 
     float dp = (float)dropout_p;
-    const int64_t* seeds_ptr = (dropout_seeds.has_value() && dropout_seeds->defined())
-        ? dropout_seeds->data_ptr<int64_t>() : nullptr;
+    torch::Tensor seeds_cpu;
+    const int64_t* seeds_ptr = nullptr;
+    if (dropout_seeds.has_value() && dropout_seeds->defined()) {
+        seeds_cpu = dropout_seeds->is_cpu() ? *dropout_seeds : dropout_seeds->cpu();
+        seeds_ptr = seeds_cpu.data_ptr<int64_t>();
+    }
+    const int64_t* seg_pairs_ptr = nullptr;
+    if (seg_pairs.has_value() && seg_pairs->defined()) {
+        TORCH_CHECK(seg_pairs->is_cuda() && seg_pairs->device() == A.device(),
+                    "seg_pairs must be on the same CUDA device as A");
+        TORCH_CHECK(seg_pairs->scalar_type() == at::kLong, "seg_pairs must be int64");
+        TORCH_CHECK(seg_pairs->is_contiguous(), "seg_pairs must be contiguous");
+        seg_pairs_ptr = seg_pairs->data_ptr<int64_t>();
+    }
 
     torch::Tensor dB;
 
@@ -925,7 +1261,7 @@ torch::Tensor cublas_backward_dB(
         dB = cublas_backward_dB_impl<cpp_type>( \
             dC_p, A_p, R_p, m, n, k, group_size, reconn_sz, n_groups, \
             handle, compute_dt, A.options(), dB_dt, dB_opts, gated, stream, \
-            ib_p, seeds_ptr, dp); \
+            ib_p, seeds_ptr, dp, seg_pairs_ptr); \
     }
 
     if (dtype == at::kHalf) {

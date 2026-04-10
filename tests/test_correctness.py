@@ -31,7 +31,7 @@ def check_close(name, val, ref, rtol=0.005):
     return rel < rtol, rel
 
 
-def test_forward(backend, gs, rs, sizes, n_seeds=5, verbose=False):
+def _run_forward(backend, gs, rs, sizes, n_seeds=5, verbose=False):
     passed, failed = 0, 0
     for act in [None, "silu_gate"]:
         for M, N, K in sizes:
@@ -43,8 +43,8 @@ def test_forward(backend, gs, rs, sizes, n_seeds=5, verbose=False):
                 B = torch.randn(N, K, dtype=torch.float16, device="cuda")
                 R = torch.randn(N // gs * rs, K, dtype=torch.float16, device="cuda")
 
-                C = cute_prism.forward(A, B, R, gs, rs, backend=backend, activation=act)
-                C_ref = cute_prism.forward(A, B, R, gs, rs, backend="pytorch", activation=act)
+                C, _ = cute_prism.forward(A, B, R, gs, rs, backend=backend, activation=act)
+                C_ref, _ = cute_prism.forward(A, B, R, gs, rs, backend="pytorch", activation=act)
 
                 ok, rel = check_close("C", C, C_ref)
                 label = f"fwd {'gated' if act else 'plain':5s} M={M:4d} seed={seed}"
@@ -58,7 +58,7 @@ def test_forward(backend, gs, rs, sizes, n_seeds=5, verbose=False):
     return passed, failed
 
 
-def test_backward_dadr(backend, gs, rs, sizes, n_seeds=5, verbose=False):
+def _run_backward_dadr(backend, gs, rs, sizes, n_seeds=5, verbose=False):
     passed, failed = 0, 0
     for act in [None, "silu_gate"]:
         for M, N, K in sizes:
@@ -71,8 +71,8 @@ def test_backward_dadr(backend, gs, rs, sizes, n_seeds=5, verbose=False):
                 R = torch.randn(N // gs * rs, K, dtype=torch.float16, device="cuda")
                 dC = torch.randn(M, N, dtype=torch.float16, device="cuda")
 
-                dA, dR, _ = cute_prism.backward(dC, A, B, R, gs, rs, backend=backend, activation=act)
-                dA_ref, dR_ref, _ = cute_prism.backward(dC, A, B, R, gs, rs, backend="pytorch", activation=act)
+                dA, dR, _, _ = cute_prism.backward(dC, A, B, R, gs, rs, backend=backend, activation=act)
+                dA_ref, dR_ref, _, _ = cute_prism.backward(dC, A, B, R, gs, rs, backend="pytorch", activation=act)
 
                 ok_a, rel_a = check_close("dA", dA, dA_ref)
                 ok_r, rel_r = check_close("dR", dR, dR_ref)
@@ -88,7 +88,7 @@ def test_backward_dadr(backend, gs, rs, sizes, n_seeds=5, verbose=False):
     return passed, failed
 
 
-def test_backward_db(backend, gs, rs, sizes, n_seeds=5, verbose=False):
+def _run_backward_db(backend, gs, rs, sizes, n_seeds=5, verbose=False):
     passed, failed = 0, 0
     for M, N, K in sizes:
         if N < gs:
@@ -100,8 +100,8 @@ def test_backward_db(backend, gs, rs, sizes, n_seeds=5, verbose=False):
             R = torch.randn(N // gs * rs, K, dtype=torch.float16, device="cuda")
             dC = torch.randn(M, N, dtype=torch.float16, device="cuda")
 
-            _, _, dB = cute_prism.backward(dC, A, B, R, gs, rs, backend=backend, activation="silu_gate")
-            _, _, dB_ref = cute_prism.backward(dC, A, B, R, gs, rs, backend="pytorch", activation="silu_gate")
+            _, _, dB, _ = cute_prism.backward(dC, A, B, R, gs, rs, backend=backend, activation="silu_gate")
+            _, _, dB_ref, _ = cute_prism.backward(dC, A, B, R, gs, rs, backend="pytorch", activation="silu_gate")
 
             ok, rel = check_close("dB", dB, dB_ref)
             label = f"db   gated M={M:4d} seed={seed}"
@@ -148,21 +148,21 @@ def main():
 
     if args.kernel in ("all", "fwd"):
         print(f"=== Forward ({args.backend}) ===")
-        p, f = test_forward(args.backend, gs, rs, sizes, args.seeds, args.verbose)
+        p, f = _run_forward(args.backend, gs, rs, sizes, args.seeds, args.verbose)
         total_passed += p
         total_failed += f
         print(f"Forward: {p} passed, {f} failed\n")
 
     if args.kernel in ("all", "bwd_dadr"):
         print(f"=== Backward dAdR ({args.backend}) ===")
-        p, f = test_backward_dadr(args.backend, gs, rs, sizes, args.seeds, args.verbose)
+        p, f = _run_backward_dadr(args.backend, gs, rs, sizes, args.seeds, args.verbose)
         total_passed += p
         total_failed += f
         print(f"Backward dAdR: {p} passed, {f} failed\n")
 
     if args.kernel in ("all", "bwd_db"):
         print(f"=== Backward dB ({args.backend}) ===")
-        p, f = test_backward_db(args.backend, gs, rs, sizes, args.seeds, args.verbose)
+        p, f = _run_backward_db(args.backend, gs, rs, sizes, args.seeds, args.verbose)
         total_passed += p
         total_failed += f
         print(f"Backward dB: {p} passed, {f} failed\n")
