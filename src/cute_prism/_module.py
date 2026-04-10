@@ -477,9 +477,9 @@ class PrismLinear(nn.Module):
             # Measured empirically: 0.5638 for r=16 (NOT 0.6024 from the
             # independent x*SiLU(y) approximation, which ignores within-block
             # correlation between a and ar).
-            _GATED_SILU_CORRECTION = 1.0 / 0.5638
+            # _GATED_SILU_CORRECTION = 1.0 / 0.5638
             # B: absorb alpha/sqrt(K) into init. No runtime multiplier.
-            nn.init.normal_(self.weight, std=_GATED_SILU_CORRECTION / math.sqrt(self.in_features))
+            nn.init.normal_(self.weight, std=1 / math.sqrt(self.in_features))
             # R: init as block-diagonal skew-symmetric.
             # Form S = M - M^T from random M, so S is skew-symmetric.
             # Var(S_ij) = 2*sigma^2 for off-diagonal, 0 on diagonal.
@@ -487,7 +487,9 @@ class PrismLinear(nn.Module):
             n_groups = self.out_features // self.group_size
             n_blocks = self.in_features // self.reconn_sz
             r = self.reconn_sz
-            sigma = 1.0 / math.sqrt(2 * r)
+            sigma = 4.0 / math.sqrt(2 * r)
+            if self._internal_bias is not None:
+                sigma = 4.0 / math.sqrt(2 * (r - 1))
             M = torch.randn(n_groups, n_blocks, r, r, device=self.reconn.device,
                             dtype=self.reconn.dtype) * sigma
             S = M - M.transpose(-1, -2)
@@ -509,7 +511,7 @@ class PrismLinear(nn.Module):
             # Scale so that std(AR + bias) matches std(AR) at init.
             # bias std ~ std(R @ x) to keep total variance ~ 2x original.
             nn.init.normal_(self._internal_bias,
-                            std=1.0 / math.sqrt(self.reconn_sz))
+                            std=1.0 / math.sqrt(self.reconn_sz - 1))
 
     def _build_R(self) -> torch.Tensor:
         """Construct the reconnection matrix R from the stored parameter.
