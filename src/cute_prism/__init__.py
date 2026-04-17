@@ -67,7 +67,11 @@ __all__ = [
 
 BACKENDS = ("cute", "cublas", "pytorch")
 MODES = ("ar", "rw")
-ACTIVATIONS = (None, "silu_gate")
+ACTIVATIONS = (None, "silu_gate", "sigmoid_gate")
+
+# Runtime gate_kind values passed to the cublas kernels. Must stay in sync
+# with the `GATE_*` enum in torch_ext/cublas_prism_torch.cu.
+_GATE_KIND = {None: 0, "silu_gate": 1, "sigmoid_gate": 2}
 
 
 def forward(
@@ -79,14 +83,14 @@ def forward(
     backend: Literal["cute", "cublas", "pytorch"] = "cute",
     mode: Literal["ar", "rw"] = "ar",
     comp_params: CompParams | Literal["auto"] | None = None,
-    activation: Literal["silu_gate"] | None = None,
+    activation: Literal["silu_gate", "sigmoid_gate"] | None = None,
     autotuning: bool = False,
     autotuning_search_space: Iterable[CompParams | tuple[CompParams, Callable]] | None = None,
     force_rebenchmark: bool = False,
     internal_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     training: bool = False,
-    seg_pairs: torch.Tensor | None = None,
+    shuffle_masks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, list[int] | torch.Tensor]:
     """Compute C = A @ diag(R) @ B^T with Prism structure.
 
@@ -107,8 +111,8 @@ def forward(
             Shape (n_groups, K). Only used in gated mode.
         dropout_p: Dropout probability applied to H = A * SiLU(AR + bias).
         training: Whether in training mode (dropout only active when True).
-        seg_pairs: Optional (n_groups, n_blocks, 2) int64 tensor of per-group
-            segment pair indices for input shuffling. Only supported by the
+        shuffle_masks: Optional (n_groups, n_chunks, n_rounds) int64 tensor of
+            per-group butterfly shuffle masks. Only supported by the
             ``cublas`` and ``pytorch`` backends in AR mode.
 
     Returns:
@@ -135,7 +139,11 @@ def forward(
             f"activation={activation!r} is only supported in mode='ar'"
         )
 
-    gated = activation == "silu_gate"
+    gated = activation is not None
+    if activation == "sigmoid_gate" and backend == "cute":
+        raise ValueError(
+            "activation='sigmoid_gate' is not supported by the 'cute' backend"
+        )
 
     validate_kernel_params(group_size, reconn_sz)
 
@@ -146,11 +154,11 @@ def forward(
             rw_mode=(mode == "rw"), activation=activation,
             internal_bias=internal_bias,
             dropout_p=dropout_p, training=training,
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
 
-    if seg_pairs is not None and backend == "cute":
-        raise ValueError("seg_pairs is not supported with the 'cute' backend")
+    if shuffle_masks is not None and backend == "cute":
+        raise ValueError("shuffle_masks is not supported with the 'cute' backend")
 
     validate_tensor_params(A, B, R, group_size, reconn_sz)
 
@@ -191,8 +199,8 @@ def forward(
     # cublas backend
     module = get_or_compile(group_size, reconn_sz, backend, comp_params)
     results = module.forward(
-        A, B, R, group_size, reconn_sz, mode == "rw", gated,
-        internal_bias, dropout_p, training, seg_pairs,
+        A, B, R, group_size, reconn_sz, mode == "rw", _GATE_KIND[activation],
+        internal_bias, dropout_p, training, shuffle_masks,
     )
     return results[0], results[1]
 
@@ -205,7 +213,7 @@ def backward(
     group_size: int = 256,
     reconn_sz: int = 8,
     backend: Literal["cute", "cublas", "pytorch"] = "pytorch",
-    activation: Literal["silu_gate"] | None = None,
+    activation: Literal["silu_gate", "sigmoid_gate"] | None = None,
     comp_params: CompParams | Literal["auto"] | None = None,
     autotuning: bool = False,
     autotuning_search_space_dadr: Iterable[BwdDAdRCompParams | tuple[BwdDAdRCompParams, Callable]] | None = None,
@@ -218,7 +226,7 @@ def backward(
     internal_bias: torch.Tensor | None = None,
     dropout_seeds: list[int] | torch.Tensor | None = None,
     dropout_p: float = 0.0,
-    seg_pairs: torch.Tensor | None = None,
+    shuffle_masks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Compute gradients for Prism backward pass.
 
@@ -263,7 +271,11 @@ def backward(
 
     validate_kernel_params(group_size, reconn_sz)
 
-    gated = activation == "silu_gate"
+    gated = activation is not None
+    if activation == "sigmoid_gate" and backend == "cute":
+        raise ValueError(
+            "activation='sigmoid_gate' is not supported by the 'cute' backend"
+        )
 
     if backend == "pytorch":
         from ._pytorch_backend import pytorch_backward
@@ -278,28 +290,29 @@ def backward(
             dC, A, B, R, group_size, reconn_sz,
             activation=activation, internal_bias=internal_bias,
             dropout_seeds=py_seeds, dropout_p=dropout_p,
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
 
     validate_tensor_params(A, B, R, group_size, reconn_sz)
 
-    if seg_pairs is not None and backend == "cute":
-        raise ValueError("seg_pairs is not supported with the 'cute' backend")
+    if shuffle_masks is not None and backend == "cute":
+        raise ValueError("shuffle_masks is not supported with the 'cute' backend")
 
     if backend == "cublas":
         module = get_or_compile(group_size, reconn_sz, backend)
+        gk = _GATE_KIND[activation]
         # dropout_seeds is a Tensor from cublas forward
         ds_tensor = dropout_seeds if isinstance(dropout_seeds, torch.Tensor) else None
         grads = module.backward_dA_dR(
-            dC, A, B, R, group_size, reconn_sz, gated, dR_dtype,
-            internal_bias, ds_tensor, dropout_p, seg_pairs,
+            dC, A, B, R, group_size, reconn_sz, gk, dR_dtype,
+            internal_bias, ds_tensor, dropout_p, shuffle_masks,
         )
         dA, dR = grads[0], grads[1]
         d_ib = grads[2] if (len(grads) > 2 and grads[2] is not None and grads[2].numel() > 0) else None
         if gated:
             dB_out = module.backward_dB(
-                dC, A, R, group_size, reconn_sz, gated, dB_dtype,
-                internal_bias, ds_tensor, dropout_p, seg_pairs,
+                dC, A, R, group_size, reconn_sz, gk, dB_dtype,
+                internal_bias, ds_tensor, dropout_p, shuffle_masks,
             )
         else:
             dB_out = None

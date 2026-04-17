@@ -10,10 +10,11 @@ import torch.nn as nn
 
 from ._config import BwdDAdRCompParams, BwdDBCompParams, CompParams
 
-SHUFFLE_SEGMENT_SZ = 8  # 128-bit vectorized load = 8 x fp16
+SHUFFLE_SEGMENT_SZ = 2  # segment = 2 x fp16 = 32 bits, natural for __shfl_xor_sync
 
 
 _GATED_SILU_BWD_GAIN = 1.437  # measured bwd/fwd gain ratio for gated SiLU (M=32768, 10 seeds)
+_GATED_SIGMOID_BWD_GAIN = 1.15  # measured bwd/fwd gain ratio for 2*sigmoid gate at r_init_scale∈[0.25,1.0] (1024->1024, g=64, r=16)
 
 
 class _BwdScaleFn(torch.autograd.Function):
@@ -134,14 +135,14 @@ _prism_forward_op.register_autograd(_prism_backward, setup_context=_prism_setup_
 class _PrismFn(torch.autograd.Function):
     """Unified autograd wrapper for Prism forward/backward.
 
-    Threads internal_bias, dropout, and seg_pairs (input shuffle) through
+    Threads internal_bias, dropout, and shuffle_masks (input shuffle) through
     the main ``forward()`` / ``backward()`` entry points.
     """
 
     @staticmethod
     def forward(ctx, A, B, R, group_size, reconn_sz, backend, activation,
                 autotuning, force_rebenchmark, internal_bias, dropout_p, training,
-                seg_pairs):
+                shuffle_masks):
         from . import forward as prism_forward
 
         C, dropout_seeds = prism_forward(
@@ -153,9 +154,9 @@ class _PrismFn(torch.autograd.Function):
             internal_bias=internal_bias,
             dropout_p=dropout_p,
             training=training,
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
-        ctx.save_for_backward(A, B, R, internal_bias, seg_pairs)
+        ctx.save_for_backward(A, B, R, internal_bias, shuffle_masks)
         ctx.group_size = group_size
         ctx.reconn_sz = reconn_sz
         ctx.backend = backend
@@ -170,7 +171,7 @@ class _PrismFn(torch.autograd.Function):
     def backward(ctx, dC):
         from . import backward as prism_backward
 
-        A, B, R, internal_bias, seg_pairs = ctx.saved_tensors
+        A, B, R, internal_bias, shuffle_masks = ctx.saved_tensors
 
         dA, dR, dB, d_ib = prism_backward(
             dC.contiguous(), A.contiguous(), B.contiguous(), R.contiguous(),
@@ -182,101 +183,71 @@ class _PrismFn(torch.autograd.Function):
             internal_bias=internal_bias,
             dropout_seeds=ctx.dropout_seeds,
             dropout_p=ctx.dropout_p,
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
 
         if dB is None:
             dB = torch.zeros_like(B)
 
-        # Grads: A, B, R, then None x 6 scalar args, internal_bias, None x 2, seg_pairs
+        # Grads: A, B, R, then None x 6 scalar args, internal_bias, None x 2, shuffle_masks
         return dA, dB, dR, None, None, None, None, None, None, d_ib, None, None, None
 
 
 
-def _round_robin_matchings(n: int) -> list[list[tuple[int, int]]]:
-    """Generate all unique perfect matchings via round-robin tournament.
+def _splitmix64(x: int) -> int:
+    """Deterministic bit mixer (same as the CUDA splitmix64 in this file)."""
+    x = (x + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return (x ^ (x >> 31)) & 0xFFFFFFFFFFFFFFFF
 
-    For n players (even), produces n-1 rounds where each round is a perfect
-    matching and no pair appears in more than one round.
+
+def _partition_deltas(n_segments: int, block_size: int) -> list[int]:
+    """XOR deltas that affect the partition of segments into blocks.
+
+    Only power-of-2 deltas >= block_size cross block boundaries.
+    Smaller deltas rearrange within a block, which is irrelevant
+    since R densely connects all elements inside a block.
     """
-    assert n % 2 == 0 and n >= 2
-    matchings = []
-    players = list(range(n))
-    for _ in range(n - 1):
-        matching = [(players[0], players[-1])]
-        for i in range(1, n // 2):
-            matching.append((players[i], players[n - 1 - i]))
-        matchings.append(matching)
-        players = [players[0]] + [players[-1]] + players[1:-1]
-    return matchings
+    return [1 << r for r in range(int(math.log2(n_segments)))
+            if (1 << r) >= block_size]
 
 
-def _build_seg_pairs(
+def _build_shuffle_masks(
     in_features: int, out_features: int, group_size: int,
     reconn_sz: int, shuffle_blk_k: int,
-) -> torch.Tensor:
-    """Build per-group segment pair indices for input shuffling.
+) -> tuple[torch.Tensor, list[int]]:
+    """Build per-group butterfly shuffle masks.
 
-    Group 0 uses identity pairing. Other groups get per-chunk randomized
-    matchings from a round-robin schedule, ensuring maximum diversity
-    even when n_groups exceeds the number of available matchings.
+    Uses a hash-based construction: group 0 gets all-zero masks (identity),
+    groups 1+ get deterministic pseudo-random masks via splitmix64, giving
+    diverse partitions across groups and across chunks.
 
     Returns:
-        (n_groups, n_blocks, 2) int64 tensor of global segment indices.
+        (shuffle_masks, deltas) where:
+        - shuffle_masks: (n_groups, n_chunks, n_rounds) int64 tensor of
+          packed bitmasks (each value has n_pairs = n_segments/2 bits).
+        - deltas: list of XOR deltas for each round (e.g. [8, 16]).
     """
     seg_sz = SHUFFLE_SEGMENT_SZ
     n_groups = out_features // group_size
     n_chunks = in_features // shuffle_blk_k
-    n_segments_per_chunk = shuffle_blk_k // seg_sz
-    n_blocks = in_features // reconn_sz
-    blocks_per_chunk = shuffle_blk_k // reconn_sz
+    n_segments = shuffle_blk_k // seg_sz
+    block_size = reconn_sz // seg_sz
+    n_pairs = n_segments // 2
 
-    all_matchings = _round_robin_matchings(n_segments_per_chunk)
-    n_matchings = len(all_matchings)
+    deltas = _partition_deltas(n_segments, block_size)
+    n_rounds = len(deltas)
+    pair_mask = (1 << n_pairs) - 1
 
-    # Deterministic affine code construction.
-    #
-    # Map each non-identity group g (1-indexed) to (a, b):
-    #   a = (g-1) // n_matchings,  b = (g-1) % n_matchings
-    #
-    # Assignment for group g at chunk c:
-    #   matching_idx = (a * c + b) % n_matchings
-    #
-    # Diversity guarantees:
-    #   - Same a, different b: 0 chunk collisions (constant offset)
-    #   - Different a: ≤ gcd(|a1-a2|, n_matchings) collisions per
-    #     period of n_matchings chunks
-    #   - Supports up to n_matchings^2 + 1 groups deterministically
-    if n_groups - 1 > n_matchings * n_matchings:
-        raise ValueError(
-            f"Too many groups ({n_groups}) for affine construction. "
-            f"Max supported: {n_matchings ** 2 + 1}"
-        )
+    masks = torch.zeros(n_groups, n_chunks, n_rounds, dtype=torch.long)
+    for g in range(1, n_groups):
+        for c in range(n_chunks):
+            for r in range(n_rounds):
+                h = _splitmix64(g * 0xDEADBEEF + c * 0xCAFEBABE + r * 0x12345678)
+                masks[g, c, r] = h & pair_mask
 
-    seg_pairs = torch.zeros(n_groups, n_blocks, 2, dtype=torch.long)
-
-    for g in range(n_groups):
-        if g == 0:
-            # Identity: natural segment pairing
-            for c in range(n_chunks):
-                seg_offset = c * n_segments_per_chunk
-                for b_local in range(blocks_per_chunk):
-                    b_global = c * blocks_per_chunk + b_local
-                    seg_pairs[g, b_global, 0] = seg_offset + 2 * b_local
-                    seg_pairs[g, b_global, 1] = seg_offset + 2 * b_local + 1
-        else:
-            a = (g - 1) // n_matchings
-            b = (g - 1) % n_matchings
-            for c in range(n_chunks):
-                matching_idx = (a * c + b) % n_matchings
-                matching = all_matchings[matching_idx]
-                seg_offset = c * n_segments_per_chunk
-                for b_local, (sa, sb) in enumerate(matching):
-                    b_global = c * blocks_per_chunk + b_local
-                    seg_pairs[g, b_global, 0] = seg_offset + sa
-                    seg_pairs[g, b_global, 1] = seg_offset + sb
-
-    return seg_pairs
+    return masks, deltas
 
 
 class PrismLinear(nn.Module):
@@ -337,10 +308,10 @@ class PrismLinear(nn.Module):
         group_size: int = 256,
         reconn_sz: int = 8,
         bias: bool = True,
-        activation: Literal["silu_gate"] | None = None,
+        activation: Literal["silu_gate", "sigmoid_gate"] | None = None,
         cayley_order: int | float = float("inf"),
         input_shuffle: bool = False,
-        shuffle_blk_k: int = 128,
+        shuffle_blk_k: int = 64,
         backend: Literal["cute", "cublas", "pytorch"] = "cute",
         autotuning: bool = False,
         force_rebenchmark: bool = False,
@@ -349,8 +320,19 @@ class PrismLinear(nn.Module):
         bwd_db_params: BwdDBCompParams | None = None,
         internal_bias: bool = False,
         dropout: float = 0.0,
+        r_init_scale=1.0
     ):
         super().__init__()
+        if activation not in (None, "silu_gate", "sigmoid_gate"):
+            raise ValueError(
+                f"Unknown activation {activation!r}, must be one of "
+                "(None, 'silu_gate', 'sigmoid_gate')"
+            )
+        if activation == "sigmoid_gate" and backend == "cute":
+            raise ValueError(
+                "activation='sigmoid_gate' is not supported with backend='cute'; "
+                "use backend='cublas' (or 'pytorch' as a reference)"
+            )
 
         if out_features % group_size != 0:
             raise ValueError(
@@ -390,9 +372,10 @@ class PrismLinear(nn.Module):
         self.comp_params = comp_params
         self.bwd_dadr_params = bwd_dadr_params
         self.bwd_db_params = bwd_db_params
+        self.r_init_scale = r_init_scale
 
         n_groups = out_features // group_size
-        gated = activation == "silu_gate"
+        gated = activation in ("silu_gate", "sigmoid_gate")
 
         # μP multipliers.
         #
@@ -443,15 +426,22 @@ class PrismLinear(nn.Module):
 
         self.dropout = dropout
 
-        # Input shuffle: build per-group segment pair indices
+        # Input shuffle: build per-group butterfly shuffle masks
         if input_shuffle:
-            seg_pairs = _build_seg_pairs(
+            shuffle_masks, shuffle_deltas = _build_shuffle_masks(
                 in_features, out_features, group_size, reconn_sz, shuffle_blk_k,
             )
-            self.register_buffer("_seg_pairs", seg_pairs)
+            self.register_buffer("_shuffle_masks", shuffle_masks)
+            self._shuffle_deltas = shuffle_deltas
 
-        # Backward scalar correction for gated SiLU's multiplicative gain
-        bwd_gain = _GATED_SILU_BWD_GAIN if activation == "silu_gate" else 1.0
+        # Backward scalar correction for the gated activation's multiplicative gain.
+        # Constants are empirical bwd/fwd gain ratios measured at realistic shapes.
+        if activation == "silu_gate":
+            bwd_gain = _GATED_SILU_BWD_GAIN
+        elif activation == "sigmoid_gate":
+            bwd_gain = _GATED_SIGMOID_BWD_GAIN
+        else:
+            bwd_gain = 1.0
         self._bwd_scale = 1.0 / bwd_gain
 
         self.reset_parameters()
@@ -470,7 +460,7 @@ class PrismLinear(nn.Module):
         be overwritten by pretrained weights). Reconn is initialized to zero
         (delta from identity), so R starts as the block-diagonal identity.
         """
-        gated = self.activation == "silu_gate"
+        gated = self.activation in ("silu_gate", "sigmoid_gate")
 
         if gated:
             # Gain of a * SiLU(a @ r^T) with skew-symmetric R at std=1/sqrt(r).
@@ -487,9 +477,12 @@ class PrismLinear(nn.Module):
             n_groups = self.out_features // self.group_size
             n_blocks = self.in_features // self.reconn_sz
             r = self.reconn_sz
-            sigma = 4.0 / math.sqrt(2 * r)
+            sigma = 4.0 / math.sqrt(2 * (r - 1))
             if self._internal_bias is not None:
-                sigma = 4.0 / math.sqrt(2 * (r - 1))
+                sigma = 4.0 / math.sqrt(2 * (r - 2))
+                
+            scale = getattr(self, 'r_init_scale', 1.0)
+            sigma = sigma * scale
             M = torch.randn(n_groups, n_blocks, r, r, device=self.reconn.device,
                             dtype=self.reconn.dtype) * sigma
             S = M - M.transpose(-1, -2)
@@ -526,7 +519,7 @@ class PrismLinear(nn.Module):
         Returns:
             R tensor of shape (n_groups * reconn_sz, in_features), same dtype/device.
         """
-        if self.activation == "silu_gate":
+        if self.activation in ("silu_gate", "sigmoid_gate"):
             return self.reconn
 
         n_groups = self.out_features // self.group_size
@@ -602,13 +595,13 @@ class PrismLinear(nn.Module):
         with torch.no_grad():
             if self._weight_multiplier != 1.0:
                 self.weight.copy_(weight / self._weight_multiplier)
-            elif self.input_shuffle and self.activation != "silu_gate":
+            elif self.input_shuffle and self.activation not in ("silu_gate", "sigmoid_gate"):
                 # Non-gated finetuning with shuffle: permute B columns per group
                 # so that frozen B is compatible with the shuffled AR layout.
                 n_groups = self.out_features // self.group_size
                 w = weight.clone()
                 for g in range(n_groups):
-                    elem_perm = self._seg_pairs_to_elem_perm(g)
+                    elem_perm = self._shuffle_masks_to_elem_perm(g)
                     w[g * self.group_size : (g + 1) * self.group_size] = \
                         weight[g * self.group_size : (g + 1) * self.group_size][:, elem_perm]
                 self.weight.copy_(w)
@@ -631,7 +624,7 @@ class PrismLinear(nn.Module):
         linear: nn.Linear,
         group_size: int = 256,
         reconn_sz: int = 8,
-        activation: Literal["silu_gate"] | None = None,
+        activation: Literal["silu_gate", "sigmoid_gate"] | None = None,
         backend: Literal["cute", "cublas", "pytorch"] = "cute",
         autotuning: bool = False,
         **kwargs,
@@ -686,14 +679,14 @@ class PrismLinear(nn.Module):
         )
 
         if needs_full_fn:
-            seg_pairs = self._seg_pairs if self.input_shuffle else None
+            shuffle_masks = self._shuffle_masks if self.input_shuffle else None
             C = _PrismFn.apply(
                 A, B, R,
                 self.group_size, self.reconn_sz,
                 self.backend, self.activation or "",
                 self.autotuning, self.force_rebenchmark,
                 self._internal_bias, self.dropout, self.training,
-                seg_pairs,
+                shuffle_masks,
             )
         else:
             # The custom op call is opaque to torch.compile — no graph breaks.
@@ -718,25 +711,44 @@ class PrismLinear(nn.Module):
 
         return C
 
-    def _seg_pairs_to_elem_perm(self, g: int) -> torch.Tensor:
-        """Convert seg_pairs[g] to an element-level permutation of K columns.
+    def _shuffle_masks_to_elem_perm(self, g: int) -> torch.Tensor:
+        """Convert shuffle_masks for group g to an element-level permutation of K columns.
 
-        seg_pairs[g, b] = (seg_a, seg_b) means R block b reads segments
-        seg_a and seg_b. The permuted layout puts them at positions
-        [b*reconn_sz .. (b+1)*reconn_sz). This returns the element indices
-        that map natural order to permuted order.
+        Applies the butterfly shuffle independently per chunk to build the
+        full K-wide element permutation.  Used for weight column pre-permutation
+        in non-gated finetuning mode.
         """
         seg_sz = SHUFFLE_SEGMENT_SZ
-        n_blocks = self._seg_pairs.shape[1]
-        perm = torch.zeros(self.in_features, dtype=torch.long,
-                           device=self._seg_pairs.device)
-        for b in range(n_blocks):
-            sa = self._seg_pairs[g, b, 0]
-            sb = self._seg_pairs[g, b, 1]
-            dst = b * self.reconn_sz
-            offsets = torch.arange(seg_sz, device=self._seg_pairs.device)
-            perm[dst:dst + seg_sz] = sa * seg_sz + offsets
-            perm[dst + seg_sz:dst + 2 * seg_sz] = sb * seg_sz + offsets
+        K = self.in_features
+        n_segments = self.shuffle_blk_k // seg_sz
+        n_chunks = K // self.shuffle_blk_k
+        deltas = self._shuffle_deltas
+
+        perm = torch.arange(K, dtype=torch.long, device=self._shuffle_masks.device)
+        for c in range(n_chunks):
+            masks_gc = self._shuffle_masks[g, c]  # (n_rounds,)
+            # Build segment-level permutation for this chunk
+            seg_perm = list(range(n_segments))
+            for r, delta in enumerate(deltas):
+                mask_bits = int(masks_gc[r].item())
+                new_perm = list(seg_perm)
+                pair_idx = 0
+                for i in range(n_segments):
+                    partner = i ^ delta
+                    if partner > i and partner < n_segments:
+                        if (mask_bits >> pair_idx) & 1:
+                            new_perm[i], new_perm[partner] = new_perm[partner], new_perm[i]
+                        pair_idx += 1
+                seg_perm = new_perm
+            # Convert segment perm to element perm for this chunk
+            chunk_offset = c * self.shuffle_blk_k
+            for dst_seg, src_seg in enumerate(seg_perm):
+                dst_start = chunk_offset + dst_seg * seg_sz
+                src_start = chunk_offset + src_seg * seg_sz
+                perm[dst_start:dst_start + seg_sz] = torch.arange(
+                    src_start, src_start + seg_sz,
+                    device=self._shuffle_masks.device,
+                )
         return perm
 
     def extra_repr(self) -> str:

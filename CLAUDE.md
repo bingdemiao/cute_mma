@@ -7,8 +7,8 @@ High-performance Python library for the Prism linear layer — a block-diagonal 
 - **Prism operation**: Multiplies activation matrix A by block-diagonal orthogonal matrix R and weight matrix B
 - **Backends**: `cute` (JIT-compiled CuTe kernel, default), `cublas` (cuBLAS), `pytorch` (pure PyTorch reference)
 - **Modes**: `ar` (activation reconnection: `(A @ R^T) @ B^T`), `rw` (reweighting: `A @ (B @ R)^T`, cublas/pytorch only)
-- **Activations**: `None` (standard linear mode), `"silu_gate"` (gated: `A * SiLU(A @ R^T)` replaces `A @ R^T`, AR mode only)
-- **Input shuffle** (`cublas`/`pytorch` only): per-group gather of A into a permuted layout before AR, controlled by `seg_pairs: (n_groups, n_blocks, 2)`. Unified with `activation`, `internal_bias`, and `dropout` — all 16 combinations run through a single code path. Shuffle backward uses a non-atomic unpermute-add (gather on the inverse permutation) in place of the old scatter-add fp32 accumulator.
+- **Activations**: `None` (standard linear mode), `"silu_gate"` (gated: `A * SiLU(A @ R^T)` replaces `A @ R^T`, AR mode only, supported by all backends), `"sigmoid_gate"` (bounded gate: `A * 2*sigmoid(A @ R^T)`, AR mode only, **cublas and pytorch backends only** — no `cute` kernel). The sigmoid variant is useful when the linearly-growing `SiLU(S)` term in the dA gate contribution is undesirable; `2*sigmoid(S)` is capped in (0, 2) while `2*sigmoid(0) = 1` matches SiLU's zero slope. Kernel dispatch uses an integer `gate_kind` (0=none, 1=silu_gate, 2=sigmoid_gate) — the Python `_GATE_KIND` dict in `src/cute_prism/__init__.py` must stay in sync with the `GATE_*` enum in `torch_ext/cublas_prism_torch.cu`.
+- **Input shuffle** (`cublas`/`pytorch` only): per-group butterfly shuffle of A via `__shfl_xor_sync` before AR, controlled by `shuffle_masks: (n_groups, n_chunks, n_rounds)`. Uses 2 rounds with XOR deltas [8, 16] and hash-based mask construction (seg_sz=2). Unified with `activation`, `internal_bias`, and `dropout` — all 16 combinations run through a single code path.
 - **CompParams / BwdDAdRCompParams / BwdDBCompParams**: Frozen dataclasses controlling tile sizes, pipeline depths, and warp layouts for each kernel type (forward, backward dA+dR, backward dB)
 - **Autotuning**: Per-kernel autotuning via pipelined compilation + benchmarking (producer-consumer overlap), caches all tested results to disk. Supports generators, callbacks, multi-GPU benchmarking, and `force_rebenchmark`. All compiled kernels are kept on disk across autotune runs (keyed by `group_size/reconn_sz/comp_params`, not MNK). Configs that fail compilation are recorded in a global registry (`compile_failed.json`) and skipped across all MNK sizes.
 - **Safe fallback**: When default `CompParams` fail to compile, `forward()`/`backward()` automatically retry with `safe_defaults()`
@@ -46,6 +46,7 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
 - `cute_prism.forward(A, B, R, group_size, reconn_sz, backend, mode, comp_params, activation, autotuning, autotuning_search_space, force_rebenchmark)` — main entry point
   - `activation=None`: standard mode `C = (A @ R^T) @ B^T`
   - `activation="silu_gate"`: gated mode `C = (A * SiLU(A @ R^T)) @ B^T` (AR mode only)
+  - `activation="sigmoid_gate"`: bounded gated mode `C = (A * 2*sigmoid(A @ R^T)) @ B^T` (AR mode only, cublas/pytorch backends only)
   - `autotuning=True`: check cache first, autotune if miss, use best config
   - `autotuning_search_space`: custom `Iterable[CompParams | (CompParams, callback)]`
 - `cute_prism.backward(dC, A, B, R, group_size, reconn_sz, backend, activation, autotuning, ...)` — backward pass
@@ -72,7 +73,7 @@ Dependencies: `torch`, `einops`, `cmake`, CUDA toolkit, CUTLASS headers.
 - All three `CompParams` classes have a `safe_defaults()` classmethod returning conservative configs that compile for all valid shapes
 - `cute_prism.PrismLinear` — `nn.Module` drop-in replacement for `nn.Linear` with Prism structure
   - `PrismLinear.from_linear(linear, ...)` creates from an existing `nn.Linear`
-  - Standard mode: weight frozen, reconn trainable. Gated mode (`activation="silu_gate"`): both trainable.
+  - Standard mode: weight frozen, reconn trainable. Gated modes (`activation="silu_gate"` or `"sigmoid_gate"`): both trainable. `_GATED_SILU_BWD_GAIN` correction on the backward pass is only applied for `silu_gate`; `sigmoid_gate` gets `_bwd_scale=1.0`.
 
 ### Search space protocol
 - Items: `CompParam` or `(CompParam, callback)` tuples

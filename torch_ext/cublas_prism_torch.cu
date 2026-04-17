@@ -113,106 +113,164 @@ static void gemm_strided_batched_ex(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Input shuffle helpers
+// Input shuffle helpers — butterfly shuffle via __shfl_xor_sync
 // ---------------------------------------------------------------------------
 
-// Gather per-group permuted layout from natural A.
-// seg_pairs: (n_blocks, 2) — for block b, positions [b*rs .. b*rs+seg_sz) read
-// from segment seg_pairs[b,0] and [b*rs+seg_sz .. b*rs+2*seg_sz) from
-// seg_pairs[b,1], where rs = 2 * seg_sz.
+// Butterfly shuffle: one warp = one chunk of 32 segments (64 fp16 elements).
+// Each thread handles one segment (2 elements packed as uint32).
+// Applies n_rounds rounds of conditional XOR-swap, each using one
+// __shfl_xor_sync call.  Deltas are power-of-2 >= block_size (e.g. [8, 16]).
+//
+// Pair indexing: for XOR delta d = 2^r, the mask bit for thread i is at
+// position pair_idx = (i & ((1<<r)-1)) | ((i >> (r+1)) << r), i.e. the
+// lane index with bit r removed.  Both partners (i and i^d) map to the
+// same pair_idx, so the swap decision is always consistent.
+
+// Forward: load from A, shuffle, store to A_perm.
 template<typename T>
-__global__ void gather_segments_kernel(
-    const T* __restrict__ A,         // (M, K) row-major
-    T* __restrict__ A_perm,          // (M, K) permuted layout
-    const int64_t* __restrict__ seg_pairs,  // (n_blocks, 2)
-    int64_t M, int64_t K, int64_t seg_sz)
+__global__ void shuffle_forward_kernel(
+    const T* __restrict__ A,           // (M, K) row-major
+    T* __restrict__ A_perm,            // (M, K) permuted layout
+    const int64_t* __restrict__ masks, // per-group: (n_chunks, n_rounds)
+    int64_t M, int64_t K,
+    int64_t n_chunks,
+    int64_t n_rounds)                  // number of shuffle rounds
 {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = M * K;
-    if (idx >= total) return;
+    int64_t warp_id = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
 
-    int64_t col = idx % K;
-    int64_t row = idx / K;
+    int64_t row   = warp_id / n_chunks;
+    int64_t chunk = warp_id % n_chunks;
+    if (row >= M) return;
 
-    int64_t two_seg = 2 * seg_sz;
-    int64_t block = col / two_seg;
-    int64_t within_block = col % two_seg;
-    int64_t seg_local = within_block / seg_sz;
-    int64_t elem_in_seg = within_block % seg_sz;
+    // Each chunk has 32 segments of 2 elements = 64 elements
+    int64_t col = chunk * 64 + lane * 2;
+    uint32_t val = *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const char*>(A) + (row * K + col) * sizeof(T));
 
-    int64_t src_seg = seg_pairs[block * 2 + seg_local];
-    int64_t src_col = src_seg * seg_sz + elem_in_seg;
+    // Apply shuffle rounds.  Deltas are stored implicitly as the r-th
+    // power of 2 >= block_size.  For reconn_sz=16, seg_sz=2, block_size=8:
+    //   round 0 → delta=8  (log2=3)
+    //   round 1 → delta=16 (log2=4)
+    // These are hard-coded for 2-round / 4-block configuration.
+    {
+        // Round 0: delta = 8, r = 3
+        int64_t m0 = masks[chunk * n_rounds + 0];
+        uint32_t p0 = __shfl_xor_sync(0xFFFFFFFF, val, 8);
+        int pi0 = (lane & 7) | ((lane >> 4) << 3);  // remove bit 3
+        val = ((m0 >> pi0) & 1) ? p0 : val;
+    }
+    {
+        // Round 1: delta = 16, r = 4
+        int64_t m1 = masks[chunk * n_rounds + 1];
+        uint32_t p1 = __shfl_xor_sync(0xFFFFFFFF, val, 16);
+        int pi1 = (lane & 15);  // remove bit 4 (bit 4 is MSB for 5-bit lane)
+        val = ((m1 >> pi1) & 1) ? p1 : val;
+    }
 
-    A_perm[idx] = A[row * K + src_col];
+    *reinterpret_cast<uint32_t*>(
+        reinterpret_cast<char*>(A_perm) + (row * K + col) * sizeof(T)) = val;
 }
 
-// Build per-group inverse permutation. perm_inv[g, c_nat] gives the position
-// in the permuted layout that holds natural column c_nat.
-__global__ void build_perm_inv_kernel(
-    const int64_t* __restrict__ seg_pairs,  // (n_groups, n_blocks, 2)
-    int64_t* __restrict__ perm_inv,          // (n_groups, K)
-    int64_t n_blocks, int64_t K, int64_t seg_sz)
+// Inverse shuffle + accumulate: applies the same masks in REVERSE order
+// (delta=16 first, then delta=8), then adds the result to dA.
+template<typename T>
+__global__ void shuffle_inverse_add_kernel(
+    T* __restrict__ dA,                 // (M, K) natural layout, accumulated
+    const T* __restrict__ dA_perm,      // (M, K) permuted layout
+    const int64_t* __restrict__ masks,  // per-group: (n_chunks, n_rounds)
+    int64_t M, int64_t K,
+    int64_t n_chunks,
+    int64_t n_rounds)
 {
-    int64_t g = blockIdx.y;
-    int64_t c = blockIdx.x * blockDim.x + threadIdx.x;  // permuted column
-    if (c >= K) return;
+    int64_t warp_id = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
 
-    int64_t two_seg = 2 * seg_sz;
-    int64_t block = c / two_seg;
-    int64_t within_block = c % two_seg;
-    int64_t seg_local = within_block / seg_sz;
-    int64_t elem_in_seg = within_block % seg_sz;
+    int64_t row   = warp_id / n_chunks;
+    int64_t chunk = warp_id % n_chunks;
+    if (row >= M) return;
 
-    int64_t src_seg = seg_pairs[(g * n_blocks + block) * 2 + seg_local];
-    int64_t src_col = src_seg * seg_sz + elem_in_seg;
-    perm_inv[g * K + src_col] = c;
+    int64_t col = chunk * 64 + lane * 2;
+    uint32_t val = *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const char*>(dA_perm) + (row * K + col) * sizeof(T));
+
+    // Reverse order: round 1 first (delta=16), then round 0 (delta=8)
+    {
+        int64_t m1 = masks[chunk * n_rounds + 1];
+        uint32_t p1 = __shfl_xor_sync(0xFFFFFFFF, val, 16);
+        int pi1 = (lane & 15);
+        val = ((m1 >> pi1) & 1) ? p1 : val;
+    }
+    {
+        int64_t m0 = masks[chunk * n_rounds + 0];
+        uint32_t p0 = __shfl_xor_sync(0xFFFFFFFF, val, 8);
+        int pi0 = (lane & 7) | ((lane >> 4) << 3);
+        val = ((m0 >> pi0) & 1) ? p0 : val;
+    }
+
+    // Unpack the two T values from uint32 and accumulate into dA via float
+    const T* unpacked = reinterpret_cast<const T*>(&val);
+    int64_t base = row * K + col;
+    float prev0 = to_float(dA[base]);
+    float prev1 = to_float(dA[base + 1]);
+    dA[base]     = from_float<T>(prev0 + to_float(unpacked[0]));
+    dA[base + 1] = from_float<T>(prev1 + to_float(unpacked[1]));
 }
 
-// Non-atomic unpermute-add: dA[row, c] += dA_perm[row, perm_inv[c]].
-// perm_inv is indexed by natural column and gives the permuted-layout
-// position. Since each output element is written exactly once per launch,
-// no atomics are needed (serialization happens across per-group launches
-// on the stream).
+// Fused inverse shuffle + accumulate for gated backward.
+// Inverse-shuffles both dA_perm and dA_gate_perm, adds both to dA.
 template<typename T>
-__global__ void unpermute_add_kernel(
-    T* __restrict__ dA,                  // (M, K) natural layout, accumulated
-    const T* __restrict__ dA_perm,       // (M, K) permuted layout
-    const int64_t* __restrict__ perm_inv,  // (K,)
-    int64_t M, int64_t K)
-{
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = M * K;
-    if (idx >= total) return;
-
-    int64_t col = idx % K;
-    int64_t row = idx / K;
-    int64_t src_col = perm_inv[col];
-    float prev = to_float(dA[idx]);
-    float add = to_float(dA_perm[row * K + src_col]);
-    dA[idx] = from_float<T>(prev + add);
-}
-
-// Fused variant: dA[row, c] += dA_perm[row, perm_inv[c]] + dA_gate_perm[row, perm_inv[c]]
-// Used in shuffle+gated dA/dR backward, replacing the add_kernel + unpermute_add
-// pair with a single pass over (M, K).
-template<typename T>
-__global__ void unpermute_add_with_gate_kernel(
+__global__ void shuffle_inverse_add_with_gate_kernel(
     T* __restrict__ dA,                     // (M, K) natural layout, accumulated
     const T* __restrict__ dA_perm,          // (M, K) permuted: dS_perm @ R_g
-    const T* __restrict__ dA_gate_perm,     // (M, K) permuted: dh * silu(s)
-    const int64_t* __restrict__ perm_inv,   // (K,)
-    int64_t M, int64_t K)
+    const T* __restrict__ dA_gate_perm,     // (M, K) permuted: dh * gate(s)
+    const int64_t* __restrict__ masks,      // per-group: (n_chunks, n_rounds)
+    int64_t M, int64_t K,
+    int64_t n_chunks,
+    int64_t n_rounds)
 {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = M * K;
-    if (idx >= total) return;
+    int64_t warp_id = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
 
-    int64_t col = idx % K;
-    int64_t row = idx / K;
-    int64_t src = row * K + perm_inv[col];
-    float prev = to_float(dA[idx]);
-    float add = to_float(dA_perm[src]) + to_float(dA_gate_perm[src]);
-    dA[idx] = from_float<T>(prev + add);
+    int64_t row   = warp_id / n_chunks;
+    int64_t chunk = warp_id % n_chunks;
+    if (row >= M) return;
+
+    int64_t col = chunk * 64 + lane * 2;
+    int64_t byte_off = (row * K + col) * sizeof(T);
+    uint32_t v1 = *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const char*>(dA_perm) + byte_off);
+    uint32_t v2 = *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const char*>(dA_gate_perm) + byte_off);
+
+    // Reverse order: round 1 (delta=16), then round 0 (delta=8)
+    {
+        int64_t m1 = masks[chunk * n_rounds + 1];
+        uint32_t p1a = __shfl_xor_sync(0xFFFFFFFF, v1, 16);
+        uint32_t p1b = __shfl_xor_sync(0xFFFFFFFF, v2, 16);
+        int pi1 = (lane & 15);
+        bool swap1 = (m1 >> pi1) & 1;
+        v1 = swap1 ? p1a : v1;
+        v2 = swap1 ? p1b : v2;
+    }
+    {
+        int64_t m0 = masks[chunk * n_rounds + 0];
+        uint32_t p0a = __shfl_xor_sync(0xFFFFFFFF, v1, 8);
+        uint32_t p0b = __shfl_xor_sync(0xFFFFFFFF, v2, 8);
+        int pi0 = (lane & 7) | ((lane >> 4) << 3);
+        bool swap0 = (m0 >> pi0) & 1;
+        v1 = swap0 ? p0a : v1;
+        v2 = swap0 ? p0b : v2;
+    }
+
+    // Unpack and accumulate both contributions
+    const T* u1 = reinterpret_cast<const T*>(&v1);
+    const T* u2 = reinterpret_cast<const T*>(&v2);
+    int64_t base = row * K + col;
+    float prev0 = to_float(dA[base]);
+    float prev1 = to_float(dA[base + 1]);
+    dA[base]     = from_float<T>(prev0 + to_float(u1[0]) + to_float(u2[0]));
+    dA[base + 1] = from_float<T>(prev1 + to_float(u1[1]) + to_float(u2[1]));
 }
 
 // Fused forward gate: AR[i] = A[i] * SiLU(AR[i] + bias[i%K])  with optional
@@ -362,6 +420,139 @@ __global__ void silu_gate_backward_fused_reduce_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// sigmoid_gate variants: forward H = A * 2*sigmoid(S), with 2*sigmoid(0) = 1
+// matching silu(0)=0-slope behavior at zero and capping the gate in (0, 2).
+// This bounds the elementwise dA contribution dH * 2*sigmoid(S), replacing
+// the unbounded silu(S) term that grows linearly with |S| at init.
+// ---------------------------------------------------------------------------
+
+// Forward fused gate: AR[i] = A[i] * 2*sigmoid(AR[i] + bias[i%K])  with
+// optional dropout on the result. Same interface and semantics as the
+// silu_gate variant.
+template<typename T>
+__global__ void sigmoid_gate_bias_dropout_kernel(
+    const T* A, T* AR, const T* bias,
+    int64_t M, int64_t K,
+    uint64_t dropout_seed, float dropout_p, float inv_keep)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t numel = M * K;
+    if (idx < numel) {
+        float a = to_float(A[idx]);
+        float ar = to_float(AR[idx]);
+        if (bias) ar += to_float(bias[idx % K]);
+        float sigma = 1.0f / (1.0f + __expf(-ar));
+        float h = a * (2.0f * sigma);
+        if (dropout_seed) {
+            float u = uniform_from_hash(dropout_seed, idx);
+            h = (u >= dropout_p) ? h * inv_keep : 0.0f;
+        }
+        AR[idx] = from_float<T>(h);
+    }
+}
+
+// Fused backward for H = A * 2*sigmoid(S):
+//   dA_gate[i] = dH[i] * 2*sigmoid(S[i])
+//   dS[i]      = dH[i] * A[i] * 2*sigmoid(S[i]) * (1 - sigmoid(S[i]))
+template<typename T, bool ACCUMULATE>
+__global__ void sigmoid_gate_backward_fused_kernel(
+    const T* dH_in, const T* A, T* AR,
+    T* dA_gate, T* dS,
+    const T* bias, int64_t M, int64_t K,
+    uint64_t dropout_seed, float dropout_p, float inv_keep)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t numel = M * K;
+    if (idx < numel) {
+        float s = to_float(AR[idx]);
+        if (bias) s += to_float(bias[idx % K]);
+        AR[idx] = from_float<T>(s);
+
+        float dh = to_float(dH_in[idx]);
+        if (dropout_seed) {
+            float u = uniform_from_hash(dropout_seed, idx);
+            dh = (u >= dropout_p) ? dh * inv_keep : 0.0f;
+        }
+
+        float a = to_float(A[idx]);
+        float sigma = 1.0f / (1.0f + __expf(-s));
+        float two_sigma = 2.0f * sigma;
+        float gate_prime = two_sigma * (1.0f - sigma);
+
+        float dA_gate_val = dh * two_sigma;
+        if (ACCUMULATE) {
+            dA_gate[idx] = from_float<T>(to_float(dA_gate[idx]) + dA_gate_val);
+        } else {
+            dA_gate[idx] = from_float<T>(dA_gate_val);
+        }
+        dS[idx] = from_float<T>(dh * a * gate_prime);
+    }
+}
+
+// Reduce-variant of sigmoid_gate_backward_fused_kernel; adds a column-wise
+// sum of dS into d_ib_f32, analogous to the silu variant.
+template<typename T, bool ACCUMULATE, int BM, int BN>
+__global__ void sigmoid_gate_backward_fused_reduce_kernel(
+    const T* dH_in, const T* A, T* AR,
+    T* dA_gate, T* dS,
+    float* d_ib_f32,
+    const T* bias, int64_t M, int64_t K,
+    uint64_t dropout_seed, float dropout_p, float inv_keep)
+{
+    int64_t col = (int64_t)blockIdx.x * BN + threadIdx.x;
+    int64_t row = (int64_t)blockIdx.y * BM + threadIdx.y;
+
+    float dS_val = 0.0f;
+    if (row < M && col < K) {
+        int64_t idx = row * K + col;
+        float s = to_float(AR[idx]);
+        if (bias) s += to_float(bias[col]);
+        AR[idx] = from_float<T>(s);
+
+        float dh = to_float(dH_in[idx]);
+        if (dropout_seed) {
+            float u = uniform_from_hash(dropout_seed, idx);
+            dh = (u >= dropout_p) ? dh * inv_keep : 0.0f;
+        }
+
+        float a = to_float(A[idx]);
+        float sigma = 1.0f / (1.0f + __expf(-s));
+        float two_sigma = 2.0f * sigma;
+        float gate_prime = two_sigma * (1.0f - sigma);
+
+        float dA_gate_val = dh * two_sigma;
+        if (ACCUMULATE) {
+            dA_gate[idx] = from_float<T>(to_float(dA_gate[idx]) + dA_gate_val);
+        } else {
+            dA_gate[idx] = from_float<T>(dA_gate_val);
+        }
+        dS_val = dh * a * gate_prime;
+        dS[idx] = from_float<T>(dS_val);
+    }
+
+    __shared__ float sm[BM * BN];
+    int sm_idx = threadIdx.y * BN + threadIdx.x;
+    sm[sm_idx] = dS_val;
+    __syncthreads();
+
+    #pragma unroll
+    for (int stride = BM / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.y < stride) {
+            sm[sm_idx] += sm[sm_idx + stride * BN];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.y == 0 && col < K) {
+        atomicAdd(&d_ib_f32[col], sm[threadIdx.x]);
+    }
+}
+
+// Gate-kind enum shared between host dispatch and kernel selection.
+// 0 = none (linear), 1 = silu_gate, 2 = sigmoid_gate.
+enum : int { GATE_NONE = 0, GATE_SILU = 1, GATE_SIGMOID = 2 };
+
 // Cast an fp32 buffer to T (half / bfloat16). Used once per group to
 // finalize that group's d_internal_bias row after the fused reduction.
 template<typename T>
@@ -386,11 +577,12 @@ static void cublas_prism_ar_impl(
     int64_t group_size, int64_t reconn_sz, int64_t n_groups,
     cublasHandle_t handle, cudaDataType_t dt,
     torch::TensorOptions opts,
-    bool gated, cudaStream_t stream,
+    int gate_kind, cudaStream_t stream,
     const scalar_t* internal_bias_ptr = nullptr,
     float dropout_p = 0.0f, bool training = false,
     int64_t* dropout_seeds_out = nullptr,
-    const int64_t* seg_pairs_ptr = nullptr)
+    const int64_t* shuffle_masks_ptr = nullptr,
+    int64_t n_chunks = 0, int64_t n_rounds = 0)
 {
     // Two-stream pipeline: producer (batched AR + gate) overlaps with
     // consumer (dense C_g GEMM) across groups. Double-buffer AR.
@@ -402,13 +594,9 @@ static void cublas_prism_ar_impl(
         AR_ptr[p] = static_cast<scalar_t*>(AR_t[p].data_ptr());
     }
 
-    // Single-buffer A_perm for shuffle mode (gather target, input to AR GEMM
-    // and to the downstream gate kernel). Reused across groups; safe because
-    // every use of A_perm for group g finishes on stream_p before produce(g+1)
-    // writes it again on the same stream.
-    const bool shuffle = seg_pairs_ptr != nullptr;
+    // Single-buffer A_perm for shuffle mode.
+    const bool shuffle = shuffle_masks_ptr != nullptr;
     int64_t n_blocks = k / reconn_sz;
-    int64_t seg_sz = reconn_sz / 2;
     torch::Tensor A_perm_t;
     scalar_t* A_perm_ptr = nullptr;
     if (shuffle) {
@@ -430,6 +618,7 @@ static void cublas_prism_ar_impl(
     int threads = 256;
     bool apply_dropout = training && dropout_p > 0.0f;
     float inv_keep = apply_dropout ? 1.0f / (1.0f - dropout_p) : 1.0f;
+    const bool gated = (gate_kind != GATE_NONE);
     auto device = opts.device();
 
     auto produce = [&](int64_t g, int p) {
@@ -438,10 +627,12 @@ static void cublas_prism_ar_impl(
 
         const scalar_t* A_gemm_in = A_ptr;
         if (shuffle) {
-            gather_segments_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+            int64_t total_warps = m * n_chunks;
+            int shfl_blocks = (int)((total_warps * 32 + threads - 1) / threads);
+            shuffle_forward_kernel<scalar_t><<<shfl_blocks, threads, 0, stream_p>>>(
                 A_ptr, A_perm_ptr,
-                seg_pairs_ptr + g * n_blocks * 2,
-                m, k, seg_sz);
+                shuffle_masks_ptr + g * n_chunks * n_rounds,
+                m, k, n_chunks, n_rounds);
             A_gemm_in = A_perm_ptr;
         }
 
@@ -461,10 +652,17 @@ static void cublas_prism_ar_impl(
                 seed = _nonzero_seed((uint64_t)std::random_device{}());
                 if (dropout_seeds_out) dropout_seeds_out[g] = (int64_t)seed;
             }
-            silu_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
-                A_gemm_in, AR_ptr[p],
-                internal_bias_ptr ? internal_bias_ptr + g * k : nullptr,
-                m, k, seed, dropout_p, inv_keep);
+            const scalar_t* bias_g =
+                internal_bias_ptr ? internal_bias_ptr + g * k : nullptr;
+            if (gate_kind == GATE_SIGMOID) {
+                sigmoid_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+                    A_gemm_in, AR_ptr[p], bias_g,
+                    m, k, seed, dropout_p, inv_keep);
+            } else {
+                silu_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+                    A_gemm_in, AR_ptr[p], bias_g,
+                    m, k, seed, dropout_p, inv_keep);
+            }
         }
 
         cudaEventRecord(ready[p], stream_p);
@@ -553,11 +751,13 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
     cublasHandle_t handle, cudaDataType_t compute_dt,
     torch::TensorOptions compute_opts,
     cudaDataType_t dR_dt, torch::TensorOptions dR_opts,
-    bool gated, cudaStream_t stream,
+    int gate_kind, cudaStream_t stream,
     const scalar_t* internal_bias_ptr = nullptr,
     const int64_t* dropout_seeds = nullptr, float dropout_p = 0.0f,
-    const int64_t* seg_pairs_ptr = nullptr)
+    const int64_t* shuffle_masks_ptr = nullptr,
+    int64_t n_chunks = 0, int64_t n_rounds = 0)
 {
+    const bool gated = (gate_kind != GATE_NONE);
     auto dA  = torch::zeros({m, k}, compute_opts);
     auto dR  = torch::zeros({n_groups * reconn_sz, k}, dR_opts);
     auto d_internal_bias = internal_bias_ptr
@@ -572,15 +772,13 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
     auto* AR_ptr  = static_cast<scalar_t*>(AR.data_ptr());
     auto* dAR_ptr = static_cast<scalar_t*>(dAR.data_ptr());
 
-    // Shuffle-mode scratch buffers and inverse permutation.
-    const bool shuffle = seg_pairs_ptr != nullptr;
+    // Shuffle-mode scratch buffers.
+    const bool shuffle = shuffle_masks_ptr != nullptr;
     int64_t n_blocks = k / reconn_sz;
-    int64_t seg_sz = reconn_sz / 2;
-    torch::Tensor A_perm_t, dA_perm_t, dA_gate_perm_t, perm_inv_t;
+    torch::Tensor A_perm_t, dA_perm_t, dA_gate_perm_t;
     scalar_t* A_perm_ptr = nullptr;
     scalar_t* dA_perm_ptr = nullptr;
     scalar_t* dA_gate_perm_ptr = nullptr;
-    int64_t* perm_inv_ptr = nullptr;
     if (shuffle) {
         A_perm_t = torch::empty({m, k}, compute_opts);
         dA_perm_t = torch::empty({m, k}, compute_opts);
@@ -590,13 +788,6 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
             dA_gate_perm_t = torch::empty({m, k}, compute_opts);
             dA_gate_perm_ptr = static_cast<scalar_t*>(dA_gate_perm_t.data_ptr());
         }
-
-        // (K,) int64 scratch; rebuilt per group inside the loop via
-        // build_perm_inv_kernel launched with gridDim.y = 1. This keeps
-        // perm_inv scratch O(K) rather than O(n_groups * K).
-        auto idx_opts = torch::TensorOptions().dtype(torch::kInt64).device(compute_opts.device());
-        perm_inv_t = torch::empty({k}, idx_opts);
-        perm_inv_ptr = perm_inv_t.data_ptr<int64_t>();
     }
 
     // Parallel streams: overlap AR recompute with dH dense GEMM within each group
@@ -640,26 +831,16 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
         int64_t numel = m * k;
         int nblocks = (int)((numel + threads - 1) / threads);
 
-        // In shuffle mode, gather A→A_perm first. The AR GEMM and downstream
-        // gate_bwd + dR GEMM all read A_perm instead of A.
+        // In shuffle mode, butterfly-shuffle A→A_perm. The AR GEMM and
+        // downstream gate_bwd + dR GEMM all read A_perm instead of A.
         const scalar_t* A_use_ptr = A_ptr;
         if (shuffle) {
-            // Rebuild this group's inverse permutation into the (K,) scratch.
-            // Launched on the main stream so the later unpermute kernels (also
-            // on stream) see it in order without any extra synchronization.
-            {
-                int bx = 256;
-                dim3 pi_grid((int)((k + bx - 1) / bx), 1);
-                build_perm_inv_kernel<<<pi_grid, bx, 0, stream>>>(
-                    seg_pairs_ptr + g * n_blocks * 2,
-                    perm_inv_ptr,
-                    n_blocks, k, seg_sz);
-            }
-
-            gather_segments_kernel<scalar_t><<<nblocks, threads, 0, stream_ar>>>(
+            int64_t total_warps = m * n_chunks;
+            int shfl_blocks = (int)((total_warps * 32 + threads - 1) / threads);
+            shuffle_forward_kernel<scalar_t><<<shfl_blocks, threads, 0, stream_ar>>>(
                 A_ptr, A_perm_ptr,
-                seg_pairs_ptr + g * n_blocks * 2,
-                m, k, seg_sz);
+                shuffle_masks_ptr + g * n_chunks * n_rounds,
+                m, k, n_chunks, n_rounds);
             A_use_ptr = A_perm_ptr;
         }
 
@@ -695,17 +876,18 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
                 //   non-shuffle → accumulate directly into dA (ACCUMULATE=true),
                 //                 no temp buffer.
                 //   shuffle     → write into dA_gate_perm scratch; the
-                //                 unpermute_add_with_gate_kernel below scatters
-                //                 it together with the dS@R contribution.
+                //                 shuffle_inverse_add_with_gate_kernel below
+                //                 scatters it together with the dS@R contribution.
                 scalar_t* dA_gate_dst = shuffle ? dA_gate_perm_ptr : dA_ptr;
 
                 uint64_t seed = has_dropout ? (uint64_t)dropout_seeds[g] : 0ULL;
                 const scalar_t* bias_g =
                     has_bias ? internal_bias_ptr + g * k : nullptr;
 
-                // Fused silu-gate backward. When has_bias, also reduces dS
+                // Fused gate backward. When has_bias, also reduces dS
                 // column-wise into the per-group fp32 scratch d_ib_f32 via
                 // 2D-grid element-wise + block-local reduction + atomicAdd.
+                const bool is_sigmoid = (gate_kind == GATE_SIGMOID);
                 if (has_bias) {
                     // Zero the K-element scratch before this group's pass.
                     cudaMemsetAsync(d_ib_f32_ptr, 0, k * sizeof(float), stream);
@@ -716,21 +898,41 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
                     dim3 grid((int)((k + BN - 1) / BN),
                               (int)((m + BM - 1) / BM));
                     if (shuffle) {
-                        silu_gate_backward_fused_reduce_kernel<
-                            scalar_t, /*ACCUMULATE=*/false, BM, BN>
-                            <<<grid, block, 0, stream>>>(
-                                dAR_ptr, A_use_ptr, AR_ptr,
-                                dA_gate_dst, dAR_ptr,
-                                d_ib_f32_ptr, bias_g,
-                                m, k, seed, dropout_p, inv_keep);
+                        if (is_sigmoid) {
+                            sigmoid_gate_backward_fused_reduce_kernel<
+                                scalar_t, /*ACCUMULATE=*/false, BM, BN>
+                                <<<grid, block, 0, stream>>>(
+                                    dAR_ptr, A_use_ptr, AR_ptr,
+                                    dA_gate_dst, dAR_ptr,
+                                    d_ib_f32_ptr, bias_g,
+                                    m, k, seed, dropout_p, inv_keep);
+                        } else {
+                            silu_gate_backward_fused_reduce_kernel<
+                                scalar_t, /*ACCUMULATE=*/false, BM, BN>
+                                <<<grid, block, 0, stream>>>(
+                                    dAR_ptr, A_use_ptr, AR_ptr,
+                                    dA_gate_dst, dAR_ptr,
+                                    d_ib_f32_ptr, bias_g,
+                                    m, k, seed, dropout_p, inv_keep);
+                        }
                     } else {
-                        silu_gate_backward_fused_reduce_kernel<
-                            scalar_t, /*ACCUMULATE=*/true, BM, BN>
-                            <<<grid, block, 0, stream>>>(
-                                dAR_ptr, A_use_ptr, AR_ptr,
-                                dA_gate_dst, dAR_ptr,
-                                d_ib_f32_ptr, bias_g,
-                                m, k, seed, dropout_p, inv_keep);
+                        if (is_sigmoid) {
+                            sigmoid_gate_backward_fused_reduce_kernel<
+                                scalar_t, /*ACCUMULATE=*/true, BM, BN>
+                                <<<grid, block, 0, stream>>>(
+                                    dAR_ptr, A_use_ptr, AR_ptr,
+                                    dA_gate_dst, dAR_ptr,
+                                    d_ib_f32_ptr, bias_g,
+                                    m, k, seed, dropout_p, inv_keep);
+                        } else {
+                            silu_gate_backward_fused_reduce_kernel<
+                                scalar_t, /*ACCUMULATE=*/true, BM, BN>
+                                <<<grid, block, 0, stream>>>(
+                                    dAR_ptr, A_use_ptr, AR_ptr,
+                                    dA_gate_dst, dAR_ptr,
+                                    d_ib_f32_ptr, bias_g,
+                                    m, k, seed, dropout_p, inv_keep);
+                        }
                     }
 
                     // Cast this group's scratch into d_internal_bias[g].
@@ -740,19 +942,37 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
                         d_ib_f32_ptr, d_ib_base + g * k, k);
                 } else {
                     if (shuffle) {
-                        silu_gate_backward_fused_kernel<
-                            scalar_t, /*ACCUMULATE=*/false>
-                            <<<nblocks, threads, 0, stream>>>(
-                                dAR_ptr, A_use_ptr, AR_ptr,
-                                dA_gate_dst, dAR_ptr,
-                                bias_g, m, k, seed, dropout_p, inv_keep);
+                        if (is_sigmoid) {
+                            sigmoid_gate_backward_fused_kernel<
+                                scalar_t, /*ACCUMULATE=*/false>
+                                <<<nblocks, threads, 0, stream>>>(
+                                    dAR_ptr, A_use_ptr, AR_ptr,
+                                    dA_gate_dst, dAR_ptr,
+                                    bias_g, m, k, seed, dropout_p, inv_keep);
+                        } else {
+                            silu_gate_backward_fused_kernel<
+                                scalar_t, /*ACCUMULATE=*/false>
+                                <<<nblocks, threads, 0, stream>>>(
+                                    dAR_ptr, A_use_ptr, AR_ptr,
+                                    dA_gate_dst, dAR_ptr,
+                                    bias_g, m, k, seed, dropout_p, inv_keep);
+                        }
                     } else {
-                        silu_gate_backward_fused_kernel<
-                            scalar_t, /*ACCUMULATE=*/true>
-                            <<<nblocks, threads, 0, stream>>>(
-                                dAR_ptr, A_use_ptr, AR_ptr,
-                                dA_gate_dst, dAR_ptr,
-                                bias_g, m, k, seed, dropout_p, inv_keep);
+                        if (is_sigmoid) {
+                            sigmoid_gate_backward_fused_kernel<
+                                scalar_t, /*ACCUMULATE=*/true>
+                                <<<nblocks, threads, 0, stream>>>(
+                                    dAR_ptr, A_use_ptr, AR_ptr,
+                                    dA_gate_dst, dAR_ptr,
+                                    bias_g, m, k, seed, dropout_p, inv_keep);
+                        } else {
+                            silu_gate_backward_fused_kernel<
+                                scalar_t, /*ACCUMULATE=*/true>
+                                <<<nblocks, threads, 0, stream>>>(
+                                    dAR_ptr, A_use_ptr, AR_ptr,
+                                    dA_gate_dst, dAR_ptr,
+                                    bias_g, m, k, seed, dropout_p, inv_keep);
+                        }
                     }
                 }
             }
@@ -770,13 +990,13 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
                 1.0f, dA_accum_beta);
 
             if (shuffle) {
-                // Fused: dA[r, c] += dA_perm[r, perm_inv[c]]
-                //                   + dA_gate_perm[r, perm_inv[c]]
-                // One pass over (M, K) instead of add_kernel + unpermute_add.
-                unpermute_add_with_gate_kernel<scalar_t>
-                    <<<nblocks, threads, 0, stream>>>(
+                int64_t total_warps = m * n_chunks;
+                int shfl_blocks = (int)((total_warps * 32 + threads - 1) / threads);
+                shuffle_inverse_add_with_gate_kernel<scalar_t>
+                    <<<shfl_blocks, threads, 0, stream>>>(
                         dA_ptr, dA_perm_ptr, dA_gate_perm_ptr,
-                        perm_inv_ptr, m, k);
+                        shuffle_masks_ptr + g * n_chunks * n_rounds,
+                        m, k, n_chunks, n_rounds);
             }
 
             // dR_g[b] = dS_g^T @ A_use
@@ -811,8 +1031,12 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> cublas_backward_d
                 1.0f, dA_accum_beta);
 
             if (shuffle) {
-                unpermute_add_kernel<scalar_t><<<nblocks, threads, 0, stream>>>(
-                    dA_ptr, dA_perm_ptr, perm_inv_ptr, m, k);
+                int64_t total_warps = m * n_chunks;
+                int shfl_blocks = (int)((total_warps * 32 + threads - 1) / threads);
+                shuffle_inverse_add_kernel<scalar_t><<<shfl_blocks, threads, 0, stream>>>(
+                    dA_ptr, dA_perm_ptr,
+                    shuffle_masks_ptr + g * n_chunks * n_rounds,
+                    m, k, n_chunks, n_rounds);
             }
 
             // dR_g[b] = dAR_g^T @ A_use
@@ -849,11 +1073,13 @@ static torch::Tensor cublas_backward_dB_impl(
     cublasHandle_t handle, cudaDataType_t compute_dt,
     torch::TensorOptions compute_opts,
     cudaDataType_t dB_dt, torch::TensorOptions dB_opts,
-    bool gated, cudaStream_t stream,
+    int gate_kind, cudaStream_t stream,
     const scalar_t* internal_bias_ptr = nullptr,
     const int64_t* dropout_seeds = nullptr, float dropout_p = 0.0f,
-    const int64_t* seg_pairs_ptr = nullptr)
+    const int64_t* shuffle_masks_ptr = nullptr,
+    int64_t n_chunks = 0, int64_t n_rounds = 0)
 {
+    const bool gated = (gate_kind != GATE_NONE);
     auto dB = torch::zeros({n, k}, dB_opts);
     void* dB_raw  = dB.data_ptr();
     int64_t dB_es = dB.element_size();
@@ -868,9 +1094,8 @@ static torch::Tensor cublas_backward_dB_impl(
     }
 
     // Single-buffer A_perm for shuffle mode.
-    const bool shuffle = seg_pairs_ptr != nullptr;
+    const bool shuffle = shuffle_masks_ptr != nullptr;
     int64_t n_blocks = k / reconn_sz;
-    int64_t seg_sz = reconn_sz / 2;
     torch::Tensor A_perm_t;
     scalar_t* A_perm_ptr = nullptr;
     if (shuffle) {
@@ -902,10 +1127,12 @@ static torch::Tensor cublas_backward_dB_impl(
 
         const scalar_t* A_gemm_in = A_ptr;
         if (shuffle) {
-            gather_segments_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+            int64_t total_warps = m * n_chunks;
+            int shfl_blocks = (int)((total_warps * 32 + threads - 1) / threads);
+            shuffle_forward_kernel<scalar_t><<<shfl_blocks, threads, 0, stream_p>>>(
                 A_ptr, A_perm_ptr,
-                seg_pairs_ptr + g * n_blocks * 2,
-                m, k, seg_sz);
+                shuffle_masks_ptr + g * n_chunks * n_rounds,
+                m, k, n_chunks, n_rounds);
             A_gemm_in = A_perm_ptr;
         }
 
@@ -922,10 +1149,17 @@ static torch::Tensor cublas_backward_dB_impl(
             // single kernel handles all four sub-cases (plain / bias / dropout
             // / bias+dropout).
             uint64_t seed = has_dropout ? (uint64_t)dropout_seeds[g] : 0ULL;
-            silu_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
-                A_gemm_in, AR_ptr[p],
-                has_bias ? internal_bias_ptr + g * k : nullptr,
-                m, k, seed, dropout_p, inv_keep);
+            const scalar_t* bias_g =
+                has_bias ? internal_bias_ptr + g * k : nullptr;
+            if (gate_kind == GATE_SIGMOID) {
+                sigmoid_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+                    A_gemm_in, AR_ptr[p], bias_g,
+                    m, k, seed, dropout_p, inv_keep);
+            } else {
+                silu_gate_bias_dropout_kernel<scalar_t><<<nblocks, threads, 0, stream_p>>>(
+                    A_gemm_in, AR_ptr[p], bias_g,
+                    m, k, seed, dropout_p, inv_keep);
+            }
         }
 
         cudaEventRecord(ready[p], stream_p);
@@ -1051,11 +1285,11 @@ std::vector<torch::Tensor> cublas_prism_forward(
     int64_t group_size,
     int64_t reconn_sz,
     bool rw_mode,
-    bool gated,
+    int64_t gate_kind,
     c10::optional<torch::Tensor> internal_bias,
     double dropout_p,
     bool training,
-    c10::optional<torch::Tensor> seg_pairs)
+    c10::optional<torch::Tensor> shuffle_masks)
 {
     auto dtype = validate_forward_inputs(A, B, R, group_size, reconn_sz);
     auto cuda_dt = torch_to_cublas_dtype(dtype);
@@ -1065,24 +1299,27 @@ std::vector<torch::Tensor> cublas_prism_forward(
     int64_t n = B.size(0);
     int64_t n_groups = n / group_size;
 
+    TORCH_CHECK(gate_kind == GATE_NONE || gate_kind == GATE_SILU || gate_kind == GATE_SIGMOID,
+                "gate_kind must be 0 (none), 1 (silu_gate), or 2 (sigmoid_gate), got ", gate_kind);
+    const bool gated = (gate_kind != GATE_NONE);
     TORCH_CHECK(!gated || !rw_mode,
                 "Gated activation is only supported in AR mode, not RW mode");
 
-    const int64_t* seg_pairs_ptr = nullptr;
-    if (seg_pairs.has_value() && seg_pairs->defined()) {
-        TORCH_CHECK(!rw_mode, "seg_pairs not supported in rw_mode");
-        TORCH_CHECK(seg_pairs->is_cuda() && seg_pairs->device() == A.device(),
-                    "seg_pairs must be on the same CUDA device as A");
-        TORCH_CHECK(seg_pairs->scalar_type() == at::kLong, "seg_pairs must be int64");
-        TORCH_CHECK(seg_pairs->is_contiguous(), "seg_pairs must be contiguous");
-        seg_pairs_ptr = seg_pairs->data_ptr<int64_t>();
+    const int64_t* shuffle_masks_ptr = nullptr;
+    int64_t n_chunks = 0, n_rounds = 0;
+    if (shuffle_masks.has_value() && shuffle_masks->defined()) {
+        TORCH_CHECK(!rw_mode, "shuffle_masks not supported in rw_mode");
+        TORCH_CHECK(shuffle_masks->is_cuda() && shuffle_masks->device() == A.device(),
+                    "shuffle_masks must be on the same CUDA device as A");
+        TORCH_CHECK(shuffle_masks->scalar_type() == at::kLong, "shuffle_masks must be int64");
+        TORCH_CHECK(shuffle_masks->is_contiguous(), "shuffle_masks must be contiguous");
+        shuffle_masks_ptr = shuffle_masks->data_ptr<int64_t>();
+        n_chunks = shuffle_masks->size(1);
+        n_rounds = shuffle_masks->size(2);
     }
 
     auto C = torch::zeros({m, n}, A.options());
 
-    // Allocate dropout seeds tensor on the CPU. The kernel receives seeds as
-    // scalar uint64_t launch parameters, so we only need host-side storage
-    // for them; it's also returned to Python for backward replay.
     auto seeds_opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
     auto dropout_seeds_t = torch::zeros({n_groups}, seeds_opts);
     int64_t* seeds_ptr = dropout_seeds_t.data_ptr<int64_t>();
@@ -1108,7 +1345,8 @@ std::vector<torch::Tensor> cublas_prism_forward(
         else \
             cublas_prism_ar_impl<cpp_type>(A_p, B_p, R_p, C_p, m, n, k, \
                 group_size, reconn_sz, n_groups, handle, cuda_dt, A.options(), \
-                gated, stream, ib_p, dp, training, seeds_ptr, seg_pairs_ptr); \
+                (int)gate_kind, stream, ib_p, dp, training, seeds_ptr, \
+                shuffle_masks_ptr, n_chunks, n_rounds); \
     }
 
     if (dtype == at::kHalf) {
@@ -1129,13 +1367,15 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
     torch::Tensor R,
     int64_t group_size,
     int64_t reconn_sz,
-    bool gated,
+    int64_t gate_kind,
     c10::optional<at::ScalarType> dR_dtype,
     c10::optional<torch::Tensor> internal_bias,
     c10::optional<torch::Tensor> dropout_seeds,
     double dropout_p,
-    c10::optional<torch::Tensor> seg_pairs)
+    c10::optional<torch::Tensor> shuffle_masks)
 {
+    TORCH_CHECK(gate_kind == GATE_NONE || gate_kind == GATE_SILU || gate_kind == GATE_SIGMOID,
+                "gate_kind must be 0 (none), 1 (silu_gate), or 2 (sigmoid_gate), got ", gate_kind);
     auto dtype = validate_backward_inputs(dC, A, R);
     TORCH_CHECK(B.is_cuda() && B.scalar_type() == dtype && B.is_contiguous(),
                 "B must be a contiguous CUDA tensor with dtype ", dtype);
@@ -1157,22 +1397,22 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
     GEMM_CHECK_CUBLAS(cublasSetStream(handle, stream));
 
     float dp = (float)dropout_p;
-    // Seeds are consumed by host code (passed as kernel launch scalars), so
-    // they must live in CPU memory. Forward allocates them on CPU; accept a
-    // GPU tensor defensively by moving to CPU.
     torch::Tensor seeds_cpu;
     const int64_t* seeds_ptr = nullptr;
     if (dropout_seeds.has_value() && dropout_seeds->defined()) {
         seeds_cpu = dropout_seeds->is_cpu() ? *dropout_seeds : dropout_seeds->cpu();
         seeds_ptr = seeds_cpu.data_ptr<int64_t>();
     }
-    const int64_t* seg_pairs_ptr = nullptr;
-    if (seg_pairs.has_value() && seg_pairs->defined()) {
-        TORCH_CHECK(seg_pairs->is_cuda() && seg_pairs->device() == A.device(),
-                    "seg_pairs must be on the same CUDA device as A");
-        TORCH_CHECK(seg_pairs->scalar_type() == at::kLong, "seg_pairs must be int64");
-        TORCH_CHECK(seg_pairs->is_contiguous(), "seg_pairs must be contiguous");
-        seg_pairs_ptr = seg_pairs->data_ptr<int64_t>();
+    const int64_t* shuffle_masks_ptr = nullptr;
+    int64_t n_chunks = 0, n_rounds = 0;
+    if (shuffle_masks.has_value() && shuffle_masks->defined()) {
+        TORCH_CHECK(shuffle_masks->is_cuda() && shuffle_masks->device() == A.device(),
+                    "shuffle_masks must be on the same CUDA device as A");
+        TORCH_CHECK(shuffle_masks->scalar_type() == at::kLong, "shuffle_masks must be int64");
+        TORCH_CHECK(shuffle_masks->is_contiguous(), "shuffle_masks must be contiguous");
+        shuffle_masks_ptr = shuffle_masks->data_ptr<int64_t>();
+        n_chunks = shuffle_masks->size(1);
+        n_rounds = shuffle_masks->size(2);
     }
 
     torch::Tensor dA, dR_out, d_ib;
@@ -1187,8 +1427,8 @@ std::vector<torch::Tensor> cublas_backward_dA_dR(
             ? static_cast<const cpp_type*>(internal_bias->data_ptr()) : nullptr; \
         std::tie(dA, dR_out, d_ib) = cublas_backward_dA_dR_impl<cpp_type>( \
             dC_p, A_p, B_p, R_p, m, n, k, group_size, reconn_sz, n_groups, \
-            handle, compute_dt, A.options(), dR_dt, dR_opts, gated, stream, \
-            ib_p, seeds_ptr, dp, seg_pairs_ptr); \
+            handle, compute_dt, A.options(), dR_dt, dR_opts, (int)gate_kind, stream, \
+            ib_p, seeds_ptr, dp, shuffle_masks_ptr, n_chunks, n_rounds); \
     }
 
     if (dtype == at::kHalf) {
@@ -1208,13 +1448,15 @@ torch::Tensor cublas_backward_dB(
     torch::Tensor R,
     int64_t group_size,
     int64_t reconn_sz,
-    bool gated,
+    int64_t gate_kind,
     c10::optional<at::ScalarType> dB_dtype,
     c10::optional<torch::Tensor> internal_bias,
     c10::optional<torch::Tensor> dropout_seeds,
     double dropout_p,
-    c10::optional<torch::Tensor> seg_pairs)
+    c10::optional<torch::Tensor> shuffle_masks)
 {
+    TORCH_CHECK(gate_kind == GATE_NONE || gate_kind == GATE_SILU || gate_kind == GATE_SIGMOID,
+                "gate_kind must be 0 (none), 1 (silu_gate), or 2 (sigmoid_gate), got ", gate_kind);
     auto dtype = validate_backward_inputs(dC, A, R);
     validate_grad_dtype(dB_dtype, "dB_dtype");
 
@@ -1240,13 +1482,16 @@ torch::Tensor cublas_backward_dB(
         seeds_cpu = dropout_seeds->is_cpu() ? *dropout_seeds : dropout_seeds->cpu();
         seeds_ptr = seeds_cpu.data_ptr<int64_t>();
     }
-    const int64_t* seg_pairs_ptr = nullptr;
-    if (seg_pairs.has_value() && seg_pairs->defined()) {
-        TORCH_CHECK(seg_pairs->is_cuda() && seg_pairs->device() == A.device(),
-                    "seg_pairs must be on the same CUDA device as A");
-        TORCH_CHECK(seg_pairs->scalar_type() == at::kLong, "seg_pairs must be int64");
-        TORCH_CHECK(seg_pairs->is_contiguous(), "seg_pairs must be contiguous");
-        seg_pairs_ptr = seg_pairs->data_ptr<int64_t>();
+    const int64_t* shuffle_masks_ptr = nullptr;
+    int64_t n_chunks = 0, n_rounds = 0;
+    if (shuffle_masks.has_value() && shuffle_masks->defined()) {
+        TORCH_CHECK(shuffle_masks->is_cuda() && shuffle_masks->device() == A.device(),
+                    "shuffle_masks must be on the same CUDA device as A");
+        TORCH_CHECK(shuffle_masks->scalar_type() == at::kLong, "shuffle_masks must be int64");
+        TORCH_CHECK(shuffle_masks->is_contiguous(), "shuffle_masks must be contiguous");
+        shuffle_masks_ptr = shuffle_masks->data_ptr<int64_t>();
+        n_chunks = shuffle_masks->size(1);
+        n_rounds = shuffle_masks->size(2);
     }
 
     torch::Tensor dB;
@@ -1260,8 +1505,8 @@ torch::Tensor cublas_backward_dB(
             ? static_cast<const cpp_type*>(internal_bias->data_ptr()) : nullptr; \
         dB = cublas_backward_dB_impl<cpp_type>( \
             dC_p, A_p, R_p, m, n, k, group_size, reconn_sz, n_groups, \
-            handle, compute_dt, A.options(), dB_dt, dB_opts, gated, stream, \
-            ib_p, seeds_ptr, dp, seg_pairs_ptr); \
+            handle, compute_dt, A.options(), dB_dt, dB_opts, (int)gate_kind, stream, \
+            ib_p, seeds_ptr, dp, shuffle_masks_ptr, n_chunks, n_rounds); \
     }
 
     if (dtype == at::kHalf) {

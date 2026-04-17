@@ -25,7 +25,7 @@ This replaces the linear reconnection with a gated non-linearity, enabling riche
 - **Three backends**: `cute` (JIT-compiled CuTe tensor core kernels, default), `cublas` (cuBLAS GEMM), `pytorch` (pure PyTorch reference)
 - **Forward and backward**: Full differentiable support with separate, independently tunable kernels for forward, backward dA+dR, and backward dB passes
 - **Automatic autotuning**: Pipelined compilation + benchmarking discovers the fastest kernel configuration for each problem shape, with results cached to disk
-- **Gated activation**: Optional `silu_gate` mode for gated Prism (`A * SiLU(A @ R^T)`)
+- **Gated activation**: Optional gated modes for Prism — `silu_gate` (`A * SiLU(A @ R^T)`) or `sigmoid_gate` (`A * 2*sigmoid(A @ R^T)`, cublas backend only). The sigmoid variant caps the elementwise gate in (0, 2), bounding the dA contribution that grows linearly with S under SiLU.
 - **Two computation modes**: `ar` (activation reconnection) and `rw` (reweighting, cublas/pytorch only)
 - **Safe fallback**: If a kernel configuration fails to compile, the library automatically retries with conservative defaults
 - **Compile-failure caching**: Configurations that fail to compile are recorded globally and skipped in future autotuning runs, even for different input shapes
@@ -143,20 +143,33 @@ C = cute_prism.forward(A, B, R, group_size, reconn_sz, backend="pytorch")
 
 ## Gated activation
 
-The `silu_gate` activation replaces the linear reconnection with a gated non-linearity. Combined with the group structure of R, this acts as a width expansion — each group provides an independent transformation pathway, and the non-linearity prevents R from collapsing into B. In this mode, both R and B are trainable, and the backward pass computes all three gradients (dA, dR, dB).
+A gated activation replaces the linear reconnection with a gated non-linearity. Combined with the group structure of R, this acts as a width expansion — each group provides an independent transformation pathway, and the non-linearity prevents R from collapsing into B. In gated modes, both R and B are trainable and the backward pass computes all three gradients (dA, dR, dB).
+
+Two gate kinds are supported:
+
+| `activation`     | Forward                   | Backends            | Notes |
+|------------------|---------------------------|---------------------|-------|
+| `"silu_gate"`    | `A * SiLU(A @ R^T + b)`   | `cute`, `cublas`, `pytorch` | Unbounded gate — `dA_gate = dH * SiLU(S)` grows linearly with S. |
+| `"sigmoid_gate"` | `A * 2*sigmoid(A @ R^T + b)` | `cublas`, `pytorch` | Gate is bounded in (0, 2), so the elementwise `dA_gate = dH * 2σ(S)` stays bounded and does not scale with |S|. `2σ(0) = 1` matches SiLU's behavior at zero. |
 
 ```python
-# Forward with gated activation
-C = cute_prism.forward(A, B, R, group_size, reconn_sz, activation="silu_gate")
+# Forward with SiLU-gated activation
+C, _ = cute_prism.forward(A, B, R, group_size, reconn_sz, activation="silu_gate")
 
-# Backward — returns (dA, dR, dB) where dB is not None
-dA, dR, dB = cute_prism.backward(
+# Forward with the bounded sigmoid gate (cublas only)
+C, _ = cute_prism.forward(
+    A, B, R, group_size, reconn_sz,
+    backend="cublas", activation="sigmoid_gate",
+)
+
+# Backward — returns (dA, dR, dB, d_internal_bias); dB is not None in gated modes
+dA, dR, dB, d_ib = cute_prism.backward(
     dC, A, B, R, group_size, reconn_sz,
-    backend="cute", activation="silu_gate",
+    backend="cublas", activation="sigmoid_gate",
 )
 ```
 
-Without `silu_gate` (standard mode), B is frozen and `dB` is returned as `None`.
+Without an activation (standard mode), B is frozen and `dB` is returned as `None`.
 
 ## Autotuning
 
@@ -274,7 +287,7 @@ With `reconn_sz=16` and `segment_sz=8`, each R block pairs exactly 2 segments. P
 - Group `g`'s matching at chunk `c` is `(a * c + b) % n_matchings` where `a, b` are derived from `g`
 - Same-`a` groups have **zero** chunk collisions; supports up to `n_matchings² + 1` groups without repetition
 
-The segment pair assignments are stored as a buffer (`_seg_pairs`) and saved with model checkpoints.
+The shuffle mask assignments are stored as a buffer (`_shuffle_masks`) and saved with model checkpoints.
 
 ### Constraints
 
@@ -380,7 +393,7 @@ optimizer = MuAdamW(model.parameters(), lr=0.01)
 | `group_size` | `256` | Output channels per reconnection group |
 | `reconn_sz` | `8` | Block size of orthogonal reconnection matrix |
 | `bias` | `True` | Learnable output bias |
-| `activation` | `None` | `None` (standard mode) or `"silu_gate"` (gated/width expansion) |
+| `activation` | `None` | `None` (standard mode), `"silu_gate"` (gated/width expansion), or `"sigmoid_gate"` (bounded gate, cublas-only) |
 | `cayley_order` | `inf` | Cayley approximation order (`inf` = exact, `k` = k-th order) |
 | `input_shuffle` | `False` | Per-group segment shuffling for cross-block feature mixing |
 | `shuffle_blk_k` | `128` | Shuffle locality chunk size |

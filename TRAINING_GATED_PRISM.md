@@ -69,7 +69,7 @@ Split parameters into groups with different weight decay:
 | Parameter | Recommended WD |
 |---|---|
 | `weight` (B) | Normal pretraining value (e.g., 0.1) |
-| `reconn` (R) | Small — `0.1×` to `0.01×` of B's WD, but **not zero** |
+| `reconn` (R) | Small but **not zero**. A rule of thumb is `~0.1×` B's WD. See "On R's WD magnitude" below. |
 | `_internal_bias` (if used) | Normal-to-aggressive (≥ B's WD) |
 | `bias` (output bias) | 0 |
 | Norm layers (GroupNorm/LN affine) | 0 |
@@ -88,8 +88,45 @@ Split parameters into groups with different weight decay:
   entries back toward zero where they can get unstuck.
 - Do NOT use large WD on R. R → 0 makes `SiLU(AR) → 0.5·AR`, collapsing
   the gate into a scaled bilinear map and killing the nonlinearity that
-  justifies gating in the first place. Keep WD on R at least 10× smaller
-  than on B.
+  justifies gating in the first place.
+
+**On R's WD magnitude:**
+
+The `~0.1×` rule is a rule of thumb, not a calibrated number — it's
+driven by the intuition "small enough to not collapse the gate, large
+enough to unstick dead entries" and has not been swept. Treat it as a
+starting point, not a prescription, and tune within a modest range
+(e.g., `0.01×` to `0.3×` of B's WD) if the dead-gate or R-drift
+monitors in §8 trip.
+
+**R's WD should NOT scale with model width under muP.**
+
+R has constant fan-in = fan-out = `reconn_sz`, independent of the
+model's hidden width K. This is *by design*: R is block-diagonal,
+and each block is a small `(r × r)` orthogonal-like matrix whose
+statistics don't care how wide the surrounding layer is. Its effective
+width is `r`, not `K`.
+
+Under muP, MuAdamW scales `weight_decay` up by `width_mult` for any
+parameter where **both** dimensions are infinite (scale with width).
+That's appropriate for B in a hidden–hidden `PrismLinear` (which
+*does* scale both dims with width) — the scaling keeps B's
+regularization dynamics constant as you widen the model.
+
+`mup_fix_prism_shapes` marks R's K-dim as finite, so R ends up with
+`ninf == 1` and is routed into MuAdamW's vector-like bucket, which
+receives **no** width scaling. This is correct: R's effective fan-in
+is `r`, not the full width, so there's nothing for muP to compensate
+for. Practically, the base WD you set on R is the WD that applies at
+every width — you do not (and should not) apply `× width_mult` to R's
+WD yourself.
+
+A consequence worth noting: as you widen the model, the ratio between
+R's WD and the `ninf == 2` portion of B's WD (the hidden→hidden
+`PrismLinear`'s weight) grows linearly with `width_mult`. That's
+expected and fine — B is being *scaled up* to track the larger layer,
+R is staying put because it operates at a fixed, width-independent
+scale.
 
 **Why `_internal_bias` should be regularized aggressively:**
 
@@ -98,7 +135,7 @@ restoring force, and once it pushes the gate deep into saturation it
 gets stuck there because the gradient is zero. Regularizing it hard is
 cheap insurance.
 
-Example with AdamW:
+Example with AdamW / MuAdamW:
 
 ```python
 decay, r_decay, ib_decay, no_decay = [], [], [], []
@@ -114,9 +151,13 @@ for name, p in model.named_parameters():
     else:
         decay.append(p)
 
-optimizer = AdamW([
+# Pass these directly to MuAdamW. Do NOT hand-scale r_decay's WD by
+# width_mult — muP's finite K-dim on R (via mup_fix_prism_shapes)
+# already ensures R receives no width-dependent WD scaling, which is
+# the intended behavior.
+optimizer = MuAdamW([
     {"params": decay,    "weight_decay": 0.1},
-    {"params": r_decay,  "weight_decay": 0.01},    # 10× smaller
+    {"params": r_decay,  "weight_decay": 0.01},    # rule of thumb, ~0.1× of B's WD
     {"params": ib_decay, "weight_decay": 0.1},
     {"params": no_decay, "weight_decay": 0.0},
 ], lr=base_lr)
@@ -199,12 +240,21 @@ failure modes before they get expensive.
 - **Do not override `reset_parameters`** unless you know the current
   init is wrong for your config. The current scheme is calibrated to
   produce ~unit fwd/bwd gain through PrismLinear → GroupNorm.
-- **Do not apply weight decay to R with the same strength as B.** 10×
-  smaller is a reasonable default.
+- **Do not apply weight decay to R with the same strength as B.** A
+  rule-of-thumb starting point is `~0.1×` B's WD; see §4 for the
+  reasoning. The exact factor is not load-bearing and has not been
+  calibrated — tune it if your monitors say so.
+- **Do not manually scale R's WD by `width_mult` as you widen the
+  model.** R has constant fan-in/fan-out = `reconn_sz`, so there is
+  nothing for muP to compensate for on R. `mup_fix_prism_shapes`
+  already routes R into MuAdamW's vector-like bucket (no width
+  scaling), which is the intended behavior. Applying `× width_mult`
+  to R's WD on top of that would over-regularize R at large widths
+  and eventually collapse the gate.
 - **Do not insert `nn.Dropout` between stacked PrismLinears.** Use the
   layer's `dropout` kwarg instead.
 - **Do not omit `mup_fix_prism_shapes`** when using muP. Without it,
-  R's LR scales incorrectly with width.
+  R's LR (and WD) will scale incorrectly with width.
 - **Do not use `LayerNorm` over all out_features** as the downstream
   norm. Use `GroupNorm(num_groups=n_groups)` so the pathways stay
   independent.

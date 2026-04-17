@@ -24,9 +24,9 @@ from einops import rearrange
 import cute_prism
 from cute_prism._pytorch_backend import (
     _dropout_mask_from_seed,
-    _seg_pairs_to_elem_perm,
+    _shuffle_masks_to_elem_perm,
 )
-from cute_prism._module import _build_seg_pairs
+from cute_prism._module import _build_shuffle_masks
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ def autograd_reference(
     A, B, R, group_size, reconn_sz,
     activation=None, internal_bias=None,
     dropout_p=0.0, dropout_seeds=None,
-    seg_pairs=None,
+    shuffle_masks=None,
 ):
     M, K = A.shape
     N = B.shape[0]
@@ -56,8 +56,8 @@ def autograd_reference(
 
     C_parts = []
     for g in range(n_groups):
-        if seg_pairs is not None:
-            perm = _seg_pairs_to_elem_perm(seg_pairs[g], K, reconn_sz)
+        if shuffle_masks is not None:
+            perm = _shuffle_masks_to_elem_perm(shuffle_masks[g], K, 64, reconn_sz)
             A_g = A.index_select(1, perm)
         else:
             A_g = A
@@ -131,11 +131,12 @@ def make_inputs(M, K, N, gs, rs, has_bias, shuffle, dtype, device):
     internal_bias = None
     if has_bias:
         internal_bias = torch.randn(n_groups, K, device=device, dtype=dtype)
-    seg_pairs = None
+    shuffle_masks = None
     if shuffle:
-        seg_pairs = _build_seg_pairs(K, N, gs, rs, shuffle_blk_k=128).to(device)
+        shuffle_masks, _deltas = _build_shuffle_masks(K, N, gs, rs, shuffle_blk_k=64)
+        shuffle_masks = shuffle_masks.to(device)
     dC = torch.randn(M, N, device=device, dtype=dtype)
-    return A, B, R, internal_bias, seg_pairs, dC
+    return A, B, R, internal_bias, shuffle_masks, dC
 
 
 def bench_backend(
@@ -143,7 +144,7 @@ def bench_backend(
     activation, has_bias, dropout_p, shuffle,
     dtype, device, warmup, iters,
 ):
-    A, B, R, internal_bias, seg_pairs, dC = make_inputs(
+    A, B, R, internal_bias, shuffle_masks, dC = make_inputs(
         M, K, N, gs, rs, has_bias, shuffle, dtype, device)
 
     def fwd_only():
@@ -154,7 +155,7 @@ def bench_backend(
             internal_bias=internal_bias,
             dropout_p=dropout_p,
             training=(dropout_p > 0.0),
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
 
     # Forward returns seeds; capture once for the bwd-only timing.
@@ -165,7 +166,7 @@ def bench_backend(
         internal_bias=internal_bias,
         dropout_p=dropout_p,
         training=(dropout_p > 0.0),
-        seg_pairs=seg_pairs,
+        shuffle_masks=shuffle_masks,
     )
 
     def fwd_bwd():
@@ -176,7 +177,7 @@ def bench_backend(
             internal_bias=internal_bias,
             dropout_p=dropout_p,
             training=(dropout_p > 0.0),
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
         cute_prism.backward(
             dC, A, B, R, gs, rs,
@@ -185,7 +186,7 @@ def bench_backend(
             internal_bias=internal_bias,
             dropout_seeds=seeds_local,
             dropout_p=dropout_p,
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
 
     fwd_ms = cuda_time(fwd_only, warmup=warmup, iters=iters)
@@ -198,7 +199,7 @@ def bench_autograd(
     activation, has_bias, dropout_p, shuffle,
     dtype, device, warmup, iters,
 ):
-    A, B, R, internal_bias, seg_pairs, dC = make_inputs(
+    A, B, R, internal_bias, shuffle_masks, dC = make_inputs(
         M, K, N, gs, rs, has_bias, shuffle, dtype, device)
 
     # Matches PrismLinear semantics: B is frozen in non-gated (finetuning)
@@ -231,7 +232,7 @@ def bench_autograd(
             internal_bias=ib_l,
             dropout_p=dropout_p,
             dropout_seeds=dropout_seeds,
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
 
     def fwd_bwd():
@@ -242,7 +243,7 @@ def bench_autograd(
             internal_bias=ib_l,
             dropout_p=dropout_p,
             dropout_seeds=dropout_seeds,
-            seg_pairs=seg_pairs,
+            shuffle_masks=shuffle_masks,
         )
         C.backward(dC)
 

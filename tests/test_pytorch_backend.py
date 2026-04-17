@@ -25,21 +25,22 @@ import cute_prism
 from cute_prism._pytorch_backend import (
     SHUFFLE_SEGMENT_SZ,
     _dropout_mask_from_seed,
-    _seg_pairs_to_elem_perm,
+    _shuffle_masks_to_elem_perm,
 )
 
 
-def _build_seg_pairs(in_features, out_features, group_size, reconn_sz, shuffle_blk_k):
-    """Borrowed from PrismLinear — deterministic seg_pairs."""
-    from cute_prism._module import _build_seg_pairs as _f
-    return _f(in_features, out_features, group_size, reconn_sz, shuffle_blk_k)
+def _build_shuffle_masks(in_features, out_features, group_size, reconn_sz, shuffle_blk_k):
+    """Borrowed from PrismLinear — deterministic shuffle_masks."""
+    from cute_prism._module import _build_shuffle_masks as _f
+    masks, _deltas = _f(in_features, out_features, group_size, reconn_sz, shuffle_blk_k)
+    return masks
 
 
 def autograd_reference(
     A, B, R, group_size, reconn_sz,
     activation=None, internal_bias=None,
     dropout_p=0.0, dropout_seeds=None,
-    seg_pairs=None,
+    shuffle_masks=None,
 ):
     """Pure autograd-traceable forward. Every op is differentiable, so
     loss.backward() produces the ground-truth gradients for (A, B, R, bias).
@@ -64,8 +65,8 @@ def autograd_reference(
     # whole computation as a differentiable graph.
     C_parts = []
     for g in range(n_groups):
-        if seg_pairs is not None:
-            perm = _seg_pairs_to_elem_perm(seg_pairs[g], K, reconn_sz)
+        if shuffle_masks is not None:
+            perm = _shuffle_masks_to_elem_perm(shuffle_masks[g], K, 64, reconn_sz)
             A_g = A.index_select(1, perm)
         else:
             A_g = A
@@ -111,9 +112,9 @@ def run_one(name, M, K, N, gs, rs, activation, has_bias, dropout_p, shuffle,
     if has_bias:
         internal_bias = torch.randn(n_groups, K, device=device, dtype=dtype, requires_grad=True)
 
-    seg_pairs = None
+    shuffle_masks = None
     if shuffle:
-        seg_pairs = _build_seg_pairs(K, N, gs, rs, shuffle_blk_k=128).to(device)
+        shuffle_masks = _build_shuffle_masks(K, N, gs, rs, shuffle_blk_k=64).to(device)
 
     # 1) Manual forward through the pytorch backend.
     C_manual, dropout_seeds = cute_prism.forward(
@@ -123,7 +124,7 @@ def run_one(name, M, K, N, gs, rs, activation, has_bias, dropout_p, shuffle,
         internal_bias=internal_bias,
         dropout_p=dropout_p,
         training=(dropout_p > 0.0),
-        seg_pairs=seg_pairs,
+        shuffle_masks=shuffle_masks,
     )
 
     # 2) Manual backward through the pytorch backend with the saved seeds.
@@ -135,7 +136,7 @@ def run_one(name, M, K, N, gs, rs, activation, has_bias, dropout_p, shuffle,
         internal_bias=internal_bias.detach() if internal_bias is not None else None,
         dropout_seeds=dropout_seeds,
         dropout_p=dropout_p,
-        seg_pairs=seg_pairs,
+        shuffle_masks=shuffle_masks,
     )
 
     # 3) Autograd reference: use the same dropout seeds so the two backward
@@ -152,7 +153,7 @@ def run_one(name, M, K, N, gs, rs, activation, has_bias, dropout_p, shuffle,
         internal_bias=ib2,
         dropout_p=dropout_p,
         dropout_seeds=dropout_seeds,
-        seg_pairs=seg_pairs,
+        shuffle_masks=shuffle_masks,
     )
 
     # Forward agreement (sanity check).
