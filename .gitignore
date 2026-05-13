@@ -5,4 +5,4 @@ python
 *.egg-info
 __pycache__
 playgrounds
-cutlass
+cutlass.venv/

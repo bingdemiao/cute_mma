@@ -157,12 +157,34 @@ def forward(
             shuffle_masks=shuffle_masks,
         )
 
-    if shuffle_masks is not None and backend == "cute":
-        raise ValueError("shuffle_masks is not supported with the 'cute' backend")
-
     validate_tensor_params(A, B, R, group_size, reconn_sz)
 
     if backend == "cute":
+        # internal_bias is supported in cute fwd via a separate compiled kernel
+        # (PRISM_INTERNAL_BIAS=1). Requires gated mode.
+        cute_internal_bias = internal_bias is not None
+        if cute_internal_bias and not gated:
+            raise ValueError(
+                "internal_bias requires a gated activation; pass activation='silu_gate'"
+            )
+        # Dropout is supported in cute fwd via a separate compiled kernel
+        # (PRISM_DROPOUT=1). The mask is hash-derived and identical to cublas
+        # so seeds can be replayed in backward (once the bwd kernels also
+        # support dropout — currently only fwd does).
+        cute_dropout = dropout_p > 0.0 and training
+        if cute_dropout and not gated:
+            raise ValueError(
+                "dropout requires a gated activation in cute backend; "
+                "pass activation='silu_gate'"
+            )
+        # Pick compiled binary based on input dtype (each binary is built for
+        # one dtype via PRISM_DTYPE; both dtypes share the same Python API).
+        if A.dtype == torch.float16:
+            cute_dtype = "fp16"
+        elif A.dtype == torch.bfloat16:
+            cute_dtype = "bf16"
+        else:
+            raise ValueError(f"cute backend requires fp16 or bf16, got {A.dtype}")
         if comp_params == "auto" or (autotuning and comp_params is None):
             M, K = A.shape
             N = B.shape[0]
@@ -172,6 +194,9 @@ def forward(
                 gated=gated,
                 search_space=autotuning_search_space,
                 force_rebenchmark=force_rebenchmark,
+                dtype=cute_dtype,
+                internal_bias=cute_internal_bias,
+                dropout_p=float(dropout_p) if cute_dropout else 0.0,
             )
         elif comp_params is None:
             comp_params = CompParams()
@@ -187,14 +212,39 @@ def forward(
             module = get_or_compile(
                 group_size, reconn_sz, backend, comp_params,
                 gated=gated, kernel_type="fwd",
+                internal_bias=cute_internal_bias,
+                dtype=cute_dtype,
+                dropout=cute_dropout,
             )
         except CompilationError:
             comp_params = CompParams.safe_defaults()
             module = get_or_compile(
                 group_size, reconn_sz, backend, comp_params,
                 gated=gated, kernel_type="fwd",
+                internal_bias=cute_internal_bias,
+                dtype=cute_dtype,
+                dropout=cute_dropout,
             )
-        return module.forward(A, B, R, group_size, reconn_sz), []
+        # Allocate per-group seeds (one uint64 per group, must be nonzero).
+        # Returned alongside C so the caller can replay the same mask in bwd.
+        N_dim = B.shape[0]
+        n_groups = N_dim // group_size
+        seeds_extra: list = []
+        if cute_dropout:
+            seeds = torch.randint(
+                low=1, high=(1 << 62),
+                size=(n_groups,), dtype=torch.int64, device=A.device,
+            )
+            seeds_extra = [seeds]
+        else:
+            seeds = None
+        return module.forward(
+            A, B, R, group_size, reconn_sz,
+            internal_bias if cute_internal_bias else None,
+            shuffle_masks,
+            seeds,
+            float(dropout_p) if cute_dropout else 0.0,
+        ), seeds_extra
 
     # cublas backend
     module = get_or_compile(group_size, reconn_sz, backend, comp_params)
@@ -295,9 +345,6 @@ def backward(
 
     validate_tensor_params(A, B, R, group_size, reconn_sz)
 
-    if shuffle_masks is not None and backend == "cute":
-        raise ValueError("shuffle_masks is not supported with the 'cute' backend")
-
     if backend == "cublas":
         module = get_or_compile(group_size, reconn_sz, backend)
         gk = _GATE_KIND[activation]
@@ -322,6 +369,30 @@ def backward(
         M, K = A.shape
         N = B.shape[0]
         dev = A.device.index or 0
+        cute_internal_bias = internal_bias is not None
+        if cute_internal_bias and not gated:
+            raise ValueError(
+                "internal_bias requires a gated activation; pass activation='silu_gate'"
+            )
+        # Dropout is supported in cute bwd via PRISM_DROPOUT=1 binaries.
+        # Seeds must be a CUDA int64 tensor of shape (n_groups,) — same as
+        # the forward returned. The Tensor form (cublas convention) is what
+        # the cute extension expects directly.
+        cute_dropout = dropout_seeds is not None and dropout_p > 0.0
+        if cute_dropout and not gated:
+            raise ValueError(
+                "dropout backward requires a gated activation in cute; "
+                "pass activation='silu_gate'"
+            )
+        if cute_dropout and not isinstance(dropout_seeds, torch.Tensor):
+            # Allow list[int] for cross-backend symmetry; convert to tensor.
+            dropout_seeds = torch.tensor(dropout_seeds, dtype=torch.int64, device=A.device)
+        if A.dtype == torch.float16:
+            cute_dtype = "fp16"
+        elif A.dtype == torch.bfloat16:
+            cute_dtype = "bf16"
+        else:
+            raise ValueError(f"cute backend requires fp16 or bf16, got {A.dtype}")
 
         # Resolve dAdR params
         if bwd_dadr_params is None:
@@ -331,6 +402,9 @@ def backward(
                     device=dev, gated=gated,
                     search_space=autotuning_search_space_dadr,
                     force_rebenchmark=force_rebenchmark,
+                    dtype=cute_dtype,
+                    internal_bias=cute_internal_bias,
+                    dropout_p=float(dropout_p) if cute_dropout else 0.0,
                 )
             else:
                 bwd_dadr_params = BwdDAdRCompParams()
@@ -341,6 +415,9 @@ def backward(
                 group_size, reconn_sz, backend,
                 gated=gated, kernel_type="bwd_dadr",
                 bwd_dadr_params=bwd_dadr_params,
+                internal_bias=cute_internal_bias,
+                dtype=cute_dtype,
+                dropout=cute_dropout,
             )
         except CompilationError:
             bwd_dadr_params = BwdDAdRCompParams.safe_defaults()
@@ -348,9 +425,19 @@ def backward(
                 group_size, reconn_sz, backend,
                 gated=gated, kernel_type="bwd_dadr",
                 bwd_dadr_params=bwd_dadr_params,
+                internal_bias=cute_internal_bias,
+                dtype=cute_dtype,
+                dropout=cute_dropout,
             )
-        grads = dadr_module.backward_dA_dR(dC, A, B, R, group_size, reconn_sz)
+        grads = dadr_module.backward_dA_dR(
+            dC, A, B, R, group_size, reconn_sz,
+            internal_bias if cute_internal_bias else None,
+            shuffle_masks,
+            dropout_seeds if cute_dropout else None,
+            float(dropout_p) if cute_dropout else 0.0,
+        )
         dA, dR = grads[0], grads[1]
+        d_ib = grads[2] if (len(grads) > 2 and grads[2] is not None and grads[2].numel() > 0) else None
 
         if gated:
             # Resolve dB params
@@ -361,6 +448,9 @@ def backward(
                         device=dev, gated=gated,
                         search_space=autotuning_search_space_db,
                         force_rebenchmark=force_rebenchmark,
+                        dtype=cute_dtype,
+                        internal_bias=cute_internal_bias,
+                        dropout_p=float(dropout_p) if cute_dropout else 0.0,
                     )
                 else:
                     bwd_db_params = BwdDBCompParams()
@@ -370,6 +460,9 @@ def backward(
                     group_size, reconn_sz, backend,
                     gated=gated, kernel_type="bwd_db",
                     bwd_db_params=bwd_db_params,
+                    internal_bias=cute_internal_bias,
+                    dtype=cute_dtype,
+                    dropout=cute_dropout,
                 )
             except CompilationError:
                 bwd_db_params = BwdDBCompParams.safe_defaults()
@@ -377,12 +470,21 @@ def backward(
                     group_size, reconn_sz, backend,
                     gated=gated, kernel_type="bwd_db",
                     bwd_db_params=bwd_db_params,
+                    internal_bias=cute_internal_bias,
+                    dtype=cute_dtype,
+                    dropout=cute_dropout,
                 )
-            dB_out = db_module.backward_dB(dC, A, R, group_size, reconn_sz)
+            dB_out = db_module.backward_dB(
+                dC, A, R, group_size, reconn_sz,
+                internal_bias if cute_internal_bias else None,
+                shuffle_masks,
+                dropout_seeds if cute_dropout else None,
+                float(dropout_p) if cute_dropout else 0.0,
+            )
         else:
             dB_out = None
 
-        return dA, dR, dB_out, None
+        return dA, dR, dB_out, d_ib
 
     raise ValueError(
         f"Backend {backend!r} is not yet supported for backward pass."

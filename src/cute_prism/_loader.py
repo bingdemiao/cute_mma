@@ -25,25 +25,33 @@ def get_or_compile(
     kernel_type: KernelType = "fwd",
     bwd_dadr_params: BwdDAdRCompParams | None = None,
     bwd_db_params: BwdDBCompParams | None = None,
+    internal_bias: bool = False,
+    dtype: str = "fp16",
+    dropout: bool = False,
 ) -> ModuleType:
     """Get a compiled kernel module, compiling if necessary.
 
     Returns a module with the appropriate function(s) for the kernel type:
-    - fwd: forward(A, B, R, group_size, reconn_sz)
+    - fwd: forward(A, B, R, group_size, reconn_sz, internal_bias=None)
     - bwd_dadr: backward_dA_dR(dC, A, B, R, group_size, reconn_sz)
     - bwd_db: backward_dB(dC, A, R, group_size, reconn_sz)
+
+    `dtype` is "fp16" (default) or "bf16"; selects the compiled binary.
     """
     if backend == "cublas":
         # cuBLAS has a single module for all operations
         key = "cublas_prism"
         module_name = key
     else:
-        # Build cache key from kernel_type + relevant params
+        # Build cache key from kernel_type + relevant params + flags
         from ._compiler import _params_cache_key
         params_key = _params_cache_key(kernel_type, comp_params, bwd_dadr_params, bwd_db_params)
         gated_suffix = "_gated" if gated else ""
-        key = f"cute_{kernel_type}_g{group_size}_r{reconn_sz}_{params_key}{gated_suffix}"
-        module_name = f"cute_{kernel_type}_g{group_size}_r{reconn_sz}{gated_suffix}"
+        bias_suffix = "_bias" if internal_bias else ""
+        dtype_suffix = "_bf16" if dtype == "bf16" else ""
+        drop_suffix = "_drop" if dropout else ""
+        key = f"cute_{kernel_type}_g{group_size}_r{reconn_sz}_{params_key}{gated_suffix}{bias_suffix}{dtype_suffix}{drop_suffix}"
+        module_name = f"cute_{kernel_type}_g{group_size}_r{reconn_sz}{gated_suffix}{bias_suffix}{dtype_suffix}{drop_suffix}"
 
     with _cache_lock:
         if key not in _module_cache:
@@ -51,6 +59,7 @@ def get_or_compile(
                 group_size, reconn_sz, backend, comp_params,
                 gated=gated, kernel_type=kernel_type,
                 bwd_dadr_params=bwd_dadr_params, bwd_db_params=bwd_db_params,
+                internal_bias=internal_bias, dtype=dtype, dropout=dropout,
             )
             module = _load_so(so_path, module_name)
             _module_cache[key] = module

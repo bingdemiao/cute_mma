@@ -352,11 +352,6 @@ class PrismLinear(nn.Module):
                     f"in_features ({in_features}) must be divisible by "
                     f"shuffle_blk_k ({shuffle_blk_k})"
                 )
-            if backend == "cute":
-                raise ValueError(
-                    "input_shuffle is not supported with the 'cute' backend. "
-                    "Use 'cublas' or 'pytorch' instead."
-                )
 
         self.in_features = in_features
         self.out_features = out_features

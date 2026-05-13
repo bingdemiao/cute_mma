@@ -52,9 +52,11 @@ def _source_files_for_kernel(src: Path, kernel_type: KernelType) -> list[Path]:
     """List source files for a specific kernel type."""
     common = [
         src / "cute_prism_coop_pc.hpp",
+        src / "cute_prism_dtype.hpp",
         src / "cute_prism_util.hpp",
         src / "z_curve.hpp",
         src / "common.hpp",
+        src / "torch_ext" / "prism_shuffle.cuh",
     ]
     if kernel_type == "fwd":
         return common + [
@@ -125,11 +127,17 @@ def _build_dir_name(
     kernel_type: KernelType,
     cache_key: str,
     gated: bool = False,
+    internal_bias: bool = False,
+    dtype: str = "fp16",
+    dropout: bool = False,
 ) -> str:
     if backend == "cublas":
         return "cublas"
     gated_suffix = "_gated" if gated else ""
-    return f"cute_{kernel_type}_g{group_size}_r{reconn_sz}_{cache_key}{gated_suffix}"
+    bias_suffix = "_bias" if internal_bias else ""
+    dtype_suffix = "_bf16" if dtype == "bf16" else ""
+    drop_suffix = "_drop" if dropout else ""
+    return f"cute_{kernel_type}_g{group_size}_r{reconn_sz}_{cache_key}{gated_suffix}{bias_suffix}{dtype_suffix}{drop_suffix}"
 
 
 def _target_name(
@@ -138,11 +146,17 @@ def _target_name(
     backend: str,
     kernel_type: KernelType = "fwd",
     gated: bool = False,
+    internal_bias: bool = False,
+    dtype: str = "fp16",
+    dropout: bool = False,
 ) -> str:
     if backend == "cublas":
         return "cublas_prism"
     gated_suffix = "_gated" if gated else ""
-    return f"cute_{kernel_type}_g{group_size}_r{reconn_sz}{gated_suffix}"
+    bias_suffix = "_bias" if internal_bias else ""
+    dtype_suffix = "_bf16" if dtype == "bf16" else ""
+    drop_suffix = "_drop" if dropout else ""
+    return f"cute_{kernel_type}_g{group_size}_r{reconn_sz}{gated_suffix}{bias_suffix}{dtype_suffix}{drop_suffix}"
 
 
 def _compose_config_header(
@@ -175,8 +189,11 @@ def _generate_cmake_cute(
     reconn_sz: int,
     kernel_type: KernelType,
     gated: bool = False,
+    internal_bias: bool = False,
+    dtype: str = "fp16",
+    dropout: bool = False,
 ) -> None:
-    target = _target_name(group_size, reconn_sz, "cute", kernel_type, gated)
+    target = _target_name(group_size, reconn_sz, "cute", kernel_type, gated, internal_bias, dtype, dropout)
     torch_ext = src / "torch_ext"
 
     # Select source files per kernel type
@@ -276,6 +293,9 @@ target_compile_definitions({target} PRIVATE
     PRISM_GROUP_SIZE={group_size}
     PRISM_RECONN_SIZE={reconn_sz}
     PRISM_GATED={'1' if gated else '0'}
+    PRISM_INTERNAL_BIAS={'1' if internal_bias else '0'}
+    PRISM_DTYPE={'1' if dtype == 'bf16' else '0'}
+    PRISM_DROPOUT={'1' if dropout else '0'}
     TORCH_EXTENSION_NAME={target}
 )
 
@@ -425,6 +445,9 @@ def compile_kernel(
     bwd_db_params: BwdDBCompParams | None = None,
     bwd_dadr_params: BwdDAdRCompParams | None = None,
     parallel_build: bool = False,
+    internal_bias: bool = False,
+    dtype: str = "fp16",
+    dropout: bool = False,
 ) -> Path:
     """Compile (or retrieve from cache) a kernel .so for the given parameters.
 
@@ -442,11 +465,13 @@ def compile_kernel(
     cache_key = _params_cache_key(kernel_type, comp_params, bwd_dadr_params, bwd_db_params)
 
     src = _source_root()
-    build_dir_name = _build_dir_name(group_size, reconn_sz, backend, kernel_type, cache_key, gated)
+    build_dir_name = _build_dir_name(
+        group_size, reconn_sz, backend, kernel_type, cache_key, gated, internal_bias, dtype, dropout
+    )
     cache = _cache_root() / "builds" / build_dir_name
     cache.mkdir(parents=True, exist_ok=True)
 
-    target = _target_name(group_size, reconn_sz, backend, kernel_type, gated)
+    target = _target_name(group_size, reconn_sz, backend, kernel_type, gated, internal_bias, dtype, dropout)
     build_dir = cache / "build"
 
     lock_path = cache / ".lock"
@@ -476,7 +501,7 @@ def compile_kernel(
         if backend == "cute":
             header = _compose_config_header(kernel_type, comp_params, bwd_dadr_params, bwd_db_params)
             (cache / "prism_config.hpp").write_text(header)
-            _generate_cmake_cute(cache, src, group_size, reconn_sz, kernel_type, gated)
+            _generate_cmake_cute(cache, src, group_size, reconn_sz, kernel_type, gated, internal_bias, dtype, dropout)
         elif backend == "cublas":
             _generate_cmake_cublas(cache, src)
 

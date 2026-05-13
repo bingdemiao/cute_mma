@@ -8,7 +8,8 @@ High-performance Python library for the Prism linear layer — a block-diagonal 
 - **Backends**: `cute` (JIT-compiled CuTe kernel, default), `cublas` (cuBLAS), `pytorch` (pure PyTorch reference)
 - **Modes**: `ar` (activation reconnection: `(A @ R^T) @ B^T`), `rw` (reweighting: `A @ (B @ R)^T`, cublas/pytorch only)
 - **Activations**: `None` (standard linear mode), `"silu_gate"` (gated: `A * SiLU(A @ R^T)` replaces `A @ R^T`, AR mode only, supported by all backends), `"sigmoid_gate"` (bounded gate: `A * 2*sigmoid(A @ R^T)`, AR mode only, **cublas and pytorch backends only** — no `cute` kernel). The sigmoid variant is useful when the linearly-growing `SiLU(S)` term in the dA gate contribution is undesirable; `2*sigmoid(S)` is capped in (0, 2) while `2*sigmoid(0) = 1` matches SiLU's zero slope. Kernel dispatch uses an integer `gate_kind` (0=none, 1=silu_gate, 2=sigmoid_gate) — the Python `_GATE_KIND` dict in `src/cute_prism/__init__.py` must stay in sync with the `GATE_*` enum in `torch_ext/cublas_prism_torch.cu`.
-- **Input shuffle** (`cublas`/`pytorch` only): per-group butterfly shuffle of A via `__shfl_xor_sync` before AR, controlled by `shuffle_masks: (n_groups, n_chunks, n_rounds)`. Uses 2 rounds with XOR deltas [8, 16] and hash-based mask construction (seg_sz=2). Unified with `activation`, `internal_bias`, and `dropout` — all 16 combinations run through a single code path.
+- **Input shuffle** (all backends, including `cute`): per-group butterfly shuffle of A via `__shfl_xor_sync` before AR, controlled by `shuffle_masks: (n_groups, n_chunks, n_rounds)`. Uses 2 rounds with XOR deltas [8, 16] and hash-based mask construction (seg_sz=2). Unified with `activation`, `internal_bias`, and `dropout` — all 16 combinations run through a single code path.
+- **Dropout** (all backends, including `cute`): hash-derived per-element mask applied to `H = A * gate(S)` after the activation. Stateless — no mask buffer is materialized. The forward generates one `uint64` seed per group (returned as the `_seeds` extra of `forward()`), and the backward replays the same `(seed, m·K + k)` index through `splitmix64` to reproduce the mask in the dB recompute and on `dH`. Cute and cublas use bit-identical hashes, so passing the same seed list to both produces the same mask. Kernel binaries are split by `dropout` flag (suffixed `_drop` in the build cache); enabling dropout requires recompilation but does not affect the no-dropout binary. Forward returns `(C, [seeds])` when `training=True and dropout_p>0`; pass the seeds back to `backward(..., dropout_seeds=seeds, dropout_p=p)`.
 - **CompParams / BwdDAdRCompParams / BwdDBCompParams**: Frozen dataclasses controlling tile sizes, pipeline depths, and warp layouts for each kernel type (forward, backward dA+dR, backward dB)
 - **Autotuning**: Per-kernel autotuning via pipelined compilation + benchmarking (producer-consumer overlap), caches all tested results to disk. Supports generators, callbacks, multi-GPU benchmarking, and `force_rebenchmark`. All compiled kernels are kept on disk across autotune runs (keyed by `group_size/reconn_sz/comp_params`, not MNK). Configs that fail compilation are recorded in a global registry (`compile_failed.json`) and skipped across all MNK sizes.
 - **Safe fallback**: When default `CompParams` fail to compile, `forward()`/`backward()` automatically retry with `safe_defaults()`
@@ -100,6 +101,74 @@ These are **mandatory** rules when writing or modifying CUDA kernels in this pro
    - Process 2 elements per instruction whenever possible
 
 4. **Use `make_tiled_copy_C` for R2S writes from MMA fragments.** Writing MMA C-fragment data to shared memory should use CuTe's `make_tiled_copy_C` with `Copy_Atom<UniversalCopy<uint32_t>, half_t>`, not manual loops with `partition_C(identity_tensor)` coordinate lookups.
+
+## Backward kernel performance — verified findings
+
+These are **measured, not estimated**. They concern the cute backward path
+(`cute_prism_backward_dadr.cu` + `cute_prism_backward_db.cu`). Each entry here
+has been validated by re-running the regression suite (`tests/test_correctness.py`,
+`test_internal_bias_bwd.py`, `test_input_shuffle_bwd.py` — 112 tests pass) and
+by direct timing on GH200.
+
+### Working baseline (M=N=K=4096, fp16, gated, gs=256, rs=8, GH200)
+- Default `BwdDAdRCompParams` + `BwdDBCompParams`: **4.115 ms ± 0.024 ms**
+  (mean ± stdev across 5 trials × 50 iters).
+- Within bf16/fp16 numerical noise of cublas (`dA, dR, dB` rel err < 0.27%).
+- bf16 backward at the same shape: **5.417 ms ± 0.067 ms**.
+
+### Verified non-regressive features
+- **Dropout plumbing** (this codebase, both fp16 and bf16). The no-dropout
+  path is performance-neutral within trial noise: a few hoisted integer index
+  calculations were moved out of `#if PRISM_INTERNAL_BIAS` blocks so the
+  dropout site could share them. The compiler DCEs them when neither bias nor
+  dropout is on. End-to-end backward at 4096^3 fp16 is unchanged within ±1.1%
+  (≈ 2σ).
+
+### Investigated and rejected (do NOT redo without new evidence)
+
+These were tried and shown to be neutral or negative; the audit notes are kept
+inline at the relevant code sites. Re-attempting them is a known dead end
+unless the bottleneck has shifted.
+
+- **bf16 dB producer's r2s via the canonical `blocken_C → inplace_transpose →
+  construct_B → copy` chain.** Rejected — measured ~4% **slower** than the
+  scalar transposed-store fallback at 4k³. The producer r2s is not on the
+  critical path of bf16 dB; replacing slow scalar stores with `movmatrix`-driven
+  faster stores adds `movmatrix` latency without saving anything because the
+  consumer is the bottleneck. See the `do not revert` comment block in
+  `cute_prism_backward_db.cu` next to the bf16 r2s site.
+
+- **Public-API autotuning at 4k³** (`cute_prism.backward(autotuning=True)`).
+  Rejected at this shape — produces a ~3× wall-clock regression
+  (4.113 ms → 12.056 ms). Two compounding causes:
+  1. Per-call autotune-cache lookup overhead inside `_autotune.py`. Every
+     `backward()` call re-resolves the cache and prints, adding ~7 ms/iter.
+  2. The dB autotuner's per-kernel timing methodology picks a config
+     (`bM=16, bK=128`) that's fastest in isolation but slower than the
+     default (`bK=32`) in the real sequential dadr→dB→dR_reduce pipeline.
+     The default `BwdDBCompParams` is empirically close to optimal at this
+     shape; the search-space best is a fluke of isolated timing.
+
+  The individual autotune entries (`autotune_bwd_dadr`, `autotune_bwd_db`)
+  remain useful for *exploration* at unfamiliar shapes — but feeding their
+  outputs back through `backward(autotuning=True)` is currently a perf bug.
+  Until the per-call lookup overhead is fixed, prefer explicit
+  `bwd_dadr_params` / `bwd_db_params` arguments after a one-shot autotune
+  exploration.
+
+- **Kernel-fusion of dadr's S recompute with dB's S recompute** (#3 in the
+  optimization audit). Rejected after re-doing the FLOP arithmetic: the AR
+  recompute is ~3.1% of total backward FLOPs (`M·N·K · rs/gs` per side, both
+  sides), not the ~30% originally hand-waved. Realistic upper-bound speedup
+  ~2-4%, against ~1-2 weeks of careful kernel-merge engineering across two
+  cooperative producer-consumer schedules with different reduction axes.
+  Cost-benefit is poor.
+
+### When to revisit
+Open kernel-perf work again only if **profiling** (e.g. `ncu --set full` on a
+real training step) shows the prism backward in the top 3 hotspots of total
+step time. The "obvious" micro-optimizations have all been tried; the next
+real win requires knowing precisely which section is saturated, not guessing.
 
 ## Misc
 - This file should be keep updated with the progress of the project.

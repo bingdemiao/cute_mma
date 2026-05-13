@@ -56,32 +56,33 @@ void dH_producer(
     int n_tiles = size<3>(tDCg);     // total N tiles
 
     // -- MMA: F16 TN for dH(BLK_M, BLK_K) += dC(BLK_M, BLK_N) @ B(BLK_K, BLK_N)^T --
-    using mma_atom_t = std::conditional_t<(_BLK_N < 16),
-        MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
-        MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
+    // dH = dC @ B^T producer. For fp16: F16-accum (matches existing).
+    // For bf16: F32-accum (only option) — rDH fragment is float, converted
+    // to bf16 at the r2s write to sdH.
+    using mma_atom_t = prism_ar_atom<_BLK_N>;
 
     auto mma = make_tiled_mma(mma_atom_t{}, wl_prod, Tile<Int<_BLK_M>, Int<_BLK_K>>{});
     auto thr_mma = mma.get_slice(thread_idx);
 
     auto rDH = thr_mma.make_fragment_C(thr_mma.partition_C(
-        make_tensor(static_cast<half_t*>(nullptr),
+        make_tensor(static_cast<prism_cute*>(nullptr),
                     make_layout(make_shape(Int<_BLK_M>{}, Int<_BLK_K>{}), LayoutRight{}))));
 
     // LDSM s2r for dC (A-operand, LDSM_N) and B (B-operand, LDSM_T)
     constexpr int K_atom = (_BLK_N < 16) ? 8 : 16;
     constexpr int a_u32 = (_BLK_M / size(WarpLayoutProd{}) * K_atom) / 64;
     using s2r_dC = std::conditional_t<(a_u32 >= 4),
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
+        Copy_Atom<SM75_U32x4_LDSM_N, prism_cute>,
         std::conditional_t<(a_u32 >= 2),
-            Copy_Atom<SM75_U32x2_LDSM_N, half_t>,
-            Copy_Atom<SM75_U32x1_LDSM_N, half_t>>>;
+            Copy_Atom<SM75_U32x2_LDSM_N, prism_cute>,
+            Copy_Atom<SM75_U32x1_LDSM_N, prism_cute>>>;
 
     constexpr int b_u16 = (_BLK_K * K_atom) / 32;
     using s2r_B = std::conditional_t<(b_u16 >= 8),
-        Copy_Atom<SM75_U16x8_LDSM_T, half_t>,
+        Copy_Atom<SM75_U16x8_LDSM_T, prism_cute>,
         std::conditional_t<(b_u16 >= 4),
-            Copy_Atom<SM75_U16x4_LDSM_T, half_t>,
-            Copy_Atom<SM75_U16x2_LDSM_T, half_t>>>;
+            Copy_Atom<SM75_U16x4_LDSM_T, prism_cute>,
+            Copy_Atom<SM75_U16x2_LDSM_T, prism_cute>>>;
 
     auto s2r_a = make_tiled_copy_A(s2r_dC{}, mma);
     auto s2r_a_thr = s2r_a.get_slice(thread_idx);
@@ -96,10 +97,13 @@ void dH_producer(
     auto tXrB = s2r_b_thr.retile_D(rB);
 
     // R2S for writing dH to sdH via make_tiled_copy_C
-    using r2s_atom = Copy_Atom<UniversalCopy<uint32_t>, half_t>;
+    using r2s_atom = Copy_Atom<UniversalCopy<uint32_t>, prism_cute>;
     auto r2s_c = make_tiled_copy_C(r2s_atom{}, mma);
     auto r2s_thr = r2s_c.get_slice(thread_idx);
+#if PRISM_DTYPE == 0
+    // fp16: rDH is half_t — direct retile.
     auto tXrDH_c = r2s_thr.retile_S(rDH);
+#endif
 
     int dh_pipe_w = 0;
     int n_groups = n_tiles / tiles_per_group;
@@ -144,7 +148,22 @@ void dH_producer(
         asm volatile("bar.sync %0, %1;\n"
             : : "r"(dh_pipe_w + BAR_CONSUMED_BASE), "n"(n_total));
 
+#if PRISM_DTYPE == 0
         copy(r2s_atom{}, tXrDH_c, r2s_thr.partition_D(sdH(_,_,dh_pipe_w)));
+#else
+        // bf16: rDH is float; convert to bf16 fragment, then r2s.
+        {
+            constexpr int frag_sz = decltype(size(rDH))::value;
+            prism_cute rDH_bf16_storage[frag_sz];
+            #pragma unroll
+            for (int i = 0; i < frag_sz; ++i) {
+                rDH_bf16_storage[i] = prism_cute(float(rDH(i)));
+            }
+            auto rDH_bf16 = make_tensor(make_rmem_ptr(rDH_bf16_storage), rDH.layout());
+            auto tXrDH_bf16 = r2s_thr.retile_S(rDH_bf16);
+            copy(r2s_atom{}, tXrDH_bf16, r2s_thr.partition_D(sdH(_,_,dh_pipe_w)));
+        }
+#endif
         asm volatile("bar.sync 14, %0;\n" : : "n"(n_prod));
 
         asm volatile("bar.arrive %0, %1;\n"
@@ -156,7 +175,8 @@ void dH_producer(
 // =============================================================================
 // Consumer: dA accumulation + dR from sdH
 // =============================================================================
-template <class TensorGA, class SmemA,  class TiledCopyA,
+template <bool GATED,
+          class TensorGA, class SmemA,  class TiledCopyA,
           class TensorGR, class SmemR,  class TiledCopyR,
           class SmemDH,
           class TensorGDA, class TensorGDR, class ReconnectSize,
@@ -165,11 +185,24 @@ __device__ static inline
 void dAdR_consumer(
     TensorGA const &gA, SmemA &sA, TiledCopyA copy_a,
     TensorGR const &gR, SmemR &sR, TiledCopyR copy_r,
-    SmemDH const &sdH,
+    SmemDH &sdH,  // NOTE: writable for the gated path (dS overwrite)
     TensorGDA &gdA, TensorGDR &gdR_partial,
     ReconnectSize reconn_sz,
     int thread_idx,
-    WarpLayoutProd wl_prod, WarpLayoutCons wl_cons)
+    WarpLayoutProd wl_prod, WarpLayoutCons wl_cons,
+    prism_cute const* bias_ptr,  // (n_groups, K) row-major; nullptr unless PRISM_INTERNAL_BIAS=1
+    int K_full, int k_start,
+    float* dIB_partial,  // (n_buf_slots, n_groups, K); nullptr unless PRISM_INTERNAL_BIAS=1
+    int buf_slot,
+    // input_shuffle: per-group A and per-group dA strides (in elements). 0 → off
+    // (use gA / gdA as-is, accumulate dA across groups). Non-zero → per-group
+    // sA reload from A_base + g*strideA_per_group, per-group dA_perm write to
+    // dA_base + g*strideDA_per_group.
+    prism_cute const* A_base, int strideA_per_group, int ldA,
+    prism_cute* dA_base, int strideDA_per_group, int ldDA,
+    int m_start,
+    // Dropout (only used when PRISM_DROPOUT=1)
+    int64_t const* dropout_seeds, float dropout_p, float inv_keep)
 {
     constexpr int rs = decltype(reconn_sz)::value;
     constexpr int bP_dh = cute::BwdDAdRParams::bP_dh;
@@ -194,18 +227,18 @@ void dAdR_consumer(
     auto sR_rb  = logical_divide(sR,  make_tile(_, make_layout(Int<rs>{})));
 
     // -- dA MMA: (BLK_M, rs) += (BLK_M, rs) @ (rs, rs)  [F32 accum, single warp] --
-    using dA_atom = std::conditional_t<(rs < 16),
-        MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>,
-        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>>;
-    using dA_atom_f16 = std::conditional_t<(rs < 16),
-        MMA_Atom<SM80_16x8x8_F16F16F16F16_TN>,
-        MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>>;
+    using dA_atom = prism_dA_atom_f32<rs>;
+    // Helper atom for blocken/transpose/construct paths — needs to share the
+    // operand layout with the dA/AR atoms. For fp16 → F16-accum atom; for bf16
+    // we reuse the F32-accum atom (same operand layouts as F16-accum since
+    // SM80 16x8x{8,16} thread/val layouts are identical across accum types).
+    using dA_atom_f16 = prism_ar_atom<rs>;
 
     auto dA_mma = make_tiled_mma(dA_atom{}, Layout<Shape<_1,_1>>{},
                                   Tile<Int<_BLK_M>, Int<rs>>{});
     auto dA_thr = dA_mma.get_slice(lane_idx);
 
-    auto dA_C_dummy = make_tensor(static_cast<half_t*>(nullptr),
+    auto dA_C_dummy = make_tensor(static_cast<prism_cute*>(nullptr),
         make_layout(make_shape(Int<_BLK_M>{}, Int<rs>{}), LayoutRight{}));
     auto tCdA_id = dA_thr.partition_C(make_identity_tensor(
         make_shape(Int<_BLK_M>{}, Int<rs>{})));
@@ -219,16 +252,16 @@ void dAdR_consumer(
     constexpr int dA_K = (rs < 16) ? 8 : 16;
     constexpr int dA_a_u32 = (_BLK_M * dA_K) / 64;
     using dA_s2r_A_atom = std::conditional_t<(dA_a_u32 >= 4),
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
+        Copy_Atom<SM75_U32x4_LDSM_N, prism_cute>,
         std::conditional_t<(dA_a_u32 >= 2),
-            Copy_Atom<SM75_U32x2_LDSM_N, half_t>,
-            Copy_Atom<SM75_U32x1_LDSM_N, half_t>>>;
+            Copy_Atom<SM75_U32x2_LDSM_N, prism_cute>,
+            Copy_Atom<SM75_U32x1_LDSM_N, prism_cute>>>;
     constexpr int dA_b_u32 = (rs * dA_K) / 64;
     using dA_s2r_B_atom = std::conditional_t<(dA_b_u32 >= 4),
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
+        Copy_Atom<SM75_U32x4_LDSM_N, prism_cute>,
         std::conditional_t<(dA_b_u32 >= 2),
-            Copy_Atom<SM75_U32x2_LDSM_N, half_t>,
-            Copy_Atom<SM75_U32x1_LDSM_N, half_t>>>;
+            Copy_Atom<SM75_U32x2_LDSM_N, prism_cute>,
+            Copy_Atom<SM75_U32x1_LDSM_N, prism_cute>>>;
 
     auto dA_s2r_a = make_tiled_copy_A(dA_s2r_A_atom{}, dA_mma);
     auto dA_s2r_a_thr = dA_s2r_a.get_slice(lane_idx);
@@ -243,8 +276,10 @@ void dAdR_consumer(
     constexpr int dR_pad = dR_M / rs;  // 1 when rs >= 16, 2 when rs = 8
 
     // Use a helper MMA for loading (BLK_M, dR_M) and for C-fragment / identity
-    using dR_load_atom = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
-    using dR_load_atom_f16 = MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>;
+    // dR's MMA is always 16x8x16 F32-accum. For bf16 we need the bf16 variant
+    // since operand types must match (dH and A in sdH/sA are bf16 there).
+    using dR_load_atom = prism_dA_atom_f32<16>;
+    using dR_load_atom_f16 = prism_ar_atom<16>;
     auto dR_load_mma = make_tiled_mma(dR_load_atom{}, Layout<Shape<_1,_1>>{},
                                        Tile<Int<_BLK_M>, Int<dR_M>>{});
     auto dR_load_thr = dR_load_mma.get_slice(lane_idx);
@@ -252,21 +287,23 @@ void dAdR_consumer(
     // LDSM for dR loading: A-operand from padded (BLK_M, dR_M) smem views
     constexpr int dR_a_u32 = (_BLK_M * 16) / 64;  // K_atom = 16 for SM80_16x8x16
     using dR_s2r_A_atom = std::conditional_t<(dR_a_u32 >= 4),
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>,
+        Copy_Atom<SM75_U32x4_LDSM_N, prism_cute>,
         std::conditional_t<(dR_a_u32 >= 2),
-            Copy_Atom<SM75_U32x2_LDSM_N, half_t>,
-            Copy_Atom<SM75_U32x1_LDSM_N, half_t>>>;
+            Copy_Atom<SM75_U32x2_LDSM_N, prism_cute>,
+            Copy_Atom<SM75_U32x1_LDSM_N, prism_cute>>>;
     auto dR_s2r_a = make_tiled_copy_A(dR_s2r_A_atom{}, dR_load_mma);
     auto dR_s2r_a_thr = dR_s2r_a.get_slice(lane_idx);
 
     // dR identity for output writeback (created once, reused per block)
-    auto dR_id_mma = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+    auto dR_id_mma = make_tiled_mma(prism_dA_atom_f32<16>{},
                                      Layout<Shape<_1,_1>>{}, Tile<Int<dR_M>, Int<rs>>{});
     auto dR_C_id = dR_id_mma.get_slice(lane_idx).partition_C(
         make_identity_tensor(make_shape(Int<dR_M>{}, Int<rs>{})));
 
-    // -- Load sA once via cp.async --
-    {
+    const bool shuffle_mode = (strideA_per_group != 0);
+
+    // -- Load sA once via cp.async (no-shuffle path) --
+    if (!shuffle_mode) {
         ThrCopy thr_cp_a = copy_a.get_slice(thread_idx);
         Tensor tAg = thr_cp_a.partition_S(gA);
         Tensor tAs = thr_cp_a.partition_D(sA);
@@ -292,6 +329,22 @@ void dAdR_consumer(
     int r_pipe_w = 1, r_pipe_r = 0, dh_pipe_r = 0;
 
     for (int g = 0; g < n_groups; ++g) {
+        // shuffle_mode: reload sA from A_base + g*strideA_per_group (per-group A_perm).
+        // Also reset rDA[b] so each group's dA contribution is written separately.
+        if (shuffle_mode) {
+            ThrCopy thr_cp_a = copy_a.get_slice(thread_idx);
+            prism_cute const* A_for_g = A_base + (long long)g * strideA_per_group
+                                    + (long long)m_start * ldA + k_start;
+            Tensor gA_g = make_tensor(make_gmem_ptr(A_for_g),
+                make_layout(make_shape(Int<_BLK_M>{}, Int<_BLK_K>{}),
+                            make_stride(ldA, Int<1>{})));
+            Tensor tAg_g = thr_cp_a.partition_S(gA_g);
+            Tensor tAs_g = thr_cp_a.partition_D(sA);
+            copy(copy_a, tAg_g, tAs_g);
+            #pragma unroll
+            for (int b = 0; b < n_reconn; ++b) clear(rDA[b]);
+        }
+
         // Load next R
         if (g + 1 < n_groups) {
             copy(copy_r, tRg(_,_,_,g + 1), tRs(_,_,_,r_pipe_w));
@@ -320,17 +373,255 @@ void dAdR_consumer(
             auto tXrDH = dA_s2r_a_thr.retile_D(rDH_frag);
             copy(dA_s2r_A_atom{}, tXsDH, tXrDH);
 
-            // LDSM: load R block → rR_nat, then transpose for dA = dH @ R
+            // LDSM: load R block → rR_nat (natural B-operand layout)
             auto tXsR = dA_s2r_b_thr.partition_S(sR_blk);
             auto rR_nat = dA_thr.make_fragment_B(dA_thr.partition_B(sR_blk));
             auto tXrR = dA_s2r_b_thr.retile_D(rR_nat);
             copy(dA_s2r_B_atom{}, tXsR, tXrR);
 
+            if constexpr (GATED) {
+                // -- Gated path: recompute S = AR + bias, gate, dS = dH * A * silu'(S),
+                //    add dA_gate = dH * silu(S) to rDA[b], overwrite rDH_frag with dS,
+                //    write dS back to sdH_blk so the dR step picks it up.
+                Tensor sA_blk = sA_rb(_, make_coord(_, rb_idx));
+                auto tXsA = dA_s2r_a_thr.partition_S(sA_blk);
+                auto rA_frag = dA_thr.make_fragment_A(dA_thr.partition_A(sA_blk));
+                auto tXrA = dA_s2r_a_thr.retile_D(rA_frag);
+                copy(dA_s2r_A_atom{}, tXsA, tXrA);
+
+                // f16-accum AR mma so we can run silu_h2 directly on the result.
+                auto AR_mma = make_tiled_mma(dA_atom_f16{}, Layout<Shape<_1,_1>>{},
+                                              Tile<Int<_BLK_M>, Int<rs>>{});
+                auto AR_thr = AR_mma.get_slice(lane_idx);
+                auto rAR = AR_thr.make_fragment_C(AR_thr.partition_C(
+                    make_tensor(static_cast<prism_cute*>(nullptr),
+                        make_layout(make_shape(Int<_BLK_M>{}, Int<rs>{}), LayoutRight{}))));
+                clear(rAR);
+                gemm(AR_mma, rA_frag, rR_nat, rAR);  // AR = A @ R^T (no R transpose)
+
+                // Per (mma_n, mma_m) atom: 2 packed half2 (top row, bottom row) sharing
+                // the same (col_lo, col_hi) cols. For rs=16, A-atom holds 8 vals per
+                // thread; pick the right K-half via a_off = (mn % (rs/8)) * 4.
+                constexpr int RS_v = rs;
+                constexpr int A_OFFSET_STEP = 4;
+                constexpr int N_PER_A_ATOM = RS_v / 8;
+                const int col_lo = (lane_idx & 0x3) * 2;
+                const auto MMA_M_v = size<1>(rAR);
+                const auto MMA_N_v = size<2>(rAR);
+#if PRISM_DROPOUT
+                // Per-group seed for THIS group g; apply mask to dH on replay
+                // (matches forward's mask exactly via the same hash).
+                const uint64_t seed_g = (uint64_t)dropout_seeds[g];
+#endif
+                #pragma unroll
+                for (int mn = 0; mn < int(MMA_N_v); ++mn) {
+                    const int ri_lo = mn * 8 + col_lo;
+                    const int ri_hi = ri_lo + 1;
+                    const int a_off = (mn % N_PER_A_ATOM) * A_OFFSET_STEP;
+#if PRISM_DTYPE == 0
+                    // -- fp16 path: packed half2 silu --
+                    __half2 bias2 = __floats2half2_rn(0.0f, 0.0f);
+#if PRISM_INTERNAL_BIAS
+                    bias2 = load_half2(
+                        bias_ptr[g * K_full + k_start + blk_k_off + ri_lo],
+                        bias_ptr[g * K_full + k_start + blk_k_off + ri_hi]);
+#endif
+                    #pragma unroll
+                    for (int mm = 0; mm < int(MMA_M_v); ++mm) {
+                        auto& ar2_lo = reinterpret_cast<__half2&>(rAR(0, mm, mn));
+                        auto& ar2_hi = reinterpret_cast<__half2&>(rAR(2, mm, mn));
+                        auto& dh2_lo = reinterpret_cast<__half2&>(rDH_frag(0 + a_off, mm, 0));
+                        auto& dh2_hi = reinterpret_cast<__half2&>(rDH_frag(2 + a_off, mm, 0));
+                        auto& a2_lo  = reinterpret_cast<const __half2&>(rA_frag(0 + a_off, mm, 0));
+                        auto& a2_hi  = reinterpret_cast<const __half2&>(rA_frag(2 + a_off, mm, 0));
+#if PRISM_INTERNAL_BIAS
+                        ar2_lo = __hadd2(ar2_lo, bias2);
+                        ar2_hi = __hadd2(ar2_hi, bias2);
+#else
+                        (void)bias2;
+#endif
+#if PRISM_DROPOUT
+                        // Apply the same mask the forward used to dH BEFORE
+                        // the gate-derivative math, so dS and dA_gate inherit
+                        // it. dadr's MMA is single-warp over (_BLK_M, rs), so
+                        // m_local = mm*16 + lane/4 maps directly to global M.
+                        const int m_lo_dr = m_start + mm * 16 + int(lane_idx >> 2);
+                        const int m_hi_dr = m_lo_dr + 8;
+                        const float u00 = prism_uniform_from_hash(seed_g, (int64_t)m_lo_dr * K_full + k_start + blk_k_off + ri_lo);
+                        const float u01 = prism_uniform_from_hash(seed_g, (int64_t)m_lo_dr * K_full + k_start + blk_k_off + ri_hi);
+                        const float u10 = prism_uniform_from_hash(seed_g, (int64_t)m_hi_dr * K_full + k_start + blk_k_off + ri_lo);
+                        const float u11 = prism_uniform_from_hash(seed_g, (int64_t)m_hi_dr * K_full + k_start + blk_k_off + ri_hi);
+                        const __half2 mask_lo = __floats2half2_rn(
+                            (u00 >= dropout_p) ? inv_keep : 0.0f,
+                            (u01 >= dropout_p) ? inv_keep : 0.0f);
+                        const __half2 mask_hi = __floats2half2_rn(
+                            (u10 >= dropout_p) ? inv_keep : 0.0f,
+                            (u11 >= dropout_p) ? inv_keep : 0.0f);
+                        dh2_lo = __hmul2(dh2_lo, mask_lo);
+                        dh2_hi = __hmul2(dh2_hi, mask_hi);
+#endif
+                        const __half2 sig_lo = sigmoid_h2(ar2_lo);
+                        const __half2 sig_hi = sigmoid_h2(ar2_hi);
+                        const __half2 gate_lo = __hmul2(ar2_lo, sig_lo);
+                        const __half2 gate_hi = __hmul2(ar2_hi, sig_hi);
+                        const __half2 gprime_lo = silu_prime_h2(ar2_lo, sig_lo);
+                        const __half2 gprime_hi = silu_prime_h2(ar2_hi, sig_hi);
+                        const __half2 dA_gate_lo = __hmul2(dh2_lo, gate_lo);
+                        const __half2 dA_gate_hi = __hmul2(dh2_hi, gate_hi);
+                        rDA[b](0, mm, mn) += __half2float(__low2half(dA_gate_lo));
+                        rDA[b](1, mm, mn) += __half2float(__high2half(dA_gate_lo));
+                        rDA[b](2, mm, mn) += __half2float(__low2half(dA_gate_hi));
+                        rDA[b](3, mm, mn) += __half2float(__high2half(dA_gate_hi));
+                        dh2_lo = __hmul2(__hmul2(dh2_lo, a2_lo), gprime_lo);
+                        dh2_hi = __hmul2(__hmul2(dh2_hi, a2_hi), gprime_hi);
+                    }
+
+#if PRISM_INTERNAL_BIAS
+                    // d_internal_bias[g, k] = sum_m dS[m, k] (fp16 path).
+                    {
+                        float ps_lo = 0.0f, ps_hi = 0.0f;
+                        #pragma unroll
+                        for (int mm = 0; mm < int(MMA_M_v); ++mm) {
+                            const __half2& dh2_lo_v = reinterpret_cast<const __half2&>(rDH_frag(0 + a_off, mm, 0));
+                            const __half2& dh2_hi_v = reinterpret_cast<const __half2&>(rDH_frag(2 + a_off, mm, 0));
+                            ps_lo += __half2float(__low2half(dh2_lo_v));
+                            ps_hi += __half2float(__high2half(dh2_lo_v));
+                            ps_lo += __half2float(__low2half(dh2_hi_v));
+                            ps_hi += __half2float(__high2half(dh2_hi_v));
+                        }
+                        ps_lo += __shfl_xor_sync(0xffffffff, ps_lo, 4);
+                        ps_lo += __shfl_xor_sync(0xffffffff, ps_lo, 8);
+                        ps_lo += __shfl_xor_sync(0xffffffff, ps_lo, 16);
+                        ps_hi += __shfl_xor_sync(0xffffffff, ps_hi, 4);
+                        ps_hi += __shfl_xor_sync(0xffffffff, ps_hi, 8);
+                        ps_hi += __shfl_xor_sync(0xffffffff, ps_hi, 16);
+                        if ((lane_idx >> 2) == 0) {
+                            const int gK = g * K_full;
+                            const int slot_off = buf_slot * (n_groups * K_full);
+                            atomicAdd(&dIB_partial[slot_off + gK + k_start + blk_k_off + ri_lo], ps_lo);
+                            atomicAdd(&dIB_partial[slot_off + gK + k_start + blk_k_off + ri_hi], ps_hi);
+                        }
+                    }
+#endif
+#else
+                    // -- bf16 path: rAR is float, rA/rDH/rR are bf16; silu in float --
+#if PRISM_INTERNAL_BIAS
+                    const float bias_lo_f = prism_to_float(reinterpret_cast<const prism_native&>(bias_ptr[g * K_full + k_start + blk_k_off + ri_lo]));
+                    const float bias_hi_f = prism_to_float(reinterpret_cast<const prism_native&>(bias_ptr[g * K_full + k_start + blk_k_off + ri_hi]));
+#endif
+                    float ps_lo = 0.0f, ps_hi = 0.0f;  // d_internal_bias accumulators
+                    #pragma unroll
+                    for (int mm = 0; mm < int(MMA_M_v); ++mm) {
+                        float ar0 = rAR(0, mm, mn);
+                        float ar1 = rAR(1, mm, mn);
+                        float ar2 = rAR(2, mm, mn);
+                        float ar3 = rAR(3, mm, mn);
+                        float dh0 = float(rDH_frag(0 + a_off, mm, 0));
+                        float dh1 = float(rDH_frag(1 + a_off, mm, 0));
+                        float dh2 = float(rDH_frag(2 + a_off, mm, 0));
+                        float dh3 = float(rDH_frag(3 + a_off, mm, 0));
+                        float a0 = float(rA_frag(0 + a_off, mm, 0));
+                        float a1 = float(rA_frag(1 + a_off, mm, 0));
+                        float a2 = float(rA_frag(2 + a_off, mm, 0));
+                        float a3 = float(rA_frag(3 + a_off, mm, 0));
+#if PRISM_INTERNAL_BIAS
+                        ar0 += bias_lo_f; ar1 += bias_hi_f;
+                        ar2 += bias_lo_f; ar3 += bias_hi_f;
+#endif
+#if PRISM_DROPOUT
+                        // Replay the forward's mask on dH (same hash, same idx).
+                        const int m_lo_dr = m_start + mm * 16 + int(lane_idx >> 2);
+                        const int m_hi_dr = m_lo_dr + 8;
+                        const float u00 = prism_uniform_from_hash(seed_g, (int64_t)m_lo_dr * K_full + k_start + blk_k_off + ri_lo);
+                        const float u01 = prism_uniform_from_hash(seed_g, (int64_t)m_lo_dr * K_full + k_start + blk_k_off + ri_hi);
+                        const float u10 = prism_uniform_from_hash(seed_g, (int64_t)m_hi_dr * K_full + k_start + blk_k_off + ri_lo);
+                        const float u11 = prism_uniform_from_hash(seed_g, (int64_t)m_hi_dr * K_full + k_start + blk_k_off + ri_hi);
+                        dh0 *= (u00 >= dropout_p) ? inv_keep : 0.0f;
+                        dh1 *= (u01 >= dropout_p) ? inv_keep : 0.0f;
+                        dh2 *= (u10 >= dropout_p) ? inv_keep : 0.0f;
+                        dh3 *= (u11 >= dropout_p) ? inv_keep : 0.0f;
+#endif
+                        const float s0 = 0.5f * (1.0f + tanhf(0.5f * ar0));
+                        const float s1 = 0.5f * (1.0f + tanhf(0.5f * ar1));
+                        const float s2 = 0.5f * (1.0f + tanhf(0.5f * ar2));
+                        const float s3 = 0.5f * (1.0f + tanhf(0.5f * ar3));
+                        const float gate0 = ar0 * s0;  // silu(S)
+                        const float gate1 = ar1 * s1;
+                        const float gate2 = ar2 * s2;
+                        const float gate3 = ar3 * s3;
+                        // silu'(x) = sigma(x) * (1 + x*(1-sigma(x)))
+                        const float gp0 = s0 * (1.0f + ar0 * (1.0f - s0));
+                        const float gp1 = s1 * (1.0f + ar1 * (1.0f - s1));
+                        const float gp2 = s2 * (1.0f + ar2 * (1.0f - s2));
+                        const float gp3 = s3 * (1.0f + ar3 * (1.0f - s3));
+                        // dA_gate = dH * gate
+                        rDA[b](0, mm, mn) += dh0 * gate0;
+                        rDA[b](1, mm, mn) += dh1 * gate1;
+                        rDA[b](2, mm, mn) += dh2 * gate2;
+                        rDA[b](3, mm, mn) += dh3 * gate3;
+                        // dS = dH * A * gate' — write back as bf16 (lossy).
+                        const float dS0 = dh0 * a0 * gp0;
+                        const float dS1 = dh1 * a1 * gp1;
+                        const float dS2 = dh2 * a2 * gp2;
+                        const float dS3 = dh3 * a3 * gp3;
+                        rDH_frag(0 + a_off, mm, 0) = prism_cute(dS0);
+                        rDH_frag(1 + a_off, mm, 0) = prism_cute(dS1);
+                        rDH_frag(2 + a_off, mm, 0) = prism_cute(dS2);
+                        rDH_frag(3 + a_off, mm, 0) = prism_cute(dS3);
+                        // d_internal_bias accumulators (sum over m, both row groups)
+                        ps_lo += dS0 + dS2;
+                        ps_hi += dS1 + dS3;
+                    }
+#if PRISM_INTERNAL_BIAS
+                    ps_lo += __shfl_xor_sync(0xffffffff, ps_lo, 4);
+                    ps_lo += __shfl_xor_sync(0xffffffff, ps_lo, 8);
+                    ps_lo += __shfl_xor_sync(0xffffffff, ps_lo, 16);
+                    ps_hi += __shfl_xor_sync(0xffffffff, ps_hi, 4);
+                    ps_hi += __shfl_xor_sync(0xffffffff, ps_hi, 8);
+                    ps_hi += __shfl_xor_sync(0xffffffff, ps_hi, 16);
+                    if ((lane_idx >> 2) == 0) {
+                        const int gK = g * K_full;
+                        const int slot_off = buf_slot * (n_groups * K_full);
+                        atomicAdd(&dIB_partial[slot_off + gK + k_start + blk_k_off + ri_lo], ps_lo);
+                        atomicAdd(&dIB_partial[slot_off + gK + k_start + blk_k_off + ri_hi], ps_hi);
+                    }
+#endif
+#endif
+                }
+
+                // Write dS back to sdH_blk (overwriting dH for this block). The
+                // existing dR LDSM read will pick up dS via the padded view.
+                //
+                // FUTURE-OPT: this register→smem→register round-trip exists
+                // because dA consumes dS as B-operand and dR consumes dS^T as
+                // A-operand — different register layouts. A direct
+                //   blocken_operand_B<dA_atom_f16>(rDH_frag)
+                //     -> inplace_transpose
+                //     -> construct_operand_A<dR_load_atom_f16>
+                // chain would skip the smem trip but needs the inner-K shapes
+                // to line up: dA's B-operand has MMA_K = rs, dR's A-operand
+                // has MMA_K = BLK_M. The transpose maps M→K, so structurally
+                // the data flow works; the open question is whether the
+                // outer-block layouts produced by both atoms compose without
+                // recoordering. Estimated 5-10% on dadr critical path; not
+                // attempted yet — see prior chat's optimization #4.
+                {
+                    auto sdH_id = make_identity_tensor(make_shape(Int<_BLK_M>{}, Int<rs>{}));
+                    auto rDS_coords = dA_thr.partition_A(sdH_id);
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(rDH_frag); ++i) {
+                        auto coord = rDS_coords(i);
+                        sdH_blk(get<0>(coord), get<1>(coord)) = rDH_frag(i);
+                    }
+                    __syncwarp();
+                }
+            }
+
             auto blocked_R = blocken_operand_B<dA_atom_f16>(rR_nat);
             auto transposed_R = inplace_transpose(blocked_R);
             auto rR_T = construct_operand_B<dA_atom_f16>(transposed_R);
 
-            // dA += dH @ R  (TN GEMM with R transposed ⇒ computes dH @ R)
+            // dA += rDH_frag @ R  (rDH_frag holds dS for gated path, dH for non-gated)
             gemm(dA_mma, rDH_frag, rR_T, rDA[b]);
 
             // -- dR: dH^T(dR_M, BLK_M) @ A^T(rs, BLK_M) via stride-0 pad + transpose + atom gemm --
@@ -367,11 +658,11 @@ void dAdR_consumer(
                 // dR MMA: dR(dR_M, rs) += dH^T(dR_M, BLK_M) @ A^T(rs, BLK_M)
                 // Uses CuTe's gemm with register reuse optimization for K-outer iteration
                 auto dR_mma = make_tiled_mma(
-                    MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+                    prism_dA_atom_f32<16>{},
                     Layout<Shape<_1,_1>>{}, Tile<Int<dR_M>, Int<rs>>{});
                 auto dR_thr_mma = dR_mma.get_slice(lane_idx);
                 auto rDR = dR_thr_mma.make_fragment_C(dR_thr_mma.partition_C(
-                    make_tensor(static_cast<half_t*>(nullptr),
+                    make_tensor(static_cast<prism_cute*>(nullptr),
                         make_layout(make_shape(Int<dR_M>{}, Int<rs>{}), LayoutRight{}))));
                 clear(rDR);
                 gemm(dR_mma, rA_dR, rB_dR, rDR);
@@ -387,6 +678,24 @@ void dAdR_consumer(
             }
         }
 
+        // shuffle_mode: write THIS group's rDA to dA_perm[g] now (not at end).
+        if (shuffle_mode) {
+            prism_cute* dA_for_g = dA_base + (long long)g * strideDA_per_group
+                               + (long long)m_start * ldDA + k_start;
+            #pragma unroll
+            for (int b = 0; b < n_reconn; ++b) {
+                int blk_k_off = (warp_idx * (WARP_K / rs) + b) * rs;
+                for (int f = 0; f < size(rDA[b]); ++f) {
+                    auto coord = tCdA_id(f);
+                    int mi = get<0>(coord);
+                    int ki = get<1>(coord) + blk_k_off;
+                    if (mi < _BLK_M && ki < _BLK_K) {
+                        dA_for_g[mi * ldDA + ki] = prism_cute(rDA[b](f));
+                    }
+                }
+            }
+        }
+
         // Signal CONSUMED
         asm volatile("bar.arrive %0, %1;\n"
             : : "r"(dh_pipe_r + BAR_CONSUMED_BASE), "n"(n_total));
@@ -395,15 +704,18 @@ void dAdR_consumer(
         r_pipe_r = 1 - r_pipe_r;
     }
 
-    // Write dA to gmem
-    for (int b = 0; b < n_reconn; ++b) {
-        int blk_k_off = (warp_idx * (WARP_K / rs) + b) * rs;
-        for (int f = 0; f < size(rDA[b]); ++f) {
-            auto coord = tCdA_id(f);
-            int mi = get<0>(coord);
-            int ki = get<1>(coord) + blk_k_off;
-            if (mi < size<0>(gdA) && ki < size<1>(gdA))
-                gdA(mi, ki) = half_t(rDA[b](f));
+    // Write accumulated rDA to gdA — only when NOT in shuffle_mode (the
+    // shuffle path already wrote per-group above and zeroed rDA each group).
+    if (!shuffle_mode) {
+        for (int b = 0; b < n_reconn; ++b) {
+            int blk_k_off = (warp_idx * (WARP_K / rs) + b) * rs;
+            for (int f = 0; f < size(rDA[b]); ++f) {
+                auto coord = tCdA_id(f);
+                int mi = get<0>(coord);
+                int ki = get<1>(coord) + blk_k_off;
+                if (mi < size<0>(gdA) && ki < size<1>(gdA))
+                    gdA(mi, ki) = prism_cute(rDA[b](f));
+            }
         }
     }
 }
@@ -416,14 +728,18 @@ __global__ void __launch_bounds__(
     (size(typename cute::BwdDAdRParams::warp_layout_arb{}) +
      size(typename cute::BwdDAdRParams::warp_layout_ar{})) * 32)
 bwd_dadr_kernel(
-    const half_t* __restrict__ dC_ptr,  int ldDC,
-    const half_t* __restrict__ A_ptr,   int ldA,
-    const half_t* __restrict__ B_ptr,   int ldB,
-    const half_t* __restrict__ R_ptr,   int ldR,
-    half_t* __restrict__ dA_ptr,        int ldDA,
+    const prism_cute* __restrict__ dC_ptr,  int ldDC,
+    const prism_cute* __restrict__ A_ptr,   int ldA,
+    const prism_cute* __restrict__ B_ptr,   int ldB,
+    const prism_cute* __restrict__ R_ptr,   int ldR,
+    const prism_cute* __restrict__ bias_ptr,
+    prism_cute* __restrict__ dA_ptr,        int ldDA,
     float* __restrict__ dR_partial,
+    float* __restrict__ dIB_partial,
     int M, int N, int K,
-    int n_groups, int n_buf_slots)
+    int n_groups, int n_buf_slots,
+    int strideA_per_group, int strideDA_per_group,
+    int64_t const* dropout_seeds, float dropout_p, float inv_keep)
 {
     constexpr int gs = GROUP_SIZE;
     constexpr int rs = RECONN_SZ;
@@ -462,8 +778,8 @@ bwd_dadr_kernel(
     auto sR_layout = tile_to_shape(get_smem_atom(Int<BLK_K>{}),
         make_shape(Int<rs>{}, Int<BLK_K>{}, _2{}));
 
-    extern __shared__ half_t smem_raw[];
-    half_t* p = smem_raw;
+    extern __shared__ prism_cute smem_raw[];
+    prism_cute* p = smem_raw;
     auto sdC   = make_tensor(make_smem_ptr(p), sdC_layout);   p += cosize(sdC_layout);
     auto sB    = make_tensor(make_smem_ptr(p), sB_layout);    p += cosize(sB_layout);
     auto sdH   = make_tensor(make_smem_ptr(p), sdH_layout);   p += cosize(sdH_layout);
@@ -504,17 +820,17 @@ bwd_dadr_kernel(
                     make_stride(K, Int<1>{})));
 
     // -- TiledCopy for cp.async --
-    auto copy_dc = cp_layout<uint128_t, half_t>(Int<BLK_M>{}, Int<BLK_N>{}, Int<n_prod>{});
+    auto copy_dc = cp_layout<uint128_t, prism_cute>(Int<BLK_M>{}, Int<BLK_N>{}, Int<n_prod>{});
     constexpr int bt0 = BLK_K / 8;
     constexpr int bt1 = n_prod / bt0;
     constexpr int bv1 = BLK_N / bt1;
     static_assert(bt0 > 0 && bt1 > 0 && bv1 > 0);
     auto copy_b = make_tiled_copy(
-        Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
+        Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, prism_cute>{},
         make_layout(make_shape(Int<bt0>{}, Int<bt1>{}), LayoutRight{}),
         make_layout(make_shape(_8{}, Int<bv1>{})));
-    auto copy_a = cp_layout<uint128_t, half_t>(Int<BLK_M>{}, Int<BLK_K>{}, Int<n_cons>{});
-    auto copy_r = cp_layout<uint128_t, half_t>(Int<rs>{}, Int<BLK_K>{}, Int<n_cons>{});
+    auto copy_a = cp_layout<uint128_t, prism_cute>(Int<BLK_M>{}, Int<BLK_K>{}, Int<n_cons>{});
+    auto copy_r = cp_layout<uint128_t, prism_cute>(Int<rs>{}, Int<BLK_K>{}, Int<n_cons>{});
 
     if (threadIdx.x >= n_cons) {
         dH_producer(
@@ -524,14 +840,20 @@ bwd_dadr_kernel(
             threadIdx.x - n_cons,
             wlp_t{}, wlc_t{});
     } else {
-        dAdR_consumer(
+        dAdR_consumer<GATED>(
             gA, sA, copy_a,
             gR, sR, copy_r,
             sdH,
             gdA, gdR_partial,
             Int<rs>{},
             threadIdx.x,
-            wlp_t{}, wlc_t{});
+            wlp_t{}, wlc_t{},
+            bias_ptr, K, k_start,
+            dIB_partial, buf_slot,
+            A_ptr, strideA_per_group, ldA,
+            dA_ptr, strideDA_per_group, ldDA,
+            m_start,
+            dropout_seeds, dropout_p, inv_keep);
     }
 }
 
@@ -539,7 +861,7 @@ bwd_dadr_kernel(
 // dR reduction kernel
 // =============================================================================
 __global__ void dR_reduce_kernel(
-    const float* __restrict__ dR_partial, half* __restrict__ dR,
+    const float* __restrict__ dR_partial, prism_native* __restrict__ dR,
     int dR_elements, int n_buf_slots)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -547,7 +869,7 @@ __global__ void dR_reduce_kernel(
     float sum = 0.0f;
     for (int s = 0; s < n_buf_slots; ++s)
         sum += dR_partial[s * dR_elements + idx];
-    dR[idx] = __float2half(sum);
+    dR[idx] = prism_from_float(sum);
 }
 
 // =============================================================================
@@ -555,12 +877,17 @@ __global__ void dR_reduce_kernel(
 // =============================================================================
 void prism_backward_dA_dR_launch(
     int m, int n, int k,
-    half const* dC, int ldDC,
-    half const* A,  int ldA,
-    half const* B,  int ldB,
-    half const* R,  int ldR,
-    half* dA, int ldDA,
-    half* dR, int ldDR,
+    prism_native const* dC, int ldDC,
+    prism_native const* A,  int ldA,
+    prism_native const* B,  int ldB,
+    prism_native const* R,  int ldR,
+    prism_native const* bias,
+    prism_native* dA, int ldDA,
+    prism_native* dR, int ldDR,
+    prism_native* dInternalBias,
+    int strideA_per_group,
+    int strideDA_per_group,
+    int64_t const* dropout_seeds, float dropout_p, float inv_keep,
     cudaStream_t stream)
 {
     constexpr int gs = CurrKernelParams::group_size;
@@ -581,10 +908,17 @@ void prism_backward_dA_dR_launch(
     int n_buf_slots = min(n_buf_slots_param, n_m_tiles);
     if (n_buf_slots < 1) n_buf_slots = 1;
     int dR_elements = n_groups * rs * k;
+    int dIB_elements = n_groups * k;
 
     float* dR_partial_buf = nullptr;
     cudaMalloc(&dR_partial_buf, (int64_t)n_buf_slots * dR_elements * sizeof(float));
     cudaMemsetAsync(dR_partial_buf, 0, (int64_t)n_buf_slots * dR_elements * sizeof(float), stream);
+
+    float* dIB_partial_buf = nullptr;
+#if PRISM_INTERNAL_BIAS
+    cudaMalloc(&dIB_partial_buf, (int64_t)n_buf_slots * dIB_elements * sizeof(float));
+    cudaMemsetAsync(dIB_partial_buf, 0, (int64_t)n_buf_slots * dIB_elements * sizeof(float), stream);
+#endif
 
     // Smem size
     auto smem_dC = get_smem_atom(cute::Int<BLK_N>{});
@@ -604,7 +938,7 @@ void prism_backward_dA_dR_launch(
                     make_shape(cute::Int<BLK_M>{}, cute::Int<BLK_K>{})))
               + cosize(tile_to_shape(smem_bk,
                     make_shape(cute::Int<rs>{}, cute::Int<BLK_K>{}, _2{})))
-              ) * sizeof(half_t) + 256;
+              ) * sizeof(prism_cute) + 256;
 
     dim3 grid(n_k_tiles * n_m_tiles);
     dim3 block(n_threads);
@@ -616,12 +950,16 @@ void prism_backward_dA_dR_launch(
 #endif
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     kernel<<<grid, block, smem, stream>>>(
-        reinterpret_cast<half_t const*>(dC), ldDC,
-        reinterpret_cast<half_t const*>(A), ldA,
-        reinterpret_cast<half_t const*>(B), ldB,
-        reinterpret_cast<half_t const*>(R), ldR,
-        reinterpret_cast<half_t*>(dA), ldDA,
-        dR_partial_buf, m, n, k, n_groups, n_buf_slots);
+        reinterpret_cast<prism_cute const*>(dC), ldDC,
+        reinterpret_cast<prism_cute const*>(A), ldA,
+        reinterpret_cast<prism_cute const*>(B), ldB,
+        reinterpret_cast<prism_cute const*>(R), ldR,
+        reinterpret_cast<prism_cute const*>(bias),
+        reinterpret_cast<prism_cute*>(dA), ldDA,
+        dR_partial_buf, dIB_partial_buf,
+        m, n, k, n_groups, n_buf_slots,
+        strideA_per_group, strideDA_per_group,
+        dropout_seeds, dropout_p, inv_keep);
 
     {
         int threads = 256;
@@ -630,6 +968,19 @@ void prism_backward_dA_dR_launch(
             dR_partial_buf, dR, dR_elements, n_buf_slots);
     }
 
+#if PRISM_INTERNAL_BIAS
+    {
+        int threads = 256;
+        int blocks_ib = (dIB_elements + threads - 1) / threads;
+        // Reuse dR_reduce_kernel — it sums per-slot float partials into a half output.
+        dR_reduce_kernel<<<blocks_ib, threads, 0, stream>>>(
+            dIB_partial_buf, dInternalBias, dIB_elements, n_buf_slots);
+    }
+#endif
+
     cudaStreamSynchronize(stream);
     cudaFree(dR_partial_buf);
+#if PRISM_INTERNAL_BIAS
+    cudaFree(dIB_partial_buf);
+#endif
 }

@@ -160,48 +160,44 @@ def default_search_space_bwd_db(
     ]
 
     candidates: list[BwdDBCompParams] = []
-    for bM in (16, 32):
-        for bN in (128, 256):  # bN = group_size for now; multi-group later
-            for bK in (128, 256):
-                if bK % reconn_sz != 0:
-                    continue
-                for c_width in (16,):
-                    if bM % c_width != 0:
-                        continue
-                    for bP_a in (2, 3):
-                        for bP_ar in (2,):
-                            for bP_dc in (2, 3):
-                                for wl_ar, wl_arb in warp_presets:
-                                    n_producer_warps = _warp_count(wl_ar)
-                                    n_consumer_warps = _warp_count(wl_arb)
-                                    warp_along_n = wl_arb[0] if len(wl_arb) >= 2 else 1
-                                    warp_along_k = wl_arb[1] if len(wl_arb) >= 2 else wl_arb[0]
-                                    # Validate tile divisibility
-                                    if bM % n_producer_warps != 0:
-                                        continue
-                                    if bN % warp_along_n != 0:
-                                        continue
-                                    if bK % warp_along_k != 0:
-                                        continue
-                                    warp_tile_n = bN // warp_along_n
-                                    if warp_tile_n > group_size:
-                                        continue
-                                    if warp_tile_n < 8:
-                                        continue
-                                    params = BwdDBCompParams(
-                                        bM=bM, bN=bN, bK=bK, c_width=c_width,
-                                        bP_a=bP_a, bP_ar=bP_ar, bP_dc=bP_dc,
-                                        warp_layout_ar=wl_ar, warp_layout_arb=wl_arb,
-                                    )
-                                    try:
-                                        smem = compute_smem_bytes_bwd_db(
-                                            bM, bK, group_size, reconn_sz,
-                                            bP_a, bP_ar, bP_dc,
-                                        )
-                                        check_smem_limit(smem, device)
-                                    except (RuntimeError, ValueError):
-                                        continue
-                                    candidates.append(params)
+    bN = group_size  # dB tiles N=group_size; not a tunable on this kernel
+    # dB outputs (gs, K), so each CTA writes (gs, bK). Larger bK means fewer
+    # K-tiles and less parallelism; the default of bK=32 was empirically
+    # better than bK in {128, 256} at 4096^3, so include the small-bK region.
+    for bM in (16, 32, 64):
+        for bK in (32, 64, 128):
+            if bK % reconn_sz != 0:
+                continue
+            for bP_a in (2, 3):
+                for bP_ar in (2,):
+                    for bP_dc in (2, 3):
+                        for wl_ar, wl_arb in warp_presets:
+                            n_producer_warps = _warp_count(wl_ar)
+                            warp_along_n = wl_arb[0] if len(wl_arb) >= 2 else 1
+                            warp_along_k = wl_arb[1] if len(wl_arb) >= 2 else wl_arb[0]
+                            if bM % n_producer_warps != 0:
+                                continue
+                            if bN % warp_along_n != 0:
+                                continue
+                            if bK % warp_along_k != 0:
+                                continue
+                            warp_tile_n = bN // warp_along_n
+                            if warp_tile_n > group_size or warp_tile_n < 8:
+                                continue
+                            params = BwdDBCompParams(
+                                bM=bM, bK=bK,
+                                bP_a=bP_a, bP_ar=bP_ar, bP_dc=bP_dc,
+                                warp_layout_ar=wl_ar, warp_layout_arb=wl_arb,
+                            )
+                            try:
+                                smem = compute_smem_bytes_bwd_db(
+                                    bM, bK, group_size, reconn_sz,
+                                    bP_a, bP_ar, bP_dc,
+                                )
+                                check_smem_limit(smem, device)
+                            except (RuntimeError, ValueError):
+                                continue
+                            candidates.append(params)
     return candidates
 
 
@@ -215,9 +211,22 @@ def _problem_key(
     device_name: str,
     kernel_type: KernelType = "fwd",
     gated: bool = False,
+    dtype: str = "fp16",
+    internal_bias: bool = False,
+    dropout_p: float = 0.0,
 ) -> str:
-    """Cache key for a specific problem shape + device + kernel type."""
+    """Cache key for a specific problem shape + device + kernel type.
+
+    Includes dtype, internal_bias, dropout in the key so optimal CompParams are
+    cached separately for each compiled kernel variant — fp16 and bf16 select
+    different MMA atoms (F16-accum vs F32-accum) which can shift the optimum.
+    """
     suffix = "_gated" if gated else ""
+    suffix += f"_{dtype}"
+    if internal_bias:
+        suffix += "_ib"
+    if dropout_p > 0.0:
+        suffix += "_dp"
     return f"{device_name}_{kernel_type}_M{M}_N{N}_K{K}_g{group_size}_r{reconn_sz}{suffix}"
 
 
@@ -274,9 +283,21 @@ def _save_compile_failed(data: dict[str, dict]) -> None:
 def _compile_context_key(
     group_size: int, reconn_sz: int,
     kernel_type: KernelType, gated: bool,
+    dtype: str = "fp16",
+    internal_bias: bool = False,
+    dropout_p: float = 0.0,
 ) -> str:
-    """Key for compile-failed registry (shape-independent)."""
+    """Key for compile-failed registry (shape-independent).
+
+    Dtype / internal_bias / dropout change which kernel binary is built, so
+    compile failures must be partitioned along those axes too.
+    """
     suffix = "_gated" if gated else ""
+    suffix += f"_{dtype}"
+    if internal_bias:
+        suffix += "_ib"
+    if dropout_p > 0.0:
+        suffix += "_dp"
     return f"{kernel_type}_g{group_size}_r{reconn_sz}{suffix}"
 
 
@@ -331,13 +352,17 @@ def _parse_problem_key(key: str) -> dict | None:
     """Parse a _problem_key string back into its components.
 
     Returns dict with M, N, K, group_size, reconn_sz, device_name,
-    kernel_type, gated — or None if parsing fails.
+    kernel_type, gated, dtype, internal_bias, dropout — or None if parsing fails.
+    Older keys without dtype/ib/dp suffixes are interpreted as
+    (fp16, no internal_bias, no dropout) for compatibility.
     """
     import re
-    # Format: {device_name}_{kernel_type}_M{M}_N{N}_K{K}_g{group_size}_r{reconn_sz}[_gated]
-    # kernel_type is one of: fwd, bwd_dadr, bwd_db
-    # device_name can contain underscores, so we match from the right
-    pattern = r'^(.+?)_(fwd|bwd_dadr|bwd_db)_M(\d+)_N(\d+)_K(\d+)_g(\d+)_r(\d+)(_gated)?$'
+    # Format: {device_name}_{kernel_type}_M{M}_N{N}_K{K}_g{group_size}_r{reconn_sz}
+    #         [_gated][_fp16|_bf16][_ib][_dp]
+    pattern = (
+        r'^(.+?)_(fwd|bwd_dadr|bwd_db)_M(\d+)_N(\d+)_K(\d+)_g(\d+)_r(\d+)'
+        r'(_gated)?(_fp16|_bf16)?(_ib)?(_dp)?$'
+    )
     m = re.match(pattern, key)
     if not m:
         return None
@@ -350,6 +375,9 @@ def _parse_problem_key(key: str) -> dict | None:
         "group_size": int(m.group(6)),
         "reconn_sz": int(m.group(7)),
         "gated": m.group(8) is not None,
+        "dtype": (m.group(9) or "_fp16")[1:],  # strip leading underscore; default fp16
+        "internal_bias": m.group(10) is not None,
+        "dropout": m.group(11) is not None,
     }
 
 
@@ -502,12 +530,17 @@ def _compile_one(
     reconn_sz: int,
     kernel_type: KernelType,
     gated: bool = False,
+    dtype: str = "fp16",
+    internal_bias: bool = False,
+    dropout_p: float = 0.0,
 ) -> bool:
     """Compile a single config. Returns True on success, False on failure."""
     from ._compiler import compile_kernel
     kwargs: dict = dict(
         group_size=group_size, reconn_sz=reconn_sz,
         backend="cute", gated=gated, kernel_type=kernel_type,
+        internal_bias=internal_bias, dtype=dtype,
+        dropout=(dropout_p > 0.0),
         parallel_build=True,
     )
     if kernel_type == "fwd":
@@ -534,6 +567,9 @@ def _benchmark_one(
     repeat: int,
     gated: bool = False,
     device: int = 0,
+    dtype: str = "fp16",
+    internal_bias: bool = False,
+    dropout_p: float = 0.0,
 ) -> float | None:
     """Benchmark a single config. Returns median time in ms, or None on failure."""
     from ._loader import get_or_compile
@@ -541,6 +577,8 @@ def _benchmark_one(
     kwargs: dict = dict(
         group_size=group_size, reconn_sz=reconn_sz,
         backend="cute", gated=gated, kernel_type=kernel_type,
+        internal_bias=internal_bias, dtype=dtype,
+        dropout=(dropout_p > 0.0),
     )
     if kernel_type == "fwd":
         kwargs["comp_params"] = config
@@ -554,26 +592,57 @@ def _benchmark_one(
     except Exception:
         return None
 
-    # Build the call args per kernel type
+    ib = tensors.get("internal_bias")
+    seeds = tensors.get("dropout_seeds")
+    dp = tensors.get("dropout_p", 0.0)
+
+    # Build the call args per kernel type. Pass internal_bias / dropout
+    # tensors only when the kernel was compiled to consume them — passing them
+    # to a non-bias / non-dropout binary triggers TORCH_CHECK.
     if kernel_type == "fwd":
-        call = lambda: module.forward(tensors["A"], tensors["B"], tensors["R"], group_size, reconn_sz)
+        if internal_bias or dropout_p > 0.0:
+            call = lambda: module.forward(
+                tensors["A"], tensors["B"], tensors["R"],
+                group_size, reconn_sz,
+                ib, None, seeds, dp)
+        else:
+            call = lambda: module.forward(
+                tensors["A"], tensors["B"], tensors["R"],
+                group_size, reconn_sz)
     elif kernel_type == "bwd_dadr":
-        call = lambda: module.backward_dA_dR(
-            tensors["dC"], tensors["A"], tensors["B"], tensors["R"],
-            group_size, reconn_sz)
+        if internal_bias or dropout_p > 0.0:
+            call = lambda: module.backward_dA_dR(
+                tensors["dC"], tensors["A"], tensors["B"], tensors["R"],
+                group_size, reconn_sz,
+                ib, None, seeds, dp)
+        else:
+            call = lambda: module.backward_dA_dR(
+                tensors["dC"], tensors["A"], tensors["B"], tensors["R"],
+                group_size, reconn_sz)
     elif kernel_type == "bwd_db":
-        call = lambda: module.backward_dB(
-            tensors["dC"], tensors["A"], tensors["R"],
-            group_size, reconn_sz)
+        if internal_bias or dropout_p > 0.0:
+            call = lambda: module.backward_dB(
+                tensors["dC"], tensors["A"], tensors["R"],
+                group_size, reconn_sz,
+                ib, None, seeds, dp)
+        else:
+            call = lambda: module.backward_dB(
+                tensors["dC"], tensors["A"], tensors["R"],
+                group_size, reconn_sz)
     else:
         return None
 
+    import os, traceback
+    debug = os.environ.get("CUTE_PRISM_AUTOTUNE_DEBUG") == "1"
     with torch.cuda.device(device):
         # Warmup
         for _ in range(warmup):
             try:
                 call()
-            except Exception:
+            except Exception as e:
+                if debug:
+                    print(f"  [debug] {kernel_type} {config.cache_key()} warmup failed on cuda:{device}: {type(e).__name__}: {e}", flush=True)
+                    traceback.print_exc()
                 return None
 
         torch.cuda.synchronize()
@@ -609,6 +678,9 @@ def _autotune_generic(
     gated: bool,
     make_tensors: Callable,
     force_rebenchmark: bool = False,
+    dtype: str = "fp16",
+    internal_bias: bool = False,
+    dropout_p: float = 0.0,
 ) -> T:
     """Generic autotuning engine shared by all three autotune functions.
 
@@ -625,7 +697,8 @@ def _autotune_generic(
     # Use the first device for cache key / smem checks
     primary_device = devices[0]
     device_name = torch.cuda.get_device_properties(primary_device).name
-    key = _problem_key(M, N, K, group_size, reconn_sz, device_name, kernel_type, gated)
+    key = _problem_key(M, N, K, group_size, reconn_sz, device_name, kernel_type, gated,
+                       dtype=dtype, internal_bias=internal_bias, dropout_p=dropout_p)
 
     # Load existing cache entry
     cache_data = _load_cache() if use_cache else {}
@@ -636,7 +709,9 @@ def _autotune_generic(
     tested_by_key = {t["cache_key"]: t for t in entry.get("tested", [])}
 
     # Load global compile-failed registry (auto-invalidated on source changes)
-    ctx_key = _compile_context_key(group_size, reconn_sz, kernel_type, gated)
+    ctx_key = _compile_context_key(group_size, reconn_sz, kernel_type, gated,
+                                   dtype=dtype, internal_bias=internal_bias,
+                                   dropout_p=dropout_p)
     known_bad: set[str] = _load_known_bad(ctx_key, kernel_type)
 
     # If no search space provided and we have a cached best, return it
@@ -733,7 +808,8 @@ def _autotune_generic(
 
         with ThreadPoolExecutor(max_workers=n_compile_workers) as pool:
             futures = {
-                pool.submit(_compile_one, config, group_size, reconn_sz, kernel_type, gated): i
+                pool.submit(_compile_one, config, group_size, reconn_sz, kernel_type, gated,
+                            dtype, internal_bias, dropout_p): i
                 for i, config in enumerate(configs_to_test)
             }
             for future in as_completed(futures):
@@ -768,7 +844,9 @@ def _autotune_generic(
     # --- Consumer: benchmark on a specific GPU ---
     def _consumer(device_id: int) -> None:
         nonlocal bench_done
-        tensors = make_tensors(M, N, K, group_size, reconn_sz, device_id)
+        tensors = make_tensors(M, N, K, group_size, reconn_sz, device_id,
+                               dtype=dtype, internal_bias=internal_bias,
+                               dropout_p=dropout_p)
 
         while True:
             item = work_queue.get()
@@ -797,6 +875,7 @@ def _autotune_generic(
                 config, kernel_type, tensors,
                 group_size, reconn_sz, warmup, repeat, gated,
                 device=device_id,
+                dtype=dtype, internal_bias=internal_bias, dropout_p=dropout_p,
             )
 
             result_entry = {
@@ -910,32 +989,68 @@ def _config_summary(config) -> str:
 # Tensor factories for benchmarking
 # ---------------------------------------------------------------------------
 
-def _make_fwd_tensors(M, N, K, group_size, reconn_sz, device):
+_DTYPE_MAP = {"fp16": torch.float16, "bf16": torch.bfloat16}
+
+
+def _make_fwd_tensors(M, N, K, group_size, reconn_sz, device,
+                      dtype: str = "fp16",
+                      internal_bias: bool = False,
+                      dropout_p: float = 0.0):
     n_groups = N // group_size
-    return {
-        "A": torch.randn(M, K, dtype=torch.float16, device=f"cuda:{device}"),
-        "B": torch.randn(N, K, dtype=torch.float16, device=f"cuda:{device}"),
-        "R": torch.randn(n_groups * reconn_sz, K, dtype=torch.float16, device=f"cuda:{device}"),
+    th_dtype = _DTYPE_MAP[dtype]
+    dev = f"cuda:{device}"
+    out = {
+        "A": torch.randn(M, K, dtype=th_dtype, device=dev),
+        "B": torch.randn(N, K, dtype=th_dtype, device=dev),
+        "R": torch.randn(n_groups * reconn_sz, K, dtype=th_dtype, device=dev),
     }
+    if internal_bias:
+        out["internal_bias"] = torch.randn(n_groups, K, dtype=th_dtype, device=dev) * 0.01
+    if dropout_p > 0.0:
+        out["dropout_seeds"] = torch.randint(0, 2**31 - 1, (n_groups,), dtype=torch.int64, device=dev)
+        out["dropout_p"] = float(dropout_p)
+    return out
 
 
-def _make_bwd_dadr_tensors(M, N, K, group_size, reconn_sz, device):
+def _make_bwd_dadr_tensors(M, N, K, group_size, reconn_sz, device,
+                           dtype: str = "fp16",
+                           internal_bias: bool = False,
+                           dropout_p: float = 0.0):
     n_groups = N // group_size
-    return {
-        "dC": torch.randn(M, N, dtype=torch.float16, device=f"cuda:{device}"),
-        "A": torch.randn(M, K, dtype=torch.float16, device=f"cuda:{device}"),
-        "B": torch.randn(N, K, dtype=torch.float16, device=f"cuda:{device}"),
-        "R": torch.randn(n_groups * reconn_sz, K, dtype=torch.float16, device=f"cuda:{device}"),
+    th_dtype = _DTYPE_MAP[dtype]
+    dev = f"cuda:{device}"
+    out = {
+        "dC": torch.randn(M, N, dtype=th_dtype, device=dev),
+        "A": torch.randn(M, K, dtype=th_dtype, device=dev),
+        "B": torch.randn(N, K, dtype=th_dtype, device=dev),
+        "R": torch.randn(n_groups * reconn_sz, K, dtype=th_dtype, device=dev),
     }
+    if internal_bias:
+        out["internal_bias"] = torch.randn(n_groups, K, dtype=th_dtype, device=dev) * 0.01
+    if dropout_p > 0.0:
+        out["dropout_seeds"] = torch.randint(0, 2**31 - 1, (n_groups,), dtype=torch.int64, device=dev)
+        out["dropout_p"] = float(dropout_p)
+    return out
 
 
-def _make_bwd_db_tensors(M, N, K, group_size, reconn_sz, device):
+def _make_bwd_db_tensors(M, N, K, group_size, reconn_sz, device,
+                         dtype: str = "fp16",
+                         internal_bias: bool = False,
+                         dropout_p: float = 0.0):
     n_groups = N // group_size
-    return {
-        "dC": torch.randn(M, N, dtype=torch.float16, device=f"cuda:{device}"),
-        "A": torch.randn(M, K, dtype=torch.float16, device=f"cuda:{device}"),
-        "R": torch.randn(n_groups * reconn_sz, K, dtype=torch.float16, device=f"cuda:{device}"),
+    th_dtype = _DTYPE_MAP[dtype]
+    dev = f"cuda:{device}"
+    out = {
+        "dC": torch.randn(M, N, dtype=th_dtype, device=dev),
+        "A": torch.randn(M, K, dtype=th_dtype, device=dev),
+        "R": torch.randn(n_groups * reconn_sz, K, dtype=th_dtype, device=dev),
     }
+    if internal_bias:
+        out["internal_bias"] = torch.randn(n_groups, K, dtype=th_dtype, device=dev) * 0.01
+    if dropout_p > 0.0:
+        out["dropout_seeds"] = torch.randint(0, 2**31 - 1, (n_groups,), dtype=torch.int64, device=dev)
+        out["dropout_p"] = float(dropout_p)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1071,9 @@ def autotune(
     verbose: bool = True,
     gated: bool = False,
     force_rebenchmark: bool = False,
+    dtype: str = "fp16",
+    internal_bias: bool = False,
+    dropout_p: float = 0.0,
 ) -> CompParams:
     """Find the best CompParams for the forward kernel.
 
@@ -965,6 +1083,10 @@ def autotune(
             is distributed across them for faster autotuning.
         force_rebenchmark: When True, re-benchmark all configs even if cached
             results exist.  Useful when previous measurements seem unreliable.
+        dtype: "fp16" or "bf16". Selects which kernel binary to autotune;
+            results are cached separately per dtype.
+        internal_bias: Whether to autotune the internal-bias variant.
+        dropout_p: If > 0, autotune the dropout-enabled binary at this rate.
     """
     return _autotune_generic(
         kernel_type="fwd",
@@ -978,6 +1100,7 @@ def autotune(
         use_cache=use_cache, verbose=verbose, gated=gated,
         make_tensors=_make_fwd_tensors,
         force_rebenchmark=force_rebenchmark,
+        dtype=dtype, internal_bias=internal_bias, dropout_p=dropout_p,
     )
 
 
@@ -995,6 +1118,9 @@ def autotune_bwd_dadr(
     verbose: bool = True,
     gated: bool = False,
     force_rebenchmark: bool = False,
+    dtype: str = "fp16",
+    internal_bias: bool = False,
+    dropout_p: float = 0.0,
 ) -> BwdDAdRCompParams:
     """Find the best BwdDAdRCompParams for the backward dA+dR kernel.
 
@@ -1003,6 +1129,7 @@ def autotune_bwd_dadr(
             benchmarking.
         force_rebenchmark: When True, re-benchmark all configs even if cached
             results exist.
+        dtype, internal_bias, dropout_p: see :func:`autotune`.
     """
     return _autotune_generic(
         kernel_type="bwd_dadr",
@@ -1016,6 +1143,7 @@ def autotune_bwd_dadr(
         use_cache=use_cache, verbose=verbose, gated=gated,
         make_tensors=_make_bwd_dadr_tensors,
         force_rebenchmark=force_rebenchmark,
+        dtype=dtype, internal_bias=internal_bias, dropout_p=dropout_p,
     )
 
 
@@ -1033,6 +1161,9 @@ def autotune_bwd_db(
     verbose: bool = True,
     gated: bool = False,
     force_rebenchmark: bool = False,
+    dtype: str = "fp16",
+    internal_bias: bool = False,
+    dropout_p: float = 0.0,
 ) -> BwdDBCompParams:
     """Find the best BwdDBCompParams for the backward dB kernel.
 
@@ -1041,6 +1172,7 @@ def autotune_bwd_db(
             benchmarking.
         force_rebenchmark: When True, re-benchmark all configs even if cached
             results exist.
+        dtype, internal_bias, dropout_p: see :func:`autotune`.
     """
     return _autotune_generic(
         kernel_type="bwd_db",
@@ -1054,4 +1186,5 @@ def autotune_bwd_db(
         use_cache=use_cache, verbose=verbose, gated=gated,
         make_tensors=_make_bwd_db_tensors,
         force_rebenchmark=force_rebenchmark,
+        dtype=dtype, internal_bias=internal_bias, dropout_p=dropout_p,
     )
