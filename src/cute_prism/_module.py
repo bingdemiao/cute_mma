@@ -320,7 +320,8 @@ class PrismLinear(nn.Module):
         bwd_db_params: BwdDBCompParams | None = None,
         internal_bias: bool = False,
         dropout: float = 0.0,
-        r_init_scale=1.0
+        r_init_scale=1.0,
+        ar_scale_init: float | None = None,
     ):
         super().__init__()
         if activation not in (None, "silu_gate", "sigmoid_gate"):
@@ -406,6 +407,15 @@ class PrismLinear(nn.Module):
         self.reconn = nn.Parameter(
             torch.empty(n_groups * reconn_sz, in_features),
         )
+
+        # ar_scale: learnable LoRA-α-style scalar that multiplies R before
+        # the gating non-linearity. When None, behavior is unchanged.
+        # When set (e.g. 0.1), keeps gate inputs in SiLU's informative band
+        # at init even if R itself is initialized at design magnitude.
+        if ar_scale_init is not None:
+            self.ar_scale = nn.Parameter(torch.tensor(float(ar_scale_init)))
+        else:
+            self.register_parameter("ar_scale", None)
 
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
@@ -515,6 +525,8 @@ class PrismLinear(nn.Module):
             R tensor of shape (n_groups * reconn_sz, in_features), same dtype/device.
         """
         if self.activation in ("silu_gate", "sigmoid_gate"):
+            if self.ar_scale is not None:
+                return self.ar_scale * self.reconn
             return self.reconn
 
         n_groups = self.out_features // self.group_size
