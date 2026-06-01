@@ -89,6 +89,15 @@ def _prism_backward_op(
         force_rebenchmark=force_rebenchmark,
     )
 
+    # FROZEN-B CONTRACT (important): in *plain* mode (activation falsy) the
+    # backends intentionally return dB=None — B is the frozen pretrained weight
+    # and only R is trained. A custom_op must return a concrete tensor for every
+    # declared output, so we substitute a zero dB here. This is correct ONLY
+    # because PrismLinear marks ``weight.requires_grad=False`` in plain mode, so
+    # the zero is never consumed. If you call this op directly in plain mode with
+    # a *trainable* B, the returned dB is zero — B will silently not learn. Use a
+    # gated activation (dB is real) if B must be trained. Pinned by
+    # tests/test_module_integration.py::test_gradcheck_custom_op.
     if dB is None:
         dB = torch.zeros_like(B)
     if dR is None:

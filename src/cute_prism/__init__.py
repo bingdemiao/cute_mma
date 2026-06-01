@@ -112,8 +112,9 @@ def forward(
         dropout_p: Dropout probability applied to H = A * SiLU(AR + bias).
         training: Whether in training mode (dropout only active when True).
         shuffle_masks: Optional (n_groups, n_chunks, n_rounds) int64 tensor of
-            per-group butterfly shuffle masks. Only supported by the
-            ``cublas`` and ``pytorch`` backends in AR mode.
+            per-group butterfly shuffle masks. Supported by all backends
+            (``cute``, ``cublas``, ``pytorch``) in AR mode — the cute branch
+            below forwards ``shuffle_masks`` into the kernel.
 
     Returns:
         (C, dropout_seeds) — C is the output tensor of shape (M, N).
