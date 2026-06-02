@@ -201,6 +201,19 @@ def forward(
             )
         elif comp_params is None:
             comp_params = CompParams()
+        # input_shuffle correctness requires each CTA to map to a single output
+        # group: the shuffled-A buffer is selected per group via a single
+        # per-CTA stride, so when group_size < bN a CTA spans multiple groups
+        # and all but the first read the wrong shuffled A (silent ~100% error).
+        if shuffle_masks is not None and group_size < comp_params.bN:
+            raise ValueError(
+                f"input_shuffle on the cute backend requires group_size >= bN "
+                f"(N tile); got group_size={group_size}, bN={comp_params.bN}. "
+                f"A CTA spanning multiple groups cannot select per-group shuffled "
+                f"A. Use group_size >= {comp_params.bN}, pass comp_params with "
+                f"bN <= group_size, or use the cublas backend for input_shuffle "
+                f"at small group_size."
+            )
         smem = compute_smem_bytes(
             comp_params.bM, comp_params.bN, comp_params.bK,
             group_size, reconn_sz,

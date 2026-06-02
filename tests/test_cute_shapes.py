@@ -56,7 +56,9 @@ def _run_one(M, N, K, gs, rs, seed, verbose) -> bool:
     dB = _max_rel_err(dB_c, dB_b)
     dIB = _max_rel_err(dIB_c, dIB_b)
 
-    ok = fwd < 0.005 and max(dA, dR, dB, dIB) < 0.02
+    # fp16 forward accumulation error grows with the K reduction length.
+    fwd_tol = 0.005 * max(1.0, K / 512.0)
+    ok = fwd < fwd_tol and max(dA, dR, dB, dIB) < 0.02
     if verbose or not ok:
         tag = "PASS" if ok else "FAIL"
         print(f"  {tag} M={M:>4} N={N:>4} K={K:>4} gs={gs:>3} rs={rs:>2} "

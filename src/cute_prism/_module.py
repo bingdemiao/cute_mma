@@ -173,7 +173,17 @@ class _PrismFn(torch.autograd.Function):
         ctx.autotuning = autotuning
         ctx.force_rebenchmark = force_rebenchmark
         ctx.dropout_p = dropout_p
-        ctx.dropout_seeds = dropout_seeds
+        # Normalize the per-backend seed return to a tensor-or-None. The cute
+        # forward returns a list ([] in eval, [seed_tensor] in training); cublas
+        # returns a tensor (possibly empty in eval); pytorch returns list[int].
+        # Backward treats None as "no dropout", so eval (no seeds) must map to
+        # None — otherwise an empty []/tensor trips the (n_groups,) shape check.
+        seeds = dropout_seeds
+        if isinstance(seeds, (list, tuple)):
+            seeds = seeds[0] if len(seeds) > 0 else None
+        if isinstance(seeds, torch.Tensor) and seeds.numel() == 0:
+            seeds = None
+        ctx.dropout_seeds = seeds
         return C
 
     @staticmethod
@@ -190,7 +200,8 @@ class _PrismFn(torch.autograd.Function):
             autotuning=ctx.autotuning,
             force_rebenchmark=ctx.force_rebenchmark,
             internal_bias=internal_bias,
-            dropout_seeds=ctx.dropout_seeds,
+            dropout_seeds=(ctx.dropout_seeds.contiguous()
+                           if ctx.dropout_seeds is not None else None),
             dropout_p=ctx.dropout_p,
             shuffle_masks=shuffle_masks,
         )
