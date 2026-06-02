@@ -774,7 +774,24 @@ void prism_tn(int m, int n, int k,
     printf("dimGrid: (%d, %d), dimBlock: (%d, %d)\n",
             dimGrid.x, dimGrid.y, dimBlock.x, dimBlock.y);
     #endif
-    prism_device<<<dimGrid, dimBlock, smem_size, stream>>>(
+    // Opt in to >48KB dynamic shared memory before launch. Required whenever
+    // smem_size exceeds the 48KB default cap — e.g. group_size < bN packs
+    // n_groups>1 per CTA, doubling the R/AR buffers. Without this the launch
+    // fails with cudaErrorInvalidValue ("invalid argument"), which (since the
+    // raw <<<>>> launch error is unchecked) only surfaces at the next CUDA op.
+    // The backward kernels already do this (cute_prism_backward_dadr.cu:951,
+    // cute_prism_backward_db.cu:572); the forward path had been missing it.
+    auto prism_kernel = &prism_device<
+        decltype(grid_shape), decltype(cta_tiler),
+        decltype(A_layout), decltype(copyA),
+        decltype(R_layout), decltype(copyR),
+        decltype(group_size), decltype(reconn_sz), decltype(c_width),
+        decltype(B_layout), decltype(copyB),
+        decltype(C_layout), decltype(warp_layout1), decltype(warp_layout2),
+        decltype(bP_a_r), decltype(bP_ar), decltype(bP_b)>;
+    cudaFuncSetAttribute(prism_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    prism_kernel<<<dimGrid, dimBlock, smem_size, stream>>>(
         grid_shape, cta_tiler,
         A, A_layout, copyA,
         R, R_layout, copyR, group_size, reconn_sz, c_width,
