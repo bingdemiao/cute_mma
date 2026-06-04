@@ -136,6 +136,11 @@ void dH_producer(
             copy(s2r_dC{}, tXsdC(_,_,_,pipe_r), tXrdC);
             copy(s2r_B{},  tXsB(_,_,_,pipe_r),  tXrB);
             gemm(mma, rdC, rB, rDH);
+            // FIX (gs>=256 race): consume-side barrier. Without this, the next
+            // iteration's cp.async overwrites slot pipe_r before all producer
+            // warps have finished the LDSM read above — a slot-reuse race that
+            // fires once tiles_per_group (=gs/32) is large enough to reuse slots.
+            asm volatile("bar.sync 14, %0;\n" : : "n"(n_prod));
 
             pipe_w = pipe_r;
             if (++pipe_r == PIPE_DC_B) pipe_r = 0;
@@ -702,6 +707,10 @@ void dAdR_consumer(
         if (++dh_pipe_r == bP_dh) dh_pipe_r = 0;
         r_pipe_w = r_pipe_r;
         r_pipe_r = 1 - r_pipe_r;
+        // FIX (shuffle gs>=256 race): consume-side barrier. All consumer warps
+        // must finish reading sA/sR for this group before the next iteration
+        // reloads (overwrites) them (shuffle mode reloads sA per group in place).
+        asm volatile("bar.sync 15, %0;\n" : : "n"(n_cons));
     }
 
     // Write accumulated rDA to gdA — only when NOT in shuffle_mode (the

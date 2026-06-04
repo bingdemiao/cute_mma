@@ -127,7 +127,9 @@ def main():
     if args.clear_cache:
         cute_prism.clear_cache()
 
-    M, N, K, gs, rs = 128, 128, 256, 64, 16
+    # gs=128 (>= forward bN) so the input_shuffle combos are valid on cute;
+    # shuffle at gs<bN is a separate, guarded limitation (see KNOWN_ISSUES.md).
+    M, N, K, gs, rs = 256, 256, 512, 128, 16
 
     passed = failed = 0
     for shuffle, ib_on, drop_on in itertools.product((False, True), repeat=3):
