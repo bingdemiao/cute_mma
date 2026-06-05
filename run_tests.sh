@@ -85,8 +85,10 @@ run "integration: compare_backends (plain gated)" \
     "$PY" integration/compare_backends.py
 run "integration: compare_backends (+internal_bias +dropout)" \
     "$PY" integration/compare_backends.py --internal_bias --dropout 0.1
+# cute input_shuffle requires group_size >= bN (=128); guarded otherwise
+# (see KNOWN_ISSUES.md), so run the shuffle integration case at gs=128.
 run "integration: compare_backends (+input_shuffle)" \
-    "$PY" integration/compare_backends.py --input_shuffle --reconn_sz 16
+    "$PY" integration/compare_backends.py --group_size 128 --input_shuffle --reconn_sz 16
 
 echo; echo "==================================================================="
 echo "SUMMARY: $pass passed, $fail failed"

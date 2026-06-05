@@ -97,12 +97,21 @@ def main():
     M, N, K, gs, rs = 256, 256, 512, 64, 16
 
     passed = failed = 0
+    # forward bN (default 128): cute input_shuffle requires gs >= bN and is
+    # guarded otherwise (see KNOWN_ISSUES.md), so skip the shuffle cases here
+    # at gs < bN. Determinism of the plain/bias paths is still checked at gs=64
+    # (the fixed-race regime); shuffle determinism is covered by feature_cross.
+    BN = 128
     for name, ib, shuffle in [
         ("plain_gated", False, False),
         ("internal_bias", True, False),
         ("input_shuffle", False, True),
         ("shuffle+bias", True, True),
     ]:
+        if shuffle and gs < BN:
+            if args.verbose:
+                print(f"  SKIP {name:18s} (cute input_shuffle needs gs>=bN; gs={gs})")
+            continue
         ok = _run_feature(name, M, N, K, gs, rs, ib=ib, shuffle=shuffle, verbose=args.verbose)
         passed += ok
         failed += (not ok)
